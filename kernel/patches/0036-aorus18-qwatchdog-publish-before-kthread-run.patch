@@ -1,0 +1,88 @@
+From: claude-opus-5 <noreply@local>
+Date: 2026-11-02
+Subject: [PATCH] aorus18 (0036) -- publish nvl->qwd before starting the Q-watchdog kthread
+
+Ordering fix in tb_egpu_qwatchdog_init(), introduced by 0014.
+
+tb_egpu_qwatchdog_thread() caches nvl->qwd in its prologue:
+
+    struct tb_egpu_qwatchdog *qwd = nvl->qwd;
+
+and never re-reads it. But 0014 stored nvl->qwd = qwd AFTER kthread_run()
+returned, so a thread scheduled on another CPU before that store would hold NULL
+for its entire lifetime and oops on the first atomic_inc(&qwd->cycles).
+
+Severity, stated honestly: the oops was NOT reachable in practice. The thread
+runs msleep_interruptible(interval_ms) before its first qwd dereference, and
+interval_ms is clamped to >= TB_EGPU_QWATCHDOG_MIN_INTERVAL_MS (10ms, 200ms by
+default), while the store landed a few instructions after kthread_run() returned.
+So this was never an observed crash and no incident is attributed to it.
+
+It is still worth fixing: correctness rested on a 10ms sleep instead of on
+ordering. Nothing in 0014 documents that dependency, so any future reordering of
+the loop -- moving the sleep to the end of the body, for instance, which is the
+natural shape for a watchdog that wants to sample immediately on start -- turns a
+latent race into a NULL deref in a kthread, far from its cause.
+
+Fix -- pure ordering, no new state and no new identifiers:
+  - Store nvl->qwd = qwd BEFORE kthread_run().
+  - Drop the now-redundant store after the IS_ERR() block.
+  - Document why the order is load-bearing, so it survives the next edit.
+
+The kthread_run() failure path already does nvl->qwd = NULL before returning the
+error, so publishing early does not leave a dangling pointer on failure. The
+Tier 2 sysfs registration that 0015 appended after the old store still runs with
+nvl->qwd set, unchanged.
+
+WHY A TAIL PATCH INSTEAD OF EDITING 0014: nv-qwatchdog.c is created by 0014, and
+0015 and 0023 anchor into it by line number. Adding lines inside 0014 shifts
+those anchors and breaks 11 downstream patches by context (verified: the
+kernel-open apply stage of ci/40-kernel-patches.sh goes red on 0015, 0023, 0024,
+0027-0032, 0034 and 0035). Appending the correction leaves the series applying.
+
+NOT changed: the kthread body, the 0010 helpers it calls, the R4 gate that 0031
+puts in front of tb_egpu_qwatchdog_init, and the msleep_interruptible that
+G5-style kthread_stop latency complaints are about. Those are separate.
+
+Verified: applies in order on top of 0001-0035 over the kernel-open half of
+595.99.02 (ci/40-kernel-patches.sh, section 7b). NOT compiled and NOT run on
+hardware: the DKMS package is superseded and pending its 595.71.05 -> 595.99.02
+rebase.
+---
+diff --git a/kernel-open/nvidia/nv-qwatchdog.c b/kernel-open/nvidia/nv-qwatchdog.c
+index 2430d2b..920212a 100644
+--- a/kernel-open/nvidia/nv-qwatchdog.c
++++ b/kernel-open/nvidia/nv-qwatchdog.c
+@@ -302,6 +302,23 @@ int tb_egpu_qwatchdog_init(nv_linux_state_t *nvl)
+     atomic_set(&qwd->cycles, 0);
+     atomic_set(&qwd->detections, 0);
+ 
++    /* Publish nvl->qwd BEFORE starting the thread.
++     *
++     * tb_egpu_qwatchdog_thread() caches nvl->qwd in its prologue and never
++     * re-reads it, so a thread that gets scheduled before this store would
++     * hold NULL for its entire lifetime and oops on the first
++     * atomic_inc(&qwd->cycles).
++     *
++     * That oops was not reachable in practice: the thread sleeps
++     * msleep_interruptible(>= TB_EGPU_QWATCHDOG_MIN_INTERVAL_MS, 10ms)
++     * before its first qwd dereference, and the store below used to land a
++     * few instructions after kthread_run() returned. But correctness here
++     * rested on a 10ms sleep rather than on ordering, which is the kind of
++     * invariant that evaporates the moment someone reorders the loop.
++     *
++     * The kthread_run() failure path below resets this to NULL. */
++    nvl->qwd = qwd;
++
+     qwd->thread = kthread_run(tb_egpu_qwatchdog_thread, nvl,
+                               "aorus-qwd-%02x%02x",
+                               nv->pci_info.bus, nv->pci_info.slot);
+@@ -316,8 +333,6 @@ int tb_egpu_qwatchdog_init(nv_linux_state_t *nvl)
+         return err;
+     }
+ 
+-    nvl->qwd = qwd;
+-
+     /* Tier 2: register sysfs counters. Failure is non-fatal — kthread
+      * still runs, just without userspace-visible counters. */
+     if (nvl->pci_dev)

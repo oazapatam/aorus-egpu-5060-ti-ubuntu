@@ -188,6 +188,6 @@ necesita ninguna de las palancas del catálogo de levers.
   se instala junto a `egpu-tb-fix` (ambos gestionan el BAR0 por udev y se
   pisarían).
 - `aorus-egpu-nvidia-dkms` queda **archivado y con deuda declarada**:
-  sus 34 parches están escritos contra 595.71.05 y el driver instalado es
+  sus 35 parches están escritos contra 595.71.05 y el driver instalado es
   595.99.02, así que no cargaría sin un rebase previo.
   La eGPU funciona sin ninguno de ellos.

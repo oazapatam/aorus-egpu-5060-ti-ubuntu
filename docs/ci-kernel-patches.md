@@ -3,7 +3,7 @@
 Etapa: [`ci/40-kernel-patches.sh`](../ci/40-kernel-patches.sh).
 Baseline: [`ci/baselines/checkpatch-known.txt`](../ci/baselines/checkpatch-known.txt).
 
-`kernel/patches/` contiene 34 parches activos (`0001`…`0035`, con el `0019`
+`kernel/patches/` contiene 35 parches activos (`0001`…`0036`, con el `0019`
 desactivado en `kernel/patches/disabled/`) y dos parches retirados en
 `kernel/patches/.disabled-for-rollback/`.
 Son diffs contra el árbol upstream de
@@ -191,7 +191,7 @@ Cobertura actual, sobre `595.99.02` instalado:
 
 | Resultado | Parches |
 |---|---|
-| aplican en orden | 23 |
+| aplican en orden | 24 |
 | fallan solo por la cadena de versión (`0005`, `0025`) | 2 |
 | sin mitad `kernel-open` (solo RM, `src/nvidia/**`) | 9 |
 

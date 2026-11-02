@@ -207,7 +207,7 @@ existencia, no una invocación.
   los dos reasignan el BAR0 desde reglas udev y se pisarían.
 - `aorus-egpu-nvidia-dkms` debe seguir declarando su **deuda de versión** en la
   descripción — `ci_fail` si desaparece.
-  Sus 34 parches están escritos contra 595.71.05 y el driver instalado es el
+  Sus 35 parches están escritos contra 595.71.05 y el driver instalado es el
   stock 595.99.02:
   los módulos no cargarían.
   Si alguien borra ese aviso sin rebasar los parches, el paquete vuelve a
@@ -364,7 +364,7 @@ Con los cuatro `.deb` que se pueden construir hoy:
   `scripts/build-dkms.sh` clonando el upstream, y no está presente al correr
   el CI;
   solo se revisan su `control` y sus maintainer scripts.
-  El paquete además necesita un rebase de sus 34 parches antes de volver a ser
+  El paquete además necesita un rebase de sus 35 parches antes de volver a ser
   instalable.
 - **La deuda del baseline no se arregla sola.**
   Las líneas de `lintian-known.txt` son problemas reales aceptados;
