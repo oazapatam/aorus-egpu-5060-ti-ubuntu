@@ -464,14 +464,34 @@ readonly AORUS_LINK_MIN_GEN=3
 readonly AORUS_LINK_MIN_WIDTH=1
 ```
 
-`domain_link_verdict` distingue tres estados, y la diferencia es operativa:
+Hay **dos** veredictos, y confundirlos rompía el gate.
+
+`domain_link_verdict <speed> <width>` es **descriptivo**:
+dice a qué velocidad está entrenado el enlace en el instante de la lectura.
+Sirve para un informe y **no es un gate**:
 
 - `dead` — sin width o width 0:
   el túnel no existe;
   expulsar, no insistir.
-- `degraded` — enlace vivo pero por debajo del mínimo (el caso Gen1 marginal):
-  se puede **leer**, pero nada intrusivo.
-- `healthy` — apto para bind, persistence y overclock.
+- `degraded` — enlace vivo pero entrenado por debajo del mínimo.
+  En reposo esto es lo **normal**, no una avería.
+- `healthy` — entrenado a Gen3 o mejor ahora mismo.
+
+`domain_link_cap_verdict <gen_max> <width>` es **el gate** de las acciones
+intrusivas.
+Recibe la generación máxima que el enlace puede **negociar**
+(`pcie.link.gen.max`, vía `gpu_link_gen_max`), que en esta máquina vale 3 y no
+baja en reposo:
+
+- `dead` — igual que arriba.
+- `unknown` — no hay lectura de capacidad utilizable.
+  **No autoriza**: sin el dato no se puede afirmar que sea seguro.
+- `degraded` — el enlace solo puede negociar por debajo de Gen3.
+  Este es el caso real del 2026-06-27, el que congeló el host.
+- `healthy` — puede negociar Gen3 o mejor, aunque ahora esté en reposo a
+  2.5 GT/s.
+
+`domain_link_allows_tuning` toma la **capacidad**, no la instantánea.
 
 El motivo, en la cabecera del módulo:
 con el enlace marginal, bindear la eGPU o apretarla ha **congelado el host
@@ -481,8 +501,11 @@ no lo es, así que toda acción intrusiva se cierra tras este gate.
 
 Dos consecuencias visibles en `app/overclock.sh`:
 
-- `oc_status` llama al resolver con `AORUS_OC_FORCE=1` explícitamente, porque
-  leer el estado debe funcionar **sobre todo** cuando el enlace está degradado.
+- `oc_status` llama al resolver con `AORUS_OC_READONLY=1`, porque leer el estado
+  debe funcionar **sobre todo** cuando el enlace no está sano.
+  No simula un `--force`:
+  antes lo hacía, y el mensaje decía *"`--force` activo: continúo BAJO TU
+  RIESGO"* a quien no había pasado ningún flag ni corría ningún riesgo.
 - `--force` es el **único** gate relajable, y queda registrado con `log_warn`.
   Se puede relajar porque su riesgo es del usuario;
   R4 no se relaja porque violarlo siempre es un bug.
@@ -500,10 +523,34 @@ Un `2.5 GT/s` leído en reposo **no** es un enlace degradado.
 `what-actually-works.md` documenta la medición:
 el enlace reentrena bajo demanda (`2.5 2.5 8.0 8.0 ... 2.5`) y sube a su tope
 Gen3 cuando hay tráfico.
-El gate es correcto como precondición para *escribir* en el hardware;
-no sirve como diagnóstico de salud del túnel.
-Para eso hay que medir ancho de banda (`tools/egpu-bandwidth`), no leer
-`current_link_speed`.
+
+Durante un tiempo el gate ignoró eso y leyó la instantánea, con una
+consecuencia que nadie había comprobado:
+en reposo rechazaba **siempre**, así que `--force` —es decir, apagar el gate—
+era el único camino para usar `aorus-egpu-overclock`.
+Una protección que solo se puede satisfacer desactivándola no protege nada.
+Peor: `tests/run.sh` fijaba ese comportamiento como esperado
+(*"estado real actual (Gen1 x4) rechazado"*), así que el CI en verde lo
+**certificaba** en vez de detectarlo.
+
+El arreglo no es "generar tráfico antes de leer":
+está **medido** que un bucle de `nvidia-smi -q` no reentrena el enlace (sigue
+en 2.5 GT/s), así que daría el mismo falso negativo con más complejidad.
+Tampoco vale `max_link_speed` de sysfs:
+en el endpoint anuncia la capacidad de la **tarjeta** (32 GT/s), y en los
+puentes del túnel los registros están virtualizados y anuncian 2.5 GT/s
+(`b2:00.0` marca `max=2.5 GT/s` en esta máquina).
+Las dos lecturas mienten, cada una en un sentido distinto.
+
+La señal que sí distingue es `pcie.link.gen.max` de `nvidia-smi`:
+la capacidad **negociada** del enlace, 3 en esta máquina, que no baja en
+reposo.
+
+Con eso, cada veredicto tiene su trabajo:
+el de capacidad autoriza o cierra la escritura,
+el instantáneo informa,
+y para la salud del túnel sigue haciendo falta **medir** ancho de banda
+(`tools/egpu-bandwidth`), no leer `current_link_speed`.
 
 ---
 

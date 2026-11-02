@@ -36,15 +36,40 @@ is "Gen3 -> 3"   "$(domain_link_gen_from_speed '8.0 GT/s PCIe')"  "3"
 is "Gen1 -> 1"   "$(domain_link_gen_from_speed '2.5 GT/s PCIe')"  "1"
 is "Gen5 -> 5"   "$(domain_link_gen_from_speed '32.0 GT/s PCIe')" "5"
 is "basura -> 0" "$(domain_link_gen_from_speed 'Unknown')"        "0"
+# Veredicto INSTANTÁNEO: descriptivo. 'degraded' aquí NO significa avería; en
+# reposo es el estado normal, porque el enlace baja de velocidad solo.
 is "Gen3 x4 sano"        "$(domain_link_verdict '8.0 GT/s PCIe' 4)"  "healthy"
 is "Gen1 x4 degradado"   "$(domain_link_verdict '2.5 GT/s PCIe' 4)"  "degraded"
 is "width 0 = muerto"    "$(domain_link_verdict '8.0 GT/s PCIe' 0)"  "dead"
 is "sin width = muerto"  "$(domain_link_verdict '8.0 GT/s PCIe' '')" "dead"
-yes_ "Gen3 permite tuning"    domain_link_allows_tuning '8.0 GT/s PCIe' 4
-no_  "Gen1 NO permite tuning" domain_link_allows_tuning '2.5 GT/s PCIe' 4
-# Este es el estado REAL de la máquina al 2026-11-02: el enlace cayó a Gen1
-# tras el hotplug, así que el tuning debe rechazarse sin --force.
-no_  "estado real actual (Gen1 x4) rechazado" domain_link_allows_tuning '2.5 GT/s PCIe' 4
+
+echo "== domain/link: gate por CAPACIDAD (el que autoriza el tuning) =="
+# MEDIDO en esta máquina el 2026-11-02 con la eGPU funcionando:
+#   pcie.link.gen.max   = 3   (capacidad negociada: Gen3, el tope de egpu-tb-fix)
+#   current_link_speed  = 2.5 GT/s en reposo -> 8.0 bajo carga -> 2.5 otra vez
+#   ancho de banda real = 3.06 GB/s H2D / 3.38 GB/s D2H (túnel TB saturado)
+# Es decir: el enlace está SANO aunque la instantánea diga Gen1. El gate tiene
+# que autorizar este caso; antes lo rechazaba y dejaba --force como único
+# camino, que es apagar la propia protección.
+is "cap Gen3 x4 sano"        "$(domain_link_cap_verdict 3 4)"  "healthy"
+is "cap Gen4 x4 sano"        "$(domain_link_cap_verdict 4 4)"  "healthy"
+is "cap Gen1 x4 degradado"   "$(domain_link_cap_verdict 1 4)"  "degraded"
+is "cap Gen2 x4 degradado"   "$(domain_link_cap_verdict 2 4)"  "degraded"
+is "cap sin width = muerto"  "$(domain_link_cap_verdict 3 '')" "dead"
+is "cap width 0 = muerto"    "$(domain_link_cap_verdict 3 0)"  "dead"
+is "cap vacía = unknown"     "$(domain_link_cap_verdict '' 4)" "unknown"
+is "cap 0 = unknown"         "$(domain_link_cap_verdict 0 4)"  "unknown"
+# Guardia de mal uso: pasar una cadena de velocidad donde se espera una
+# generación debe CERRAR el gate, no reventar dentro de una subshell.
+is "cap mal usada = unknown" "$(domain_link_cap_verdict '2.5 GT/s PCIe' 4)" "unknown"
+
+yes_ "cap Gen3 permite tuning"       domain_link_allows_tuning 3 4
+no_  "cap Gen1 NO permite tuning"    domain_link_allows_tuning 1 4
+no_  "cap unknown NO permite tuning" domain_link_allows_tuning '' 4
+no_  "cap dead NO permite tuning"    domain_link_allows_tuning 3 0
+# El estado REAL de la máquina al 2026-11-02 (Gen3 negociado, 2.5 GT/s en
+# reposo) debe AUTORIZAR el tuning sin necesidad de --force.
+yes_ "estado real actual (cap Gen3, reposo 2.5) autorizado" domain_link_allows_tuning 3 4
 
 echo "== domain/overclock: clamping y plan =="
 is "clamp dentro"  "$(domain_oc_clamp 165 150 180)" "165"

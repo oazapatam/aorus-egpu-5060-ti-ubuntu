@@ -117,6 +117,12 @@ vez.
   Apretar la tarjeta con el enlace entrenado por debajo de Gen3 congeló el host
   entero.
   "No bindea" es aceptable; "bindea y congela" no lo es.
+  El gate juzga por **capacidad negociada** (`pcie.link.gen.max` de
+  `nvidia-smi`, vía `gpu_link_gen_max`), **nunca** por `current_link_speed`:
+  en reposo la instantánea siempre dice Gen1, así que usarla rechazaba el
+  tuning siempre y dejaba `--force` —apagar el gate— como único camino.
+  Si la capacidad no se puede leer el veredicto es `unknown` y el gate
+  **cierra**.
 - **nvidia-smi siempre con `timeout`.**
   Si devuelve 124 (colgado), **abortar sin reintentar**: martillear un eGPU
   semi-roto lo deja wedged en estado-D.

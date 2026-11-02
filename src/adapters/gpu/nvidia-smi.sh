@@ -73,6 +73,31 @@ gpu_caps() { # $1=busid
   printf '%s %s %s %s' "${pmin%%.*}" "${pmax%%.*}" "${gmax// /}" "${mmax// /}"
 }
 
+# Generación PCIe MÁXIMA que este enlace puede negociar, como entero.
+#
+# POR QUÉ ESTA LECTURA Y NO OTRA (es la entrada del gate de enlace):
+#   - `pcie.link.gen.max` es la capacidad del ENLACE. En esta máquina vale 3,
+#     que es el tope Gen3 que aplica egpu-tb-fix, y NO baja en reposo.
+#   - `pcie.link.gen.current` baja a 1 en reposo: no sirve de gate (era el bug).
+#   - `pcie.link.gen.gpumax` es la capacidad de la TARJETA (5 aquí), no la del
+#     enlace: autorizaría un enlace degradado.
+#   - `pcie.link.gen.hostmax` devuelve "[Unknown Error]" en esta máquina.
+# Verificado el 2026-11-02 sobre la eGPU b4:00.0 con la tarjeta funcionando.
+#
+# Si la lectura no es un entero utilizable devolvemos rc 1 SIN imprimir, y el
+# dominio lo traduce a 'unknown' -> el gate CIERRA. Ante la duda, no se escribe.
+gpu_link_gen_max() { # $1=busid -> entero (3 = Gen3)
+  local out rc
+  out="$(_smi -i "$1" --query-gpu=pcie.link.gen.max --format=csv,noheader 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 124 ] && return 124
+  [ "$rc" -ne 0 ] && return 1
+  out="${out// /}"
+  case "$out" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s' "$out"
+}
+
 gpu_state() { # $1=busid -> "clave=valor" por línea
   local out rc pl gc mc
   out="$(_smi -i "$1" --query-gpu=power.limit,clocks.gr,clocks.mem,persistence_mode \

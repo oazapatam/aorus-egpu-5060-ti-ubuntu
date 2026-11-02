@@ -103,7 +103,11 @@ forensics_probe() { # $1=nombre de sesión; $2..=comando a ejecutar
     ids="$(pci_read_ids "$bdf")"; read -r vendor device <<< "$ids"
     verdict="$(domain_target_verdict "$vendor" "$device")" || true
     link="$(pci_read_link "$bdf")"; speed="${link%%|*}"; width="${link##*|}"
-    trace_mark "TARGET" "$bdf verdict=$verdict link=$speed x$width -> $(domain_link_verdict "$speed" "$width")"
+    # El veredicto va etiquetado como INSTANTÁNEO a propósito: en reposo el
+    # enlace marca 2.5 GT/s y sale 'degraded' sin que haya ninguna avería.
+    # Una miga que dijera solo "-> degraded" invita, en el postmortem, al
+    # mismo error que ya costó una investigación entera (ver CLAUDE.md).
+    trace_mark "TARGET" "$bdf verdict=$verdict link=$speed x$width -> instantaneo=$(domain_link_verdict "$speed" "$width")"
   else
     trace_mark "TARGET" "la eGPU NO está en el bus PCI"
   fi

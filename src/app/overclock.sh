@@ -8,11 +8,18 @@
 # Orden de los gates — cada uno existe por un incidente real documentado:
 #   1. R4   : el target DEBE ser la eGPU externa. Tocar la interna dio Xid 79.
 #   2. topo : debe colgar de un controlador TB/USB4. Segunda confirmación de R4.
-#   3. link : el enlace debe estar SANO (Gen>=3). Apretar la tarjeta con el
+#   3. smi  : si nvidia-smi se cuelga (rc 124), ABORTAR sin reintentar.
+#   4. link : el enlace debe poder NEGOCIAR Gen>=3. Apretar la tarjeta con el
 #             enlace Gen1 marginal congeló el host entero el 2026-06-27.
-#   4. smi  : si nvidia-smi se cuelga (rc 124), ABORTAR sin reintentar.
 # Ningún gate se puede saltar con un flag: --force solo relaja el gate de enlace
 # y lo deja registrado, porque es el único cuyo riesgo es del usuario y no un bug.
+#
+# El gate de enlace va DESPUÉS del de nvidia-smi porque su entrada
+# (`pcie.link.gen.max`) la da nvidia-smi: es la capacidad negociada del enlace,
+# no la instantánea de sysfs. Usar la instantánea rechazaba el tuning SIEMPRE,
+# porque en reposo el enlace baja a 2.5 GT/s por diseño; ver la cabecera de
+# domain/link.sh. Los gates R4 (1 y 2) siguen primero y no dependen de nada
+# externo: la GPU interna se descarta antes de hablar con ninguna herramienta.
 
 # shellcheck shell=bash
 
@@ -79,22 +86,36 @@ oc_resolve_target() {
     return 2
   fi
 
+  # La instantánea se lee solo para INFORMAR. No decide nada: en reposo marca
+  # 2.5 GT/s siempre, porque el enlace baja de velocidad solo.
   link="$(pci_read_link "$bdf")"; speed="${link%%|*}"; width="${link##*|}"
-  local link_verdict; link_verdict="$(domain_link_verdict "$speed" "$width")"
-  if [ "$link_verdict" != "healthy" ]; then
-    if [ "${AORUS_OC_FORCE:-0}" = "1" ]; then
-      log_warn "enlace $link_verdict (${speed:-?} x${width:-?}) y --force activo: continúo BAJO TU RIESGO."
-    else
-      log_err "GATE de enlace: enlace $link_verdict (${speed:-?} x${width:-?})."
-      log_err "Apretar la eGPU con el enlace degradado ha congelado el host. Usa --force si lo asumes."
-      return 2
-    fi
-  fi
 
   bus="$(gpu_find_by_device_id "$AORUS_EGPU_DEVICE")"; local rc=$?
   [ "$rc" -eq 124 ] && { log_err "nvidia-smi se colgó; ABORTO sin reintentar."; return 124; }
   [ "$rc" -ne 0 ] && { log_err "la eGPU está en PCI ($bdf) pero nvidia no la publica."; return 1; }
-  printf '%s\t%s' "$bus" "$link_verdict"
+
+  # GATE de enlace, por CAPACIDAD negociada (ver cabecera y domain/link.sh).
+  local gen_max link_verdict info
+  gen_max="$(gpu_link_gen_max "$bus")"; rc=$?
+  [ "$rc" -eq 124 ] && { log_err "nvidia-smi se colgó leyendo el enlace; ABORTO sin reintentar."; return 124; }
+  link_verdict="$(domain_link_cap_verdict "$gen_max" "$width")"
+  info="Gen${gen_max:-?} negociado, ${speed:-?} x${width:-?} ahora mismo"
+  if [ "$link_verdict" != "healthy" ]; then
+    if [ "${AORUS_OC_READONLY:-0}" = "1" ]; then
+      log_warn "enlace $link_verdict ($info); sigo porque esta operación es de SOLO LECTURA."
+    elif [ "${AORUS_OC_FORCE:-0}" = "1" ]; then
+      log_warn "enlace $link_verdict ($info) y --force activo: continúo BAJO TU RIESGO."
+    else
+      log_err "GATE de enlace: enlace $link_verdict ($info)."
+      if [ "$link_verdict" = "unknown" ]; then
+        log_err "No he podido leer la capacidad del enlace, así que no puedo afirmar que sea seguro."
+      else
+        log_err "Apretar la eGPU con el enlace degradado ha congelado el host. Usa --force si lo asumes."
+      fi
+      return 2
+    fi
+  fi
+  printf '%s\t%s\t%s' "$bus" "$link_verdict" "$info"
 }
 
 # --- ejecutor del plan --------------------------------------------------------
@@ -129,9 +150,9 @@ oc_apply() { # $1=perfil
   [ -n "$profile" ] || { log_err "falta el nombre del perfil"; return 2; }
 
   oc_load_profile "$profile" || return $?
-  local resolved link_verdict
+  local resolved link_verdict link_info
   resolved="$(oc_resolve_target)" || return $?
-  bus="${resolved%%$'\t'*}"; link_verdict="${resolved##*$'\t'}"
+  IFS=$'\t' read -r bus link_verdict link_info <<< "$resolved"
 
   caps="$(gpu_caps "$bus")"; rc=$?
   [ "$rc" -eq 124 ] && { log_err "nvidia-smi se colgó leyendo capacidades; ABORTO."; return 124; }
@@ -147,7 +168,7 @@ oc_apply() { # $1=perfil
   plan="$(domain_oc_plan "$pmin" "$pmax" "$gmax" "$mmax")"
   [ -z "$plan" ] && { log_info "perfil '$profile': nada que aplicar."; return 0; }
 
-  log_info "aplicando perfil '$profile' a la eGPU $bus (enlace $link_verdict):"
+  log_info "aplicando perfil '$profile' a la eGPU $bus (enlace $link_verdict: $link_info):"
   if [ "${AORUS_OC_DRYRUN:-0}" = "1" ]; then
     printf '%s\n' "$plan" | while IFS=$'\t' read -r op a b; do
       log_info "  [dry-run] $op ${a:-} ${b:-}"; done
@@ -179,7 +200,7 @@ oc_apply() { # $1=perfil
 oc_reset() {
   local bus resolved
   resolved="$(oc_resolve_target)" || return $?
-  bus="${resolved%%$'\t'*}"
+  bus="${resolved%%$'\t'*}"   # primer campo: el bus-id
   log_info "reseteando la eGPU $bus a valores de fábrica"
   gpu_reset_clocks "$bus" || { log_err "el reset falló."; return 1; }
   rm -f "$AORUS_OC_STATE" 2>/dev/null || true
@@ -188,15 +209,17 @@ oc_reset() {
 
 # --- caso de uso: status ------------------------------------------------------
 oc_status() {
-  local bus caps pmin pmax gmax mmax resolved link_verdict
-  # --force implícito: `status` es solo lectura y debe informar del estado
-  # incluso (sobre todo) cuando el enlace está degradado.
-  resolved="$(AORUS_OC_FORCE=1 oc_resolve_target)" || return $?
-  bus="${resolved%%$'\t'*}"; link_verdict="${resolved##*$'\t'}"
+  local bus caps pmin pmax gmax mmax resolved link_verdict link_info
+  # `status` es SOLO LECTURA y debe informar del estado incluso -sobre todo-
+  # cuando el enlace no está sano. Se marca como tal en vez de simular un
+  # --force: antes el mensaje decía "--force activo: continúo BAJO TU RIESGO"
+  # a quien no había pasado ningún flag y no corría ningún riesgo.
+  resolved="$(AORUS_OC_READONLY=1 oc_resolve_target)" || return $?
+  IFS=$'\t' read -r bus link_verdict link_info <<< "$resolved"
   caps="$(gpu_caps "$bus")" || { log_err "no puedo leer capacidades."; return 1; }
   read -r pmin pmax gmax mmax <<< "$caps"
   log_info "eGPU:            $bus"
-  log_info "enlace:          $link_verdict"
+  log_info "enlace:          $link_verdict ($link_info)"
   log_info "power limit:     ${pmin}-${pmax} W (rango soportado)"
   log_info "reloj máx:       ${gmax} MHz gráfico / ${mmax} MHz memoria"
   log_info "--- estado actual ---"

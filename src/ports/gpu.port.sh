@@ -11,6 +11,11 @@
 #   gpu_find_by_device_id <did>        -> imprime el bus-id (o vacío + rc!=0)
 #   gpu_read_vendor_device <busid>     -> imprime "<vendor> <device>"
 #   gpu_caps <busid>                   -> imprime "pmin pmax gpumax memmax"
+#   gpu_link_gen_max <busid>           -> imprime la generación PCIe MÁXIMA que
+#                                         este enlace puede negociar (entero).
+#                                         Es la entrada del gate de enlace: la
+#                                         instantánea de sysfs no sirve porque
+#                                         en reposo siempre marca Gen1.
 #   gpu_state <busid>                  -> imprime "op=valor" por línea
 #   gpu_set_power_limit <busid> <w>
 #   gpu_set_gpu_clock <busid> <lo> <hi>
@@ -23,8 +28,8 @@
 port_gpu_assert() {
   local f missing=0
   for f in gpu_available gpu_find_by_device_id gpu_read_vendor_device gpu_caps \
-           gpu_state gpu_set_power_limit gpu_set_gpu_clock gpu_set_mem_clock \
-           gpu_reset_clocks; do
+           gpu_link_gen_max gpu_state gpu_set_power_limit gpu_set_gpu_clock \
+           gpu_set_mem_clock gpu_reset_clocks; do
     if ! declare -F "$f" >/dev/null; then
       printf 'puerto gpu: el adaptador no implementa %s()\n' "$f" >&2; missing=1
     fi
