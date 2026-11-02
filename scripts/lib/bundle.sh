@@ -31,6 +31,10 @@ bundle_core() { # $1=dir raíz del repo  $2=dir del paquete  $3..=binarios de sr
 bundle_clean() { # $1=dir del paquete $2..=binarios a borrar
   local pkg="$1"; shift
   rm -rf "$pkg/usr/lib/aorus-egpu"
+  # usr/share/aorus-egpu lo genera build-forensics.sh (copia del fuente del
+  # medidor). Si no se barre, queda en el arbol y un `git add -A` lo versiona:
+  # ya paso una vez.
+  rm -rf "$pkg/usr/share/aorus-egpu"
   local b; for b in "$@"; do rm -f "$pkg/usr/sbin/$b"; done
   # Barre los directorios que se quedaron VACÍOS al retirar lo generado, de
   # abajo arriba. `rmdir` sin -p no basta: deja usr/ y usr/lib/ colgando, y un

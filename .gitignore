@@ -51,6 +51,9 @@ packaging/aorus-egpu-overclock/usr/sbin/aorus-egpu-oc
 packaging/aorus-egpu-forensics/usr/lib/aorus-egpu/
 packaging/aorus-egpu-forensics/usr/sbin/aorus-egpu-probe
 packaging/aorus-egpu-forensics/usr/sbin/aorus-egpu-postmortem
+# El fuente del medidor se COPIA al payload desde tools/egpu-bandwidth.cu;
+# la copia es generada y no debe versionarse (duplicaria la fuente de verdad).
+packaging/aorus-egpu-forensics/usr/share/
 # El medidor de ancho de banda se copia al payload cuando está compilado.
 packaging/aorus-egpu-forensics/usr/lib/aorus-egpu/egpu-bandwidth
 

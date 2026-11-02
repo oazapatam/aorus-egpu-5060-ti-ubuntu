@@ -199,12 +199,12 @@ else
 fi
 
 # Desactivados: el 0019 y solo el 0019, y solo en disabled/.
-disabled_nums=""
+disabled_arr=()
 if [ -d "$DISABLEDIR" ]; then
-  disabled_nums="$(LC_ALL=C find "$DISABLEDIR" -maxdepth 1 -type f -name '*.patch' \
-    -printf '%f\n' | cut -c1-4 | sort -u | tr '\n' ' ')"
+  mapfile -t disabled_arr < <(LC_ALL=C find "$DISABLEDIR" -maxdepth 1 -type f \
+    -name '*.patch' -printf '%f\n' | cut -c1-4 | sort -u)
 fi
-disabled_nums="${disabled_nums% }"
+disabled_nums="${disabled_arr[*]}"
 if [ "$disabled_nums" = "$EXPECTED_DISABLED_NUMS" ]; then
   ci_ok "desactivados en disabled/: $disabled_nums (como se documenta)"
 else
@@ -216,7 +216,7 @@ fi
 
 # Colisión activo <-> desactivado.
 collide=""
-for n in $disabled_nums; do
+for n in "${disabled_arr[@]}"; do
   printf '%s\n' "${active_nums[@]}" | grep -qx "$n" && collide="$collide $n"
 done
 if [ -n "$collide" ]; then
@@ -228,7 +228,7 @@ else
 fi
 
 # Huecos: activos ∪ desactivados debe ser contiguo desde el primero.
-all_nums="$(printf '%s\n' "${active_nums[@]}" $disabled_nums | sort -u)"
+all_nums="$(printf '%s\n' "${active_nums[@]}" "${disabled_arr[@]}" | sort -u)"
 first="$(printf '%s\n' "$all_nums" | head -1 | sed 's/^0*//')"
 last="$(printf '%s\n' "$all_nums" | tail -1 | sed 's/^0*//')"
 expected_span=$((last - first + 1))
@@ -283,6 +283,8 @@ ci_section "formato de los diffs"
 # contador mal puesto se delata porque el hunk se cierra antes de tiempo (y la
 # siguiente línea sale como `stray`) o se come la cabecera del fichero
 # siguiente.
+#
+# shellcheck disable=SC2016  # es un programa de awk: $1/$2 son suyos, no del shell
 HUNK_AWK='
 function flush() {
   if (inh && (oseen != oexp || nseen != nexp))
@@ -361,15 +363,12 @@ for p in "${ACTIVE[@]}"; do
   # válido" sin clonar 1 GB. --check sí necesitaría los ficheros: no sirve.
   [ "$have_git" -eq 1 ] || continue
 
-  numstat="$(git apply --numstat "$p" 2>&1)"
-  if [ $? -ne 0 ]; then
-    numstat_rc="$(git apply --recount --numstat "$p" 2>&1)"
-    if [ $? -ne 0 ]; then
+  if ! numstat="$(git apply --numstat "$p" 2>&1)"; then
+    if ! numstat="$(git apply --recount --numstat "$p" 2>&1)"; then
       diff_bad=$((diff_bad + 1))
-      ci_fail "$b: git apply --numstat lo rechaza incluso con --recount" "$numstat_rc"
+      ci_fail "$b: git apply --numstat lo rechaza incluso con --recount" "$numstat"
       continue
     fi
-    numstat="$numstat_rc"
     if [ "$recount_ok" -eq 1 ]; then
       [ -n "${NEEDS_RECOUNT[$num]:-}" ] || ci_warn "$b: sigue necesitando --recount para aplicar"
       NEEDS_RECOUNT[$num]=1
@@ -551,8 +550,9 @@ else
       be="$(awk -v n="$name" '$1 == n { print $2; exit }' "$BASELINE")"
       bw="$(awk -v n="$name" '$1 == n { print $3; exit }' "$BASELINE")"
       if [ -z "$be" ]; then
-        [ "$e" -gt 0 ] || [ "$w" -gt 0 ] \
-          && unknown+=("$name: $e errores, $w avisos (parche nuevo, sin línea en el baseline)")
+        if [ "$e" -gt 0 ] || [ "$w" -gt 0 ]; then
+          unknown+=("$name: $e errores, $w avisos (parche nuevo, sin línea en el baseline)")
+        fi
         continue
       fi
       if [ "$e" -gt "$be" ] || [ "$w" -gt "$bw" ]; then
@@ -657,8 +657,7 @@ LINTER="tools/lint-identifiers.sh"
 if [ ! -x "$LINTER" ] && [ ! -r "$LINTER" ]; then
   ci_skip "no existe $LINTER"
 elif grep -q "kernel/patches" "$LINTER"; then
-  out="$(bash "$LINTER" 2>&1)"
-  if [ $? -eq 0 ]; then
+  if out="$(bash "$LINTER" 2>&1)"; then
     ci_ok "$LINTER: limpio"
   else
     ci_fail "$LINTER encontró identificadores obsoletos" "$out"
