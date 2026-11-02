@@ -1,0 +1,47 @@
+Package: aorus-egpu-igpu-display
+Version: 0.1.0
+Architecture: all
+Maintainer: Omar Zapata <omar.zapata@arus.com.co>
+Section: admin
+Priority: optional
+Depends: bash, coreutils, kmod, initramfs-tools | dracut
+Recommends: pciutils
+Description: Escritorio en la iGPU Intel, las dos GPUs NVIDIA libres para cómputo
+ En este portátil hay tres GPUs: la iGPU Intel (Arrow Lake), la dGPU NVIDIA
+ interna y la eGPU NVIDIA por Thunderbolt. Con la configuración de fábrica el
+ compositor Wayland acaba conduciendo pantalla con la NVIDIA, lo que las deja
+ ocupadas en vídeo y hace imposible descargar su driver.
+ .
+ Por qué pasa, y por qué prime-select no basta: nvidia_drm con modeset=1
+ registra un dispositivo KMS por cada GPU NVIDIA, y un compositor Wayland
+ enumera TODOS los dispositivos KMS y conduce cualquier salida conectada que
+ encuentre. `prime-select on-demand` afecta al arranque de Xorg y a los defaults
+ de GLX, no a qué dispositivos KMS abre el compositor. Medido en esta máquina:
+ con PRIME ya en on-demand, kwin_wayland tenía abiertos /dev/nvidia0,
+ /dev/nvidiactl y /dev/nvidia-modeset.
+ .
+ Este paquete pone nvidia_drm modeset=0 en un fichero de modprobe.d que ordena
+ DESPUÉS de los dos que el stack de nvidia instala con modeset=1, porque en los
+ parámetros de módulo gana la última asignación. Sin KMS, las tarjetas DRM de
+ las NVIDIA desaparecen, el compositor sólo ve la Intel y el driver queda libre.
+ .
+ CUDA no se entera: el cómputo no usa KMS. Los render nodes siguen existiendo,
+ así que PRIME render offload (__NV_PRIME_RENDER_OFFLOAD=1) sigue disponible
+ para lanzar una aplicación concreta sobre la NVIDIA.
+ .
+ El gate que justifica el paquete: si la iGPU no tuviera ninguna salida
+ conectada, quitarle el KMS a NVIDIA dejaría la máquina CIEGA, y eso no se
+ descubre hasta después de reiniciar. El postinst sólo activa la configuración
+ si `aorus-egpu-display check` pasa; si no, la deja sin activar y lo dice. Ese
+ gate es una función pura con test, no una comprobación improvisada.
+ .
+ Trae aorus-egpu-display, con status (inventario DRM: quién pinta y quién no),
+ check (el gate), unload (suelta el driver NVIDIA parando antes
+ nvidia-persistenced, que es quien lo retiene) y reload.
+ .
+ Aviso explícito: las pantallas cableadas a una salida de la NVIDIA dejan de dar
+ imagen. En este equipo el HDMI va a la dGPU; la solución es pasar el monitor a
+ un puerto USB-C/Thunderbolt, que sale por la iGPU.
+ .
+ Reversible: apt remove borra la configuración, regenera el initramfs y devuelve
+ el sistema a su comportamiento original (requiere reiniciar).

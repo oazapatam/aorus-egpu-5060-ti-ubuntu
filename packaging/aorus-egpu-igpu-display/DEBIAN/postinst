@@ -1,0 +1,63 @@
+#!/bin/sh
+# postinst de aorus-egpu-igpu-display.
+#
+# El fichero de modprobe se ACTIVA aquí, copiándolo desde /usr/share, y sólo si
+# el gate de pantalla pasa. Se hace así a propósito: si se enviara directamente
+# en /etc/modprobe.d, dpkg lo activaría sin preguntar y una instalación en una
+# máquina cuya iGPU no tenga pantalla conectada arrancaría CIEGA.
+set -e
+
+SRC=/usr/share/aorus-egpu/zz-aorus-egpu-igpu-display.conf
+DST=/etc/modprobe.d/zz-aorus-egpu-igpu-display.conf
+
+case "$1" in
+  configure)
+    if aorus-egpu-display check >/dev/null 2>&1; then
+      install -D -m 0644 "$SRC" "$DST"
+      # -k all, no -u a secas: `update-initramfs -u` solo regenera el initramfs
+      # del kernel MÁS NUEVO instalado, y aquí hay varios. La primera versión de
+      # este script usaba -u y dejó el initramfs del kernel EN USO sin la
+      # configuración, así que el cambio no habría surtido efecto al arrancar.
+      update-initramfs -u -k all >/dev/null 2>&1 || \
+        echo "aviso: no pude regenerar los initramfs; hazlo con: sudo update-initramfs -u -k all" >&2
+      cat <<'MSG'
+
+aorus-egpu-igpu-display instalado y ACTIVADO.
+
+El gate de pantalla pasó: la iGPU tiene salida y ninguna NVIDIA conduce
+pantalla, así que el cambio no te deja sin escritorio.
+
+REQUIERE REINICIAR (nvidia_drm ya está cargado con modeset=1):
+  sudo reboot
+
+Al volver:
+  aorus-egpu-display status        las NVIDIA deben salir con 0 salidas y sin KMS
+  sudo aorus-egpu-display unload   suelta el driver; ahora debe funcionar
+  sudo aorus-egpu-display reload   lo vuelve a cargar
+
+Revertir:  sudo apt remove aorus-egpu-igpu-display && sudo reboot
+MSG
+    else
+      cat <<'MSG'
+
+aorus-egpu-igpu-display instalado pero NO ACTIVADO, a propósito.
+
+El gate de pantalla NO pasa. Activarlo podría dejar la máquina sin ninguna
+pantalla al reiniciar, así que la configuración se ha quedado sin copiar.
+
+Mira qué pasa:
+  aorus-egpu-display check
+
+Lo normal es una de estas dos:
+  - la iGPU no tiene ninguna salida conectada  -> conecta el panel o un monitor
+  - una pantalla cuelga de la NVIDIA           -> pásala a un puerto USB-C /
+    Thunderbolt, que sale por la iGPU
+
+Cuando 'check' pase, actívalo con:
+  sudo dpkg-reconfigure aorus-egpu-igpu-display
+
+MSG
+    fi
+    ;;
+esac
+exit 0

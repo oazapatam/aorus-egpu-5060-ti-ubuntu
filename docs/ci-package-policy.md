@@ -322,6 +322,15 @@ Con los cuatro `.deb` que se pueden construir hoy:
 - **`egpu-tb-fix` 1.5.0 queda completamente limpio**:
   8 etiquetas, las 8 excluidas, 0 que evaluar.
   El paquete que hace funcionar la eGPU no tiene ni un hallazgo real.
+- Los tres paquetes que ensamblan `src/` (`aorus-egpu-forensics`,
+  `aorus-egpu-igpu-display`, `aorus-egpu-overclock`) arrastran
+  `script-not-executable` por los ficheros de `usr/lib/aorus-egpu/`:
+  llevan shebang porque son legibles y lintables por separado, pero se **cargan
+  con `.`**, nunca se ejecutan, así que 0644 es el modo correcto.
+  El recuento subió de 16 a 22 al añadir la capacidad de pantalla
+  (`domain/display.sh`, `app/display.sh`, los puertos `drm`/`kmod` y sus
+  adaptadores): `scripts/lib/bundle.sh` copia **todo** `src/` en cada paquete,
+  así que un fichero nuevo del núcleo sube el recuento de los tres a la vez.
 - `aorus-egpu-forensics` y `aorus-egpu-overclock` arrastran `non-standard-dir-perm
   0775 != 0755` en sus directorios.
   Sus build scripts normalizan los **ficheros** (`find -type f -exec chmod

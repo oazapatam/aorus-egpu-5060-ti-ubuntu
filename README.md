@@ -82,13 +82,14 @@ sudo reboot
 |---|---|---|
 | **`egpu-tb-fix`** | **principal, verificado en vivo** | Prepara la eGPU al conectarla: cierra la compuerta de autoprobe PCI, libera los puertos TB vacíos, re-enumera para que el kernel le asigne el BAR0, limita el enlace interno a Gen3 sin ASPM y se la entrega a `nvidia`. Boot args `thunderbolt.host_reset=0 clx=0`. |
 | **`aorus-egpu-forensics`** | **nuevo, probado en vivo** | Deja rastro en disco para depurar los cuelgues del host: migas de pan con `fsync` antes de cada paso, muestreador de hardware, y `ramoops` para preservar el dmesg del kernel a través del reinicio. |
+| **[`aorus-egpu-igpu-display`](./docs/igpu-display.md)** | **nuevo** | Deja el escritorio en la iGPU Intel y las dos GPUs NVIDIA libres para cómputo: pone `nvidia_drm modeset=0` para que el compositor Wayland no las abra, con lo que además se puede descargar el driver. Trae `aorus-egpu-display` (`status`/`check`/`unload`/`reload`). El `postinst` sólo activa la configuración si el gate de pantalla pasa, para no dejar la máquina ciega. |
 | `aorus-egpu-overclock` | **en desarrollo, no usar aún** | Perfiles de potencia y bloqueo de relojes para la eGPU. El núcleo y los tests están hechos; sin validar en hardware. |
 | `aorus-egpu-config` | **superseded (archivo)** | El port del stack Fedora. Reemplazado por `egpu-tb-fix`. No instalar junto a él: ambos gestionan el BAR0 por udev y se pisan. |
 | `aorus-egpu-nvidia-dkms` | **superseded + deuda** | Driver NVIDIA parcheado (34 levers) vía DKMS. Fijado a 595.71.05 mientras el instalado es 595.99.02: **necesita rebase antes de volver a usarse**. La eGPU funciona sin él. |
 
 `make` construye `egpu-tb-fix` y `aorus-egpu-forensics`.
 Los demás se construyen explícitamente
-(`make overclock`, `make config`, `make dkms`).
+(`make igpu-display`, `make overclock`, `make config`, `make dkms`).
 
 ## Cómo está organizado el repo
 

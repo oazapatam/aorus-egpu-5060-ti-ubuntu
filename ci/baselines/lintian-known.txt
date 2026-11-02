@@ -9,6 +9,7 @@
 # El motivo de cada línea está en docs/ci-package-policy.md.
 aorus-egpu-config systemd-service-in-odd-location 3
 aorus-egpu-config udev-rule-in-etc 5
-aorus-egpu-forensics script-not-executable 16
+aorus-egpu-forensics script-not-executable 22
+aorus-egpu-igpu-display script-not-executable 22
 aorus-egpu-overclock command-with-path-in-maintainer-script 2
-aorus-egpu-overclock script-not-executable 16
+aorus-egpu-overclock script-not-executable 22

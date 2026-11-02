@@ -10,7 +10,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AORUS_LIB_ROOT="$ROOT/src"; export AORUS_LIB_ROOT
 . "$ROOT/src/bootstrap.sh"
-aorus_use domain/target domain/link domain/overclock
+aorus_use domain/target domain/link domain/overclock domain/display
 
 pass=0 fail=0
 ok()   { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
@@ -70,6 +70,39 @@ no_  "cap dead NO permite tuning"    domain_link_allows_tuning 3 0
 # El estado REAL de la máquina al 2026-11-02 (Gen3 negociado, 2.5 GT/s en
 # reposo) debe AUTORIZAR el tuning sin necesidad de --force.
 yes_ "estado real actual (cap Gen3, reposo 2.5) autorizado" domain_link_allows_tuning 3 4
+
+echo "== domain/display: quién pinta el escritorio =="
+yes_ "i915 es integrada"        domain_display_is_integrated i915
+yes_ "xe es integrada"          domain_display_is_integrated xe
+no_  "nvidia NO es integrada"   domain_display_is_integrated nvidia
+yes_ "nvidia es de cómputo"     domain_display_is_compute nvidia
+no_  "i915 no es de cómputo"    domain_display_is_compute i915
+
+# El gate de seguridad. MEDIDO en esta máquina el 2026-11-02: tras mover el
+# monitor externo de HDMI (card1, NVIDIA interna) a USB-C/Thunderbolt (card2,
+# Intel DP-1), la iGPU tiene 2 salidas conectadas (eDP-1 + DP-1) y las dos
+# NVIDIA ninguna. Ese es el caso 'ok'.
+is "iGPU con 2 pantallas, NVIDIA con 0" "$(domain_display_release_verdict 2 0)" "ok"
+is "iGPU con 1 pantalla, NVIDIA con 0"  "$(domain_display_release_verdict 1 0)" "ok"
+# El caso que NO se puede descubrir reiniciando: dejaría la máquina ciega.
+is "iGPU sin pantalla = bloquea"        "$(domain_display_release_verdict 0 1)" "no-display"
+is "iGPU sin pantalla, NVIDIA tampoco"  "$(domain_display_release_verdict 0 0)" "no-display"
+# El estado ANTERIOR de esta máquina: el HDMI colgaba de la NVIDIA interna.
+is "pantalla en NVIDIA = se apagaría"   "$(domain_display_release_verdict 2 1)" "nvidia-outputs-lost"
+# Recuentos inutilizables: no se afirma que sea seguro.
+is "recuento vacío = unknown"           "$(domain_display_release_verdict '' 0)" "unknown"
+is "recuento con basura = unknown"      "$(domain_display_release_verdict 2 'dos')" "unknown"
+
+yes_ "2/0 se autoriza sin preguntar"    domain_display_release_allowed 2 0
+no_  "0/0 NO se autoriza"               domain_display_release_allowed 0 0
+no_  "2/1 NO se autoriza sin --force"   domain_display_release_allowed 2 1
+no_  "unknown NO se autoriza"           domain_display_release_allowed '' 0
+
+# El orden de descarga importa: nvidia_drm depende de nvidia_modeset y los dos
+# de nvidia. Al revés, `modprobe -r` falla con "Module in use".
+is "nvidia_drm va primero"  "$(domain_display_unload_order | head -1)" "nvidia_drm"
+is "nvidia va al final"     "$(domain_display_unload_order | tail -1)" "nvidia"
+is "son cuatro módulos"     "$(domain_display_unload_order | wc -l)" "4"
 
 echo "== domain/overclock: clamping y plan =="
 is "clamp dentro"  "$(domain_oc_clamp 165 150 180)" "165"

@@ -6,6 +6,7 @@
 #   make              -> paquetes soportados (tb-fix + forensics)
 #   make tb-fix       -> egpu-tb-fix            (PRINCIPAL, verificado en vivo)
 #   make forensics    -> aorus-egpu-forensics   (depurar cuelgues del host)
+#   make igpu-display -> aorus-egpu-igpu-display (escritorio en la iGPU Intel)
 #   make overclock    -> aorus-egpu-overclock   (EN DESARROLLO, sin validar)
 #   make config       -> aorus-egpu-config      (SUPERSEDED, archivo)
 #   make dkms         -> aorus-egpu-nvidia-dkms (SUPERSEDED + requiere rebase; RED)
@@ -24,7 +25,7 @@
 SHELL := /bin/bash
 DIST  := dist
 
-.PHONY: all tb-fix forensics overclock config dkms ci ci-list lint test inspect clean
+.PHONY: all tb-fix forensics igpu-display overclock config dkms ci ci-list lint test inspect clean
 
 # El CI local vive en ci/ (una etapa por fichero, ci/NN-*.sh) y lo orquesta
 # ci/run.sh, que ordena por número, no se para en el primer fallo y distingue
@@ -43,6 +44,9 @@ forensics: lint
 
 tb-fix: lint
 	@bash scripts/build-tb-fix.sh
+
+igpu-display: lint test
+	@bash scripts/build-igpu-display.sh
 
 overclock: lint test
 	@bash scripts/build-overclock.sh
@@ -72,6 +76,8 @@ inspect:
 
 clean:
 	@rm -rf $(DIST) build
+	@rm -rf packaging/aorus-egpu-igpu-display/usr/lib/aorus-egpu
+	@rm -f  packaging/aorus-egpu-igpu-display/usr/sbin/aorus-egpu-display
 	@rm -rf packaging/aorus-egpu-overclock/usr/lib/aorus-egpu
 	@rm -f  packaging/aorus-egpu-overclock/usr/sbin/aorus-egpu-oc
 	@rm -rf packaging/aorus-egpu-forensics/usr/lib/aorus-egpu

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# aorus-egpu-display — deja el escritorio en la iGPU Intel y las dos NVIDIA
+# libres para cómputo, y permite soltar y recargar el driver NVIDIA.
+#
+# El cambio de verdad lo hace el fichero de modprobe que instala el .deb
+# (nvidia_drm modeset=0): sin KMS, el compositor no abre la NVIDIA y ya no hay
+# nada que pelearse por el driver. Este binario sirve para VER el estado, para
+# comprobar ANTES de reiniciar que el cambio no deja la máquina ciega, y para
+# soltar el driver en caliente.
+set -uo pipefail
+
+for _root in "$(dirname "$(readlink -f "$0")")/.." /usr/lib/aorus-egpu; do
+  if [ -r "$_root/bootstrap.sh" ]; then . "$_root/bootstrap.sh"; break; fi
+done
+if ! declare -F aorus_use >/dev/null; then
+  printf 'aorus-egpu-display: no encuentro bootstrap.sh\n' >&2; exit 70
+fi
+aorus_use app/display
+
+usage() {
+  cat <<-USAGE
+	aorus-egpu-display — escritorio en la iGPU, las NVIDIA para cómputo
+
+	Uso:
+	  aorus-egpu-display status      inventario DRM: quién pinta y quién no
+	  aorus-egpu-display check       comprueba que el cambio es seguro
+	  aorus-egpu-display unload      suelta el driver NVIDIA (nada de --force)
+	  aorus-egpu-display reload      lo vuelve a cargar (nvidia + nvidia_uvm)
+
+	Opciones:
+	  --force      en 'check', acepta perder las pantallas que cuelguen de NVIDIA
+	  -h, --help   esta ayuda
+
+	El gate de 'check' existe por algo que no se puede descubrir reiniciando: si
+	la iGPU no tiene ninguna salida conectada, quitarle el modeset a NVIDIA deja
+	la máquina CIEGA. Córrelo antes del primer reinicio tras instalar.
+	USAGE
+}
+
+FORCE=0
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force)    FORCE=1 ;;
+    -h|--help)  usage; exit 0 ;;
+    -*)         printf 'aorus-egpu-display: opción desconocida: %s\n\n' "$1" >&2
+                usage >&2; exit 2 ;;
+    *)          ARGS+=("$1") ;;
+  esac
+  shift
+done
+
+cmd="${ARGS[0]:-status}"
+case "$cmd" in
+  status|'')
+    display_status
+    ;;
+  check)
+    display_check; rc=$?
+    # rc 2 es "se apagarían pantallas de NVIDIA": con --force es aceptable.
+    if [ "$rc" -eq 2 ] && [ "$FORCE" -eq 1 ]; then
+      printf 'aviso: --force activo, aceptas perder esas pantallas.\n' >&2
+      exit 0
+    fi
+    exit "$rc"
+    ;;
+  unload)
+    display_unload
+    ;;
+  reload)
+    display_reload
+    ;;
+  *)
+    printf 'aorus-egpu-display: comando desconocido: %s\n\n' "$cmd" >&2
+    usage >&2; exit 2
+    ;;
+esac

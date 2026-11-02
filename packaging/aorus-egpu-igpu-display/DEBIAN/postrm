@@ -1,0 +1,23 @@
+#!/bin/sh
+# postrm de aorus-egpu-igpu-display.
+# Quita la configuración que activó el postinst y regenera el initramfs, para
+# que NVIDIA vuelva a su modeset=1 original. Requiere reiniciar.
+set -e
+
+DST=/etc/modprobe.d/zz-aorus-egpu-igpu-display.conf
+
+case "$1" in
+  remove|purge)
+    if [ -f "$DST" ]; then
+      rm -f "$DST"
+      # -k all, no -u a secas: `update-initramfs -u` solo regenera el initramfs
+      # del kernel MÁS NUEVO instalado, y aquí hay varios. La primera versión de
+      # este script usaba -u y dejó el initramfs del kernel EN USO sin la
+      # configuración, así que el cambio no habría surtido efecto al arrancar.
+      update-initramfs -u -k all >/dev/null 2>&1 || \
+        echo "aviso: no pude regenerar los initramfs; hazlo con: sudo update-initramfs -u -k all" >&2
+      echo "aorus-egpu-igpu-display: configuración retirada. Reinicia para que NVIDIA vuelva a registrar KMS." >&2
+    fi
+    ;;
+esac
+exit 0
