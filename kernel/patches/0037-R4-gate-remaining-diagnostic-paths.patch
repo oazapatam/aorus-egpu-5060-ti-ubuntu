@@ -1,0 +1,229 @@
+From: claude-opus-5 <noreply@local>
+Date: 2026-11-02
+Subject: [PATCH] aorus19 (0037) -- R4: gate the diagnostic paths that still touched the internal GPU
+
+Patch 0031 gates every ACTIVE lever (bus resets, AER mask writes, Q-active
+disconnect) and does it well: no write and no reset can reach the internal GPU.
+Patch 0032 then claimed to close "the three diagnostic paths". A static review
+of the applied series found that it did not: three diagnostic routines still ran
+on any NVIDIA GPU in the box, and the most frequent of them all was not even on
+0032's list.
+
+R4 exists because touching the internal 10de:2c39 produced an Xid 79. These are
+reads, not writes, so they do not reproduce that failure -- but they are MMIO
+pokes and config walks aimed at the device R4 says not to touch, and one of them
+fires on a device that may be in RTD3/GC6 at that moment, which is the state
+0031's own commit message names as the cause of the original Xid 79.
+
+Four gates plus one reordering:
+
+1. tb_egpu_lever_m_check_wpr2_at_probe() -- called unconditionally from
+   nv_pci_probe for EVERY NVIDIA GPU, so each probe of the internal dGPU
+   ioremap'd a page of its BAR0 and read the Blackwell WPR2 register at
+   +0x88a828 before RM had initialised anything. nvl->pci_dev is assigned at
+   nv_pci_probe:1925 and the call is at :1942, so the gate has what it needs.
+
+2. tb_egpu_lever_m_diag_dump() -- the frequent one, and the one 0032 missed. Two
+   ioremap()+ioread32() of BAR0 plus ~20 config reads, from five call sites
+   (probe-end, startdev-entry, pre-rmInit, post-rmInit-FAIL, post-rmInit-OK).
+   Anything opening /dev/nvidia<internal> -- nvidia-persistenced every ~10s,
+   nvidia-smi, the compositor -- was poking the internal GPU's BAR0 six times
+   per open.
+
+3. tb_egpu_lever_m_diag_dump_pdev() -- EXPORT_SYMBOL'd with no guard of its own.
+   It ioremaps pci_resource_start(pdev,0) + 0x88a828 without checking that the
+   offset falls inside BAR0. 0030 called it with the hardcoded BDF
+   0000:04:00.0, which on this machine is an NVMe with a 16 KiB BAR0: the read
+   landed outside the device entirely. 0032 fixed that caller, but an exported
+   function that pokes whatever pdev it is handed needs its own guardrail.
+
+4. tb_egpu_dump_aer_trigger_event() -- also EXPORT_SYMBOL'd, also with no
+   guardrail of its own. All six of its current call sites are gated, so
+   nothing reaches the internal GPU today, but a caller added later would
+   silently start walking GPU -> bridge -> root port (~40 config reads) on it.
+   Gated for the same reason as (3): an exported function should not depend on
+   its callers behaving.
+
+5. nv_pci_error_detected() -- the R4 gate was AFTER the one-shot telemetry
+   block, so the first AER event on the internal GPU ran the full "AORUS Mode-B
+   Trigger" walk (GPU -> bridge -> root port, ~40 config reads) before the gate
+   could say no. Moving the gate above that block also fixes a second bug for
+   free: s_tb_egpu_lever_m_logged is a single static shared by both GPUs, so one
+   benign AER event on the internal during boot consumed the only shot and a
+   real eGPU failure later left NO AER dump at all. With the gate first, only
+   the eGPU can spend the latch.
+
+Placement detail that matters: gates 2, 3 and 4 go BEFORE the aorus16 (0034)
+rate limiters, not after. tb_egpu_diag_rs, tb_egpu_uvmdiag_rs and
+tb_egpu_aer_diag_rs are file-scope
+DEFINE_RATELIMIT_STATE shared by both GPUs, so ungated dumps from the internal
+used to consume the eGPU's budget and silence the only dump that matters. Gating
+first makes the budget the eGPU's alone.
+
+Both gates are written `if (x && !os_pci_is_egpu_target(x))` so the existing
+NULL handling below them keeps running, and in particular keeps its error log
+rate-limited as before.
+
+NOT changed: the predicate itself (os_pci_is_egpu_target, 0031/0032), the active
+levers 0031 already gates, the remaining file-scope latches in the RM half
+(0006/0008/0011/0013 -- separate patch), and the missing link gate in the C
+(0020/0021 read LnkSta but nobody uses it as a gate -- separate patch).
+
+Verified: applies in order on top of 0001-0036 over the kernel-open half of
+595.99.02 (ci/40-kernel-patches.sh, section 7b), and every one of the four
+functions now reaches os_pci_is_egpu_target before its first ioremap or config
+walk. NOT
+compiled and NOT run on hardware: the DKMS package is superseded pending its
+595.71.05 -> 595.99.02 rebase.
+---
+diff --git a/kernel-open/nvidia/nv-lever-m-recover.c b/kernel-open/nvidia/nv-lever-m-recover.c
+index caac9cc..dde71ea 100644
+--- a/kernel-open/nvidia/nv-lever-m-recover.c
++++ b/kernel-open/nvidia/nv-lever-m-recover.c
+@@ -555,6 +555,20 @@ void tb_egpu_dump_aer_trigger_event(struct pci_dev *gpu_pdev,
+         return;
+     }
+ 
++    /* AORUS R4 gate (Patch 0037). EXPORT_SYMBOL'd with six call sites, all of
++     * them gated today -- but the function had no guardrail of its own, same
++     * problem as tb_egpu_lever_m_diag_dump_pdev. It walks GPU -> bridge ->
++     * root port with ~40 config reads, so an ungated caller added later would
++     * silently start reading the internal GPU's AER state.
++     *
++     * Before the rate limiter: tb_egpu_aer_diag_rs is file-scope and shared,
++     * so gating first keeps the whole budget for the eGPU. The watchdog
++     * snapshot path (out != NULL) still bypasses the limiter as 0034 intended;
++     * it only ever runs on the eGPU anyway, because 0031 gates
++     * tb_egpu_qwatchdog_init. */
++    if (!os_pci_is_egpu_target(gpu_pdev))
++        return;
++
+     /* AORUS aorus16 (Patch 0034): throttle logging-only callers (UVM close
+      * path and M-recover close path both pass out=NULL). The watchdog snapshot
+      * path (out != NULL) must always run to keep its AER data, so it bypasses
+@@ -640,6 +654,26 @@ void tb_egpu_lever_m_diag_dump(nv_linux_state_t *nvl, const char *site)
+     u32           wpr2_raw   = 0xdeadbeefu;
+     bool          pmc_ok = false, wpr2_ok = false;
+ 
++    /* AORUS R4 gate (Patch 0037). This dump does two ioremap()+ioread32() of
++     * BAR0 plus ~20 config reads, and it had NO gate: it fired on ANY NVIDIA
++     * GPU. Its five call sites (probe-end, startdev-entry, pre-rmInit,
++     * post-rmInit-FAIL/OK) mean anything opening /dev/nvidia<internal> —
++     * nvidia-persistenced every ~10s, nvidia-smi, the compositor — was poking
++     * the INTERNAL GPU's BAR0. Worse, the internal can be in RTD3/GC6 right
++     * then, which is the exact state Patch 0031 names as the cause of the
++     * original Xid 79.
++     *
++     * Patch 0032 claimed to have closed "the three diagnostic paths"; this,
++     * the most frequent of them all, was not among them.
++     *
++     * BEFORE the rate limiter on purpose: tb_egpu_diag_rs is a file-scope
++     * DEFINE_RATELIMIT_STATE shared by both GPUs, so dumps from the internal
++     * used to eat the eGPU's budget and silence the only dump that matters.
++     * The !nvl handling below is left where it was so its error log keeps
++     * being rate-limited. */
++    if (nvl && !os_pci_is_egpu_target(nvl->pci_dev))
++        return;
++
+     /* AORUS aorus16 (Patch 0034): throttle this [DIAG] dump (fires per RmInit
+      * retry: startdev-entry/pre-rmInit/post-rmInit-FAIL). Logging only. */
+     if (!__ratelimit(&tb_egpu_diag_rs))
+@@ -869,6 +903,19 @@ void tb_egpu_lever_m_diag_dump_pdev(struct pci_dev *pdev, const char *site)
+     u32 br_aer_unc = 0, br_aer_cor = 0;
+     int gpu_aer_pos = 0, br_aer_pos = 0;
+ 
++    /* AORUS R4 gate (Patch 0037). This function is EXPORT_SYMBOL'd and had no
++     * guard of its own: it ioremap()s pci_resource_start(pdev,0) + 0x88a828
++     * and reads it, with no check that the offset even falls inside BAR0.
++     * Patch 0030 called it with the hardcoded BDF 0000:04:00.0, which on this
++     * machine is an NVMe whose BAR0 is 16 KiB — the read landed outside the
++     * device entirely. Patch 0032 fixed that caller, but an exported function
++     * that pokes whatever pdev it is handed needs its own guardrail, not a
++     * well-behaved caller.
++     *
++     * Before the rate limiter, same reason as in tb_egpu_lever_m_diag_dump. */
++    if (pdev && !os_pci_is_egpu_target(pdev))
++        return;
++
+     /* AORUS aorus16 (Patch 0034): throttle this [UVM-DIAG] dump (fires on every
+      * UVM last-close). Logging only; skipping it also skips the ioremap. */
+     if (!__ratelimit(&tb_egpu_uvmdiag_rs))
+@@ -985,6 +1032,14 @@ bool tb_egpu_lever_m_check_wpr2_at_probe(nv_linux_state_t *nvl,
+     if (!nvl)
+         return false;
+ 
++    /* AORUS R4 gate (Patch 0037). Called unconditionally from nv_pci_probe for
++     * EVERY NVIDIA GPU, so each probe of the internal dGPU used to ioremap a
++     * page of its BAR0 and read the Blackwell WPR2 register at +0x88a828,
++     * before RM has initialised anything. nvl->pci_dev is assigned earlier in
++     * nv_pci_probe than this call site, so the gate has what it needs. */
++    if (!os_pci_is_egpu_target(nvl->pci_dev))
++        return false;
++
+     if (!NVreg_TbEgpuLeverMRecoverEnable || !nvl->lever_m)
+     {
+         /* Lever disabled or per-pdev state not allocated; nothing to do. */
+diff --git a/kernel-open/nvidia/nv-pci.c b/kernel-open/nvidia/nv-pci.c
+index 98b02d0..724ea07 100644
+--- a/kernel-open/nvidia/nv-pci.c
++++ b/kernel-open/nvidia/nv-pci.c
+@@ -2867,6 +2867,37 @@ nv_pci_error_detected(struct pci_dev *pci_dev, pci_channel_state_t state)
+     const char *result_str = "DISCONNECT";
+     const char *reason = "M-base (Enable=0)";
+ 
++    nvl = pci_get_drvdata(pci_dev);
++    if (nvl)
++        lm = nvl->lever_m;
++
++    /* AORUS R4 gate (Patch 0031): never drive a bus reset on anything but
++     * the external Thunderbolt eGPU. For the internal dGPU (or any non-eGPU)
++     * fall back to stock M-base DISCONNECT — exactly the upstream behaviour,
++     * so the kernel's normal teardown runs and the internal is never reset.
++     *
++     * MOVED UP by Patch 0037. It used to sit AFTER the one-shot telemetry
++     * block below, so the first AER event on the INTERNAL GPU ran the full
++     * "AORUS Mode-B Trigger" walk (GPU -> bridge -> root port, ~40 config
++     * reads) on a device R4 says not to touch. Config reads only, so the
++     * damage was low, but it is a diagnostic path acting on the internal —
++     * exactly what Patch 0032 claimed to have removed.
++     *
++     * Ordering it first fixes a second bug for free: s_tb_egpu_lever_m_logged
++     * is a single static shared by both GPUs, so one benign AER event on the
++     * internal during boot consumed the only shot and the real eGPU failure
++     * later left NO AER dump at all. With the gate first, only the eGPU can
++     * ever spend the latch.
++     *
++     * The drvdata read stays above the gate: it is a plain pci_get_drvdata(),
++     * no MMIO, and log_and_return needs `lm`. */
++    if (!os_pci_is_egpu_target(pci_dev))
++    {
++        result = PCI_ERS_RESULT_DISCONNECT;
++        reason = "M-base (R4 gate: not the eGPU target)";
++        goto log_and_return;
++    }
++
+     if (!s_tb_egpu_lever_m_logged)
+     {
+         s_tb_egpu_lever_m_logged = 1;
+@@ -2882,21 +2913,6 @@ nv_pci_error_detected(struct pci_dev *pci_dev, pci_channel_state_t state)
+         tb_egpu_dump_aer_trigger_event(pci_dev, "error-handler", NULL);
+     }
+ 
+-    nvl = pci_get_drvdata(pci_dev);
+-    if (nvl)
+-        lm = nvl->lever_m;
+-
+-    /* AORUS R4 gate (Patch 0031): never drive a bus reset on anything but
+-     * the external Thunderbolt eGPU. For the internal dGPU (or any non-eGPU)
+-     * fall back to stock M-base DISCONNECT — exactly the upstream behaviour,
+-     * so the kernel's normal teardown runs and the internal is never reset. */
+-    if (!os_pci_is_egpu_target(pci_dev))
+-    {
+-        result = PCI_ERS_RESULT_DISCONNECT;
+-        reason = "M-base (R4 gate: not the eGPU target)";
+-        goto log_and_return;
+-    }
+-
+     if (!NVreg_TbEgpuLeverMRecoverEnable || !lm)
+     {
+         /* M-base behaviour (Enable=0 OR per-device state not allocated). */

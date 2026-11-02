@@ -49,4 +49,5 @@ viven en [`../../kernel/patches/`](../../kernel/patches/).
 | [`tb4-pcie-topology.md`](./tb4-pcie-topology.md) | La topología real medida, y por qué los registros PCIe del túnel Thunderbolt son virtuales. |
 | [`tb4-tunnel-gen1-investigation.md`](./tb4-tunnel-gen1-investigation.md) | La hipótesis H18, falsificada midiendo: la lección de "medir, no leer registros". |
 | [`architecture-and-modularity.md`](./architecture-and-modularity.md) | Las capas L1-L7 y el coste de fork de cada una. |
+| [`open-driver-defects.md`](./open-driver-defects.md) | Los defectos **conocidos y no arreglados** de la serie de parches, con su análisis y qué falta para cerrarlos. |
 | [`services/`](./services/) | Un documento por servicio del stack Fedora. |

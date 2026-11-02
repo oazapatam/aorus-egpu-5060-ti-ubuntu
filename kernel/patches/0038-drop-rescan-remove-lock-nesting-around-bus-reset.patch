@@ -1,0 +1,93 @@
+From: claude-opus-5 <noreply@local>
+Date: 2026-11-02
+Subject: [PATCH] aorus20 (0038) -- drop the pci_lock_rescan_remove() nesting around pci_reset_bus()
+
+Removes one of two deadlock cycles in the M-recover work handler.
+
+THE CYCLE THIS PATCH CLOSES. The handler wrapped its bus reset in the global
+PCI rescan/remove lock:
+
+    pci_lock_rescan_remove();
+    rc = pci_reset_bus(bridge);
+    pci_unlock_rescan_remove();
+
+On a Thunderbolt hotplug the PCI core already holds pci_rescan_remove_lock
+while it runs the remove path, and that path reaches nv_pci_remove_helper ->
+tb_egpu_lever_m_recover_stop -> cancel_work_sync(&lm->reset_work), which waits
+for this handler to return. The handler then asked for the very lock the
+remover holds. AB-BA: the hotplug path wedges with the global rescan/remove
+lock held, and on this machine a hard hang loses the journal (it lives in RAM),
+so the result is also near-undebuggable.
+
+Reachable whenever recovery is in flight and the box is unplugged or the module
+is removed -- i.e. exactly during the failure the lever exists to handle.
+
+WHY REMOVING IT IS RIGHT, not just convenient: pci_reset_bus() takes
+pci_bus_lock() itself, and in-tree callers (vfio-pci among them) invoke it
+without holding pci_rescan_remove_lock. The nesting was adding a lock the API
+does not ask for.
+
+THE CYCLE THIS PATCH DOES NOT CLOSE, stated plainly so nobody reads this as
+"the deadlock is fixed": pci_reset_bus() -> pci_bus_lock() -> device_lock(gpu),
+while the remove path holds device_lock(gpu) and waits in cancel_work_sync().
+That cycle needs no global lock at all and survives this patch. Closing it
+means the work item's lifetime must stop depending on a synchronous cancel
+under device_lock -- a refcount on lm instead of the kfree() in _stop, or
+moving the reset out of the work item entirely. That is a redesign of the
+lifetime model, and a wrong refcount in a PCIe error path is a use-after-free,
+so it is not something to write blind against a driver that cannot currently be
+compiled. Options and trade-offs are in docs/research/open-driver-defects.md.
+
+Net effect: two deadlock cycles become one, with no change to object lifetimes
+and no new state.
+
+NOT changed: the reset itself, the settle msleep, the 0027 explicit
+slot_reset/resume dispatch, the refcount on pdev_for_work (which has its own
+leak on a cancelled-before-run work item -- also written up, also not fixed
+here).
+
+Verified: applies in order on top of 0001-0037 over the kernel-open half of
+595.99.02 (ci/40-kernel-patches.sh, section 7b). NOT compiled and NOT run on
+hardware.
+---
+diff --git a/kernel-open/nvidia/nv-lever-m-recover.c b/kernel-open/nvidia/nv-lever-m-recover.c
+index dde71ea..0db4306 100644
+--- a/kernel-open/nvidia/nv-lever-m-recover.c
++++ b/kernel-open/nvidia/nv-lever-m-recover.c
+@@ -253,10 +253,33 @@ static void tb_egpu_lever_m_reset_work_handler(struct work_struct *work)
+ 
+     tb_egpu_lever_m_emit_uevent(pdev, "RECOVERING");
+ 
+-    /* Serialise vs the kernel's PCI rescan/remove paths. */
+-    pci_lock_rescan_remove();
++    /* Patch 0038: NO pci_lock_rescan_remove() around this call.
++     *
++     * It used to wrap the reset, to "serialise vs the kernel's PCI
++     * rescan/remove paths". That nesting created a deadlock: on a Thunderbolt
++     * hotplug the PCI core already holds pci_rescan_remove_lock while it runs
++     * the remove path, and that path reaches nv_pci_remove_helper ->
++     * tb_egpu_lever_m_recover_stop -> cancel_work_sync(&lm->reset_work), which
++     * waits for THIS handler. The handler then asked for the same global lock
++     * the remover is holding: AB-BA, with the PCI hotplug path wedged and the
++     * global rescan/remove lock held. On this machine a hard hang loses the
++     * journal, so it would also be near-undebuggable.
++     *
++     * Dropping the nesting is also what upstream callers do: pci_reset_bus()
++     * takes pci_bus_lock() itself, and in-tree users (vfio-pci among them)
++     * call it without holding pci_rescan_remove_lock. We were adding a lock
++     * the API does not ask for.
++     *
++     * A SECOND deadlock cycle survives this patch and is NOT fixed here:
++     * pci_reset_bus() -> pci_bus_lock() -> device_lock(gpu), while the remove
++     * path holds device_lock(gpu) and waits in cancel_work_sync(). Closing
++     * that one needs the work item's lifetime to stop depending on a
++     * synchronous cancel under device_lock -- a refcount on lm instead of the
++     * kfree() in _stop -- which is a redesign, not an ordering tweak, and a
++     * wrong refcount here is a use-after-free in a PCIe error path. It is
++     * written up in docs/research/open-driver-defects.md with the options;
++     * this patch removes one of the two cycles without touching lifetimes. */
+     rc = pci_reset_bus(bridge);
+-    pci_unlock_rescan_remove();
+ 
+     /* Settle before any verification; gives the link time to retrain. */
+     msleep(NVreg_TbEgpuLeverMResetSettleMs);

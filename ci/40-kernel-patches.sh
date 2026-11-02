@@ -43,7 +43,7 @@ NV_VERSION="${NV_VERSION:-595.71.05}"
 # Cuántos parches ACTIVOS debe tener la serie. Es un invariante explícito: si
 # alguien añade o retira un parche tiene que tocar esta línea, y eso aparece en
 # el diff de la revisión en vez de pasar inadvertido.
-EXPECTED_ACTIVE=35
+EXPECTED_ACTIVE=37
 
 # El 0019 está desactivado a propósito (kernel/patches/disabled/).
 EXPECTED_DISABLED_NUMS="0019"
@@ -103,7 +103,7 @@ CP_IGNORE_MAIL="$CP_IGNORE_MAIL,PREFER_LORE_ARCHIVE"
 CP_IGNORE="$CP_IGNORE_STYLE,$CP_IGNORE_MAIL"
 
 # Tipos que son DEFECTO DE VERDAD, no estilo: fallan SIEMPRE, estén o no en el
-# baseline. Hoy los 35 parches dan cero en todos ellos, así que esta lista es
+# baseline. Hoy los 37 parches dan cero en todos ellos, así que esta lista es
 # un trinquete: un parche nuevo no puede colar ninguno.
 CP_FATAL="ASSIGN_IN_IF,UNNECESSARY_ELSE,DEFAULT_NO_BREAK,MEMSET"
 CP_FATAL="$CP_FATAL,MULTISTATEMENT_MACRO_USE_DO_WHILE,COMPLEX_MACRO"

@@ -48,3 +48,5 @@
 0034-aorus16-rate-limit-egpu-diagnostic-dumps.patch 0 4
 0035-aorus17-quiet-rm-close-path-diag.patch 0 0
 0036-aorus18-qwatchdog-publish-before-kthread-run.patch 0 1
+0037-R4-gate-remaining-diagnostic-paths.patch 0 5
+0038-drop-rescan-remove-lock-nesting-around-bus-reset.patch 0 1

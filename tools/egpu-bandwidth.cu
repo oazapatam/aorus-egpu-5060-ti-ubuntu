@@ -13,7 +13,15 @@
 //
 // Selecciona la GPU por PCI bus-id para no medir nunca la GPU interna por error.
 //
-// Compilar:  nvcc -O2 -o tools/egpu-bandwidth tools/egpu-bandwidth.cu
+// Compilar:  nvcc -O2 -arch=sm_120 -o tools/egpu-bandwidth tools/egpu-bandwidth.cu
+//
+//   El -arch NO es opcional en esta maquina para herramientas con kernels: con
+//   el toolkit 13.4 y el driver 595.99.02, el JIT de PTX del driver rechaza lo
+//   que genera nvcc ("the provided PTX was compiled with an unsupported
+//   toolchain"). Este fichero concreto se salva porque no tiene ningun
+//   __global__ -solo cudaMemcpy-, asi que no hay PTX que compilar en caliente;
+//   se pone igual para que la linea sirva de plantilla. Ambas GPUs de este host
+//   son compute capability 12.0 (comprobar: nvidia-smi --query-gpu=compute_cap).
 // Usar:      tools/egpu-bandwidth            (primera GPU externa que encuentre)
 //            tools/egpu-bandwidth B4:00.0    (bus-id concreto)
 //

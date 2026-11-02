@@ -162,8 +162,9 @@ Antes de tocar un paquete, comprueba su estado en
 Resumen:
 `egpu-tb-fix` es el principal y el único verificado en vivo;
 `aorus-egpu-config` y `aorus-egpu-nvidia-dkms` están **superseded** (archivo
-documentado, y el DKMS además necesita rebase de sus 35 parches de 595.71.05 a
-595.99.02);
+documentado, y el DKMS además necesita rebase de sus 37 parches de 595.71.05 a
+595.99.02; sus defectos conocidos y no arreglados están en
+[`docs/research/open-driver-defects.md`](./docs/research/open-driver-defects.md));
 `aorus-egpu-overclock` está **en desarrollo y sin validar en hardware**.
 
 No "arregles" la documentación para que encaje con el catálogo de levers:

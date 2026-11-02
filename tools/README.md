@@ -16,10 +16,19 @@ Exits 0 with `cuda_smoke=pass` on success, non-zero with the failed call name on
 
 No dependencies beyond `libcuda.so.1` (which ships with `xorg-x11-drv-nvidia-cuda-libs`). No CUDA toolkit, no PyTorch, no nvcc required.
 
+Targets the eGPU, selected by PCI bus-id.
+With no argument it picks the first NVIDIA GPU whose PCI device is marked
+`removable` in sysfs, which is the topological confirmation CLAUDE.md
+mandates;
+pass a bus-id to override.
+It used to call `cuDeviceGet(..., 0)`, and ordinal 0 on this machine is the
+*internal* GPU, so it reported `pass` without ever touching the eGPU.
+
 Run directly:
 
 ```bash
-python3 tools/cuda-driver-api-smoke-test.py
+python3 tools/cuda-driver-api-smoke-test.py            # the eGPU
+python3 tools/cuda-driver-api-smoke-test.py B4:00.0    # a specific bus-id
 ```
 
 WARNING: do NOT run this directly without first verifying `nvidia_uvm` is loaded (`lsmod | grep nvidia_uvm`). A failed `cuInit` on this stack — caused by `nvidia_uvm` not being loadable — leaves the GPU in a partially-initialised state that has caused delayed kernel panics. The compute-load loader pre-stages `nvidia_uvm` at boot, but if you have manually unloaded it or are diagnosing, the precondition matters.
@@ -109,6 +118,31 @@ Configurable via env vars:
 - `VENV_PATH` (default `/root/torch-test`)
 - `TEST_SCRIPT` (default `/root/aorus-5090-egpu/tools/pytorch-cuda-smoke-test.py`)
 - `OUT` (default `/root/aorus-pytorch-tty-test`)
+
+## Compiling CUDA on this machine: always pass `-arch`
+
+Measured 2026-11-02, and it bites silently:
+this host has CUDA toolkit **13.4** and driver **595.99.02**, and the driver's
+PTX JIT compiler rejects what that `nvcc` emits.
+
+```
+CUDA error the provided PTX was compiled with an unsupported toolchain.
+```
+
+Any binary that ships only PTX and relies on the driver to JIT it at load time
+**fails on this machine**.
+Compile for the real architecture so a cubin is embedded and no JIT is needed.
+Both GPUs here are compute capability **12.0**:
+
+```bash
+nvcc -O2 -arch=sm_120 -o tools/egpu-bandwidth tools/egpu-bandwidth.cu
+```
+
+`tools/egpu-bandwidth.cu` escapes the problem by accident — it contains no
+`__global__` kernels, only `cudaMemcpy` calls, so there is no PTX to JIT.
+The next CUDA tool added here will not be so lucky.
+Check with `nvidia-smi --query-gpu=compute_cap --format=csv` before assuming
+`sm_120`.
 
 ## Future tools
 
