@@ -40,6 +40,8 @@ SUPERSEDED_PKGS="aorus-egpu-config aorus-egpu-nvidia-dkms"
 GENERATED_PATHS="
 packaging/aorus-egpu-overclock/usr/lib/aorus-egpu
 packaging/aorus-egpu-overclock/usr/sbin/aorus-egpu-oc
+packaging/aorus-egpu-health/usr/lib/aorus-egpu
+packaging/aorus-egpu-health/usr/sbin/aorus-egpu-health
 packaging/aorus-egpu-forensics/usr/lib/aorus-egpu
 packaging/aorus-egpu-forensics/usr/sbin/aorus-egpu-probe
 packaging/aorus-egpu-forensics/usr/sbin/aorus-egpu-postmortem
@@ -686,6 +688,38 @@ else
     if [ "$ignored" -eq 0 ]; then
       ci_warn_with "$p no está cubierto por .gitignore" \
         "hoy no está versionado, pero un 'git add -A' tras un build lo añadiría."
+    fi
+  done
+fi
+
+ci_section "11. Dobles de test: nunca en un .deb"
+# =============================================================================
+# POR QUÉ: los dobles (src/adapters/*/fake.sh) viven en src/ porque son
+# adaptadores legítimos de su puerto y `aorus_adapter` los resuelve bajo
+# AORUS_LIB_ROOT. Pero bundle_core copia src/ ENTERO, así que sin una
+# exclusión explícita acaban dentro del paquete instalado.
+#
+# No es un problema de tamaño. `aorus-egpu-oc` eleva con `sudo -E`, que
+# PRESERVA AORUS_ADAPTER_GPU, de modo que con el doble instalado
+# `AORUS_ADAPTER_GPU=adapters/gpu/fake aorus-egpu-oc apply performance`
+# reportaría "perfil aplicado" sin haber escrito nada en la tarjeta. Un falso
+# éxito en una ruta de escritura es peor que no tener la herramienta.
+# La exclusión está en scripts/lib/bundle.sh; esto impide que se caiga.
+
+if ! command -v dpkg-deb >/dev/null 2>&1; then
+  ci_skip "sin dpkg-deb — no puedo inspeccionar los .deb"
+elif ! ls dist/*.deb >/dev/null 2>&1; then
+  ci_skip "no hay .deb en dist/ — ejecuta los build-*.sh antes"
+else
+  for deb in dist/*.deb; do
+    leaked="$(dpkg-deb -c "$deb" 2>/dev/null | awk '/\/fake\.sh$/ {print $NF}')"
+    if [ -n "$leaked" ]; then
+      ci_fail "doble de test ENTREGADO en $(basename "$deb")" \
+        "$leaked" \
+        "bundle_core copia src/ entero y la exclusión de fake.sh no se aplicó." \
+        "Revisa el 'find -name fake.sh -delete' de scripts/lib/bundle.sh."
+    else
+      ci_ok "sin dobles: $(basename "$deb")"
     fi
   done
 fi

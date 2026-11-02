@@ -8,6 +8,7 @@ La evidencia de por qué está en
 |---|---|---|---|
 | `egpu-tb-fix` | 1.5.0 | **principal** | **sí** — es lo que hace funcionar la eGPU hoy |
 | `aorus-egpu-forensics` | 0.1.0 | nuevo, recomendado al depurar | capas 1-2 sí; capa 3 (ramoops) por construcción |
+| `aorus-egpu-health` | 0.1.0 | nuevo — detector de incidentes | las reglas y el `scan` sí; el servicio de vigilancia continua, no |
 | `aorus-egpu-igpu-display` | 0.1.0 | nuevo — [diseño y medidas](../igpu-display.md) | el gate y el inventario sí; el cambio de modeset requiere reiniciar |
 | `aorus-egpu-overclock` | 0.1.0 | **en desarrollo, no usar** | no |
 | `aorus-egpu-config` | 0.5.9 | **superseded** (archivo) | lo estuvo hasta el 2026-06-28; purgado |
@@ -52,6 +53,8 @@ cada una se pueda instalar, revertir y razonar por separado:
 
 - `egpu-tb-fix` — que la eGPU enumere y bindee.
 - `aorus-egpu-forensics` — que un cuelgue deje evidencia.
+- `aorus-egpu-health` — que un incidente se sepa cuando pasa, con veredicto de
+  dónde mirar.
 - `aorus-egpu-overclock` — que se pueda ajustar potencia y relojes.
 
 Todas comparten el mismo núcleo `src/`, ensamblado en el payload por

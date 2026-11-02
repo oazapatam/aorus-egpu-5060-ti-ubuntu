@@ -1,0 +1,87 @@
+[Unit]
+Description=Vigilar los incidentes de salud de la eGPU AORUS (Xid, enlace, túnel)
+Documentation=man:journalctl(1)
+
+# La fuente de eventos es el journal del kernel (adapters/kevents/journalctl),
+# no /dev/kmsg: tras un cuelgue el journal en disco sobrevive y el buffer de
+# dmesg no. Así que journald tiene que estar antes que nosotros.
+After=systemd-journald.service
+
+# El registro persistente vive en /var/log/aorus-egpu/health. Si /var/log no
+# está montado todavía, el servicio arrancaría escribiendo en el sitio
+# equivocado (o fallando) justo en el arranque, que es cuando más incidentes
+# de conexión hay.
+RequiresMountsFor=/var/log
+
+# NO se espera a la eGPU ni a egpu-tb-fix.service a propósito: la eGPU es
+# hotplug y lo que se vigila incluye el arranque en el que NO está. Un
+# detector que solo corre cuando el dispositivo ya apareció no ve la pérdida
+# que ocurre durante la propia enumeración.
+
+# Sin límite de arranques. El límite por defecto (5 en 10 s) deja la unit en
+# 'failed' PARA SIEMPRE tras una racha, y un detector de incidentes apagado es
+# peor que inútil: da la impresión de que no pasó nada. Reiniciar cada 5 s es
+# inofensivo aquí porque el servicio solo lee el journal; no toca la GPU.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/aorus-egpu-health watch
+
+# health_watch() devuelve 75 (EX_TEMPFAIL) cuando la tubería de eventos se
+# cierra —journalctl muerto o rotado—; es una SEÑAL de "reinicíame", no un
+# fallo. Declararlo como éxito mantiene la unit fuera del estado 'failed', de
+# forma que un `systemctl is-failed` siga sirviendo para detectar un problema
+# de verdad (p. ej. un rc 70: no encuentra el núcleo en /usr/lib/aorus-egpu).
+SuccessExitStatus=75
+Restart=always
+RestartSec=5
+
+# El registro persistente lo crea systemd, no el servicio: con
+# ProtectSystem=strict un ReadWritePaths a un directorio que todavía no existe
+# haría fallar el arranque de la unit, y LogsDirectory= lo crea Y lo añade a
+# las rutas escribibles en el orden correcto. No se borra al parar la unit
+# (solo con `systemctl clean`), que es justo lo que se quiere: los incidentes
+# son evidencia.
+LogsDirectory=aorus-egpu/health
+LogsDirectoryMode=0750
+# 0640 en incidents.log: lleva direcciones PCI y estado del dispositivo.
+UMask=0027
+
+# --- endurecimiento ---------------------------------------------------------
+# Este servicio solo LEE el journal y escribe una línea por incidente. No
+# necesita nada más, así que no se le da nada más.
+#
+# Corre como root a propósito, no bajo User=: los ficheros del journal son
+# root:systemd-journal 0640 y el registro va a /var/log. Pero se le quitan
+# TODAS las capabilities: uid 0 es el dueño de ambas cosas, así que no hace
+# falta ni CAP_DAC_OVERRIDE.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# OJO si algún día se cambia el adaptador del puerto kevents: esto bloquea
+# /dev/kmsg y syslog(2). El adaptador journalctl no los usa; uno basado en
+# `dmesg` NO arrancaría con esto puesto.
+ProtectKernelLogs=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# AF_UNIX y nada más: es lo que usa el propio log al journal. El detector no
+# habla por red.
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

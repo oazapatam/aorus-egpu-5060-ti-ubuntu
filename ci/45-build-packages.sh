@@ -19,6 +19,7 @@ CI_STAGE=45-build-packages
 declare -A BUILD=(
   [egpu-tb-fix]="scripts/build-tb-fix.sh:critico"
   [aorus-egpu-forensics]="scripts/build-forensics.sh:critico"
+  [aorus-egpu-health]="scripts/build-health.sh:critico"
   [aorus-egpu-overclock]="scripts/build-overclock.sh:critico"
   [aorus-egpu-config]="scripts/build-config.sh:archivo"
 )

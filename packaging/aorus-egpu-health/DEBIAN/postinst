@@ -1,0 +1,64 @@
+#!/bin/sh
+# postinst de aorus-egpu-health.
+#
+# Idempotente: se puede reinstalar o reconfigurar sin duplicar nada. Y no falla
+# donde no hay systemd corriendo (contenedores, chroots de build): ahí se
+# instalan los ficheros y se deja dicho, en vez de romper el apt install.
+set -e
+
+case "$1" in
+  configure)
+    # El directorio lo crea también LogsDirectory= de la unit, pero se crea
+    # aquí para que `aorus-egpu-health check` a mano funcione desde el primer
+    # minuto, sin haber arrancado el servicio.
+    mkdir -p /var/log/aorus-egpu/health
+    chmod 0750 /var/log/aorus-egpu /var/log/aorus-egpu/health
+
+    # /run/systemd/system es la comprobación canónica de "systemd es el PID 1 y
+    # está vivo". Sin ella, systemctl aborta y con `set -e` el paquete quedaría
+    # a medio configurar en cualquier contenedor.
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl enable aorus-egpu-health.service >/dev/null 2>&1 || true
+      # restart, no start: en una actualización hay que recoger el núcleo nuevo
+      # de /usr/lib/aorus-egpu. Y con la unit ya corriendo, start no haría nada.
+      systemctl restart aorus-egpu-health.service >/dev/null 2>&1 || true
+    else
+      echo "aviso: systemd no está corriendo; el servicio queda instalado pero" >&2
+      echo "       sin habilitar. Habilítalo con:" >&2
+      echo "       sudo systemctl enable --now aorus-egpu-health.service" >&2
+    fi
+
+    cat <<'MSG'
+
+aorus-egpu-health instalado. El detector ya está vigilando.
+
+El servicio sigue el journal y registra cada incidente en cuanto se cierra su
+ventana de 30 s, con fsync:
+
+  /var/log/aorus-egpu/health/incidents.log
+
+A mano:
+  aorus-egpu-health status          resumen del registro
+  aorus-egpu-health scan '-2 days'  mirar atrás sin tocar disco
+  aorus-egpu-health check           registrar lo de este arranque (sale 1 si grave)
+  aorus-egpu-health explain tb_device_loss
+
+Revertir todo:  sudo apt remove aorus-egpu-health
+MSG
+
+    # Barrido del arranque ACTUAL, una sola vez, al instalar. El servicio sigue
+    # el journal desde AHORA, así que sin esto un incidente ocurrido ANTES de
+    # instalar el paquete —el caso típico: se instala porque acaba de pasar
+    # algo— no quedaría registrado nunca.
+    #
+    # Sin ruta absoluta: el PATH de los maintainer scripts incluye /usr/sbin.
+    # `|| true` porque `check` devuelve 1 cuando encuentra un incidente
+    # crítico, y eso es información, no un fallo de la instalación.
+    if command -v aorus-egpu-health >/dev/null 2>&1; then
+      echo "--- incidentes ya registrados en este arranque ---"
+      aorus-egpu-health check || true
+    fi
+    ;;
+esac
+exit 0

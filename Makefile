@@ -6,6 +6,7 @@
 #   make              -> paquetes soportados (tb-fix + forensics)
 #   make tb-fix       -> egpu-tb-fix            (PRINCIPAL, verificado en vivo)
 #   make forensics    -> aorus-egpu-forensics   (depurar cuelgues del host)
+#   make health       -> aorus-egpu-health      (detector de incidentes eGPU)
 #   make igpu-display -> aorus-egpu-igpu-display (escritorio en la iGPU Intel)
 #   make overclock    -> aorus-egpu-overclock   (EN DESARROLLO, sin validar)
 #   make config       -> aorus-egpu-config      (SUPERSEDED, archivo)
@@ -20,12 +21,13 @@
 # `make` NO construye los paquetes SUPERSEDED: aorus-egpu-config se pisaría con
 # egpu-tb-fix, y el DKMS está fijado a un driver que ya no es el instalado
 # (ver docs/what-actually-works.md). Tampoco construye overclock: está sin
-# validar en hardware todavía.
+# validar en hardware todavía. Ni health: su servicio de vigilancia continua no
+# se ha visto corriendo en esta máquina todavía (el CI sí lo construye).
 
 SHELL := /bin/bash
 DIST  := dist
 
-.PHONY: all tb-fix forensics igpu-display overclock config dkms ci ci-list lint test inspect clean
+.PHONY: all tb-fix forensics health igpu-display overclock config dkms ci ci-list lint test inspect clean
 
 # El CI local vive en ci/ (una etapa por fichero, ci/NN-*.sh) y lo orquesta
 # ci/run.sh, que ordena por número, no se para en el primer fallo y distingue
@@ -44,6 +46,9 @@ forensics: lint
 
 tb-fix: lint
 	@bash scripts/build-tb-fix.sh
+
+health: lint test
+	@bash scripts/build-health.sh
 
 igpu-display: lint test
 	@bash scripts/build-igpu-display.sh
@@ -80,6 +85,8 @@ clean:
 	@rm -f  packaging/aorus-egpu-igpu-display/usr/sbin/aorus-egpu-display
 	@rm -rf packaging/aorus-egpu-overclock/usr/lib/aorus-egpu
 	@rm -f  packaging/aorus-egpu-overclock/usr/sbin/aorus-egpu-oc
+	@rm -rf packaging/aorus-egpu-health/usr/lib/aorus-egpu
+	@rm -f  packaging/aorus-egpu-health/usr/sbin/aorus-egpu-health
 	@rm -rf packaging/aorus-egpu-forensics/usr/lib/aorus-egpu
 	@rm -f  packaging/aorus-egpu-forensics/usr/sbin/aorus-egpu-probe
 	@rm -f  packaging/aorus-egpu-forensics/usr/sbin/aorus-egpu-postmortem

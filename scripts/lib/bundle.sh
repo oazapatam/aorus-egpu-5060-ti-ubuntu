@@ -19,6 +19,18 @@ bundle_core() { # $1=dir raíz del repo  $2=dir del paquete  $3..=binarios de sr
   for layer in domain ports adapters app; do
     cp -a "$root/src/$layer" "$lib/$layer"
   done
+
+  # Los DOBLES DE TEST no se entregan. Viven en src/adapters/ porque son
+  # adaptadores legítimos de su puerto y `aorus_adapter` los resuelve bajo
+  # AORUS_LIB_ROOT, pero no son código de producción.
+  #
+  # No es una cuestión de tamaño: `aorus-egpu-oc` eleva con `sudo -E`, que
+  # PRESERVA AORUS_ADAPTER_GPU, así que con el doble instalado un
+  # `AORUS_ADAPTER_GPU=adapters/gpu/fake aorus-egpu-oc apply performance`
+  # reportaría "perfil aplicado" sin haber tocado la tarjeta. Un falso éxito
+  # en la ruta de escritura es peor que no tener la herramienta.
+  find "$lib" -type f -name 'fake.sh' -delete
+
   find "$lib" -type d -exec chmod 0755 {} +
   find "$lib" -type f -exec chmod 0644 {} +
 

@@ -48,6 +48,8 @@ build/
 # copies below are disposable output, not versioned files.
 packaging/aorus-egpu-overclock/usr/lib/aorus-egpu/
 packaging/aorus-egpu-overclock/usr/sbin/aorus-egpu-oc
+packaging/aorus-egpu-health/usr/lib/aorus-egpu/
+packaging/aorus-egpu-health/usr/sbin/aorus-egpu-health
 packaging/aorus-egpu-forensics/usr/lib/aorus-egpu/
 packaging/aorus-egpu-forensics/usr/sbin/aorus-egpu-probe
 packaging/aorus-egpu-forensics/usr/sbin/aorus-egpu-postmortem

@@ -1,0 +1,41 @@
+#!/bin/sh
+# postrm de aorus-egpu-health: devuelve el sistema a su estado original.
+#
+# Los incidentes registrados en /var/log/aorus-egpu/health/ NO se borran, ni
+# siquiera en purge: son evidencia que el usuario puede seguir necesitando (y
+# el historial que justifica la siguiente investigación). Se dice en pantalla
+# para que no quede como basura oculta.
+set -e
+
+UNIT=aorus-egpu-health.service
+
+case "$1" in
+  remove|purge)
+    if [ -d /run/systemd/system ]; then
+      # El orden importa: dpkg YA borró el fichero de la unit, pero systemd la
+      # mantiene cargada en memoria hasta el daemon-reload, así que `stop`
+      # todavía funciona. Después del reload ya no habría a quién parar y el
+      # proceso seguiría vivo hasta el siguiente reinicio.
+      systemctl stop "$UNIT" >/dev/null 2>&1 || true
+      systemctl disable "$UNIT" >/dev/null 2>&1 || true
+    fi
+
+    # Red de seguridad de la REVERSIBILIDAD: el enlace de habilitación lo creó
+    # el postinst (no dpkg), así que dpkg no lo borra. Y `systemctl disable`
+    # puede negarse cuando el fichero de la unit ya no existe, dejando un
+    # enlace colgando en /etc tras el apt remove. Se barre explícitamente; si
+    # disable ya lo quitó, el rm -f no hace nada.
+    rm -f /etc/systemd/system/multi-user.target.wants/"$UNIT"
+
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    if [ -d /var/log/aorus-egpu/health ]; then
+      echo "nota: los incidentes registrados se conservan en"
+      echo "      /var/log/aorus-egpu/health/incidents.log"
+      echo "      bórralos a mano si ya no los necesitas."
+    fi
+    ;;
+esac
+exit 0

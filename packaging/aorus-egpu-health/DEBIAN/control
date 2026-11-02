@@ -1,0 +1,62 @@
+Package: aorus-egpu-health
+Version: 0.1.0
+Architecture: all
+Maintainer: Omar Zapata <omar.zapata@arus.com.co>
+Section: admin
+Priority: optional
+Depends: bash, coreutils, sed, grep, mawk | gawk | original-awk, systemd
+Suggests: aorus-egpu-forensics
+Description: Detector de incidentes de la eGPU AORUS, con veredicto de causa
+ El 2026-11-02 a las 13:31:53 la eGPU sufrió un Xid 79 ("GPU has fallen off the
+ bus") y NADA avisó. Se descubrió a mano, rebuscando en dmesg, dos horas
+ después. Con una carga servida encima (vLLM), eso son dos horas devolviendo
+ errores sin saber por qué. Este paquete existe para que esa hora cero se sepa
+ en el momento en que pasa, y para que quede escrita en disco.
+ .
+ Pero avisar no era lo difícil. La pregunta que de verdad importaba —¿falló la
+ GPU, o se cayó la caja entera y la GPU es la víctima?— exigió correlacionar a
+ ojo los timestamps de USB, PCIe, Thunderbolt y NVRM. Eso no es trabajo
+ manual: es una REGLA, y aquí vive en el dominio, con test.
+ .
+ La regla, y por qué el USB es el que decide: en el incidente real el primer
+ evento fue "usb 6-2: USB disconnect", 3 ms ANTES del Link Down de PCIe, y la
+ ethernet r8152 de la caja se fue en el mismo instante. Un fallo de la GPU no
+ puede tirar la ethernet de la caja. Si el USB cae, cayó el dispositivo
+ entero.
+ .
+ De ahí salen los veredictos, que son lo único que hay que leer:
+ tb_device_loss (se fue el dispositivo Thunderbolt completo: mirar túnel,
+ energía, cable y ASPM/runtime PM del camino, NO la GPU), pcie_link_loss (cayó
+ solo la rama PCIe: mirar su puente/puerto), gpu_fault (Xid de pérdida con el
+ bus intacto: la GPU o el driver fallaron por su cuenta), degraded (avisos sin
+ pérdida) y healthy. Confundir el primero con el tercero manda la
+ investigación al sitio equivocado durante horas.
+ .
+ Un incidente es UNA línea. El incidente real emitió 237 mensajes NVRM en
+ 200 ms; listarlos uno a uno es exactamente el ruido del que veníamos, así que
+ los eventos de una ventana de 30 s se agrupan y se colapsan conservando el
+ orden de aparición ("gpu_lost x25"), porque el PRIMER evento es la pista de la
+ causa raíz. Una ventana con solo eventos de conexión NO se registra: llenar el
+ historial de falsos positivos entrena a ignorar la herramienta.
+ .
+ Trae aorus-egpu-health con scan (los incidentes de un periodo, sin tocar
+ disco), check (igual, pero los REGISTRA y sale 1 si hubo uno crítico: sirve de
+ sonda), status (resumen del registro) y explain (qué significa un veredicto, en
+ una línea, para las 3 de la mañana). Y aorus-egpu-health.service, que sigue el
+ journal en continuo y registra cada incidente en cuanto se cierra su ventana.
+ .
+ El registro va a /var/log/aorus-egpu/health/incidents.log y se escribe con
+ fsync, no por gusto: el caso que interesa registrar es justo el que puede
+ acabar en un cuelgue duro, y entonces el buffer sin volcar se pierde con la
+ RAM. Para la evidencia del cuelgue en sí —migas de pan, ramoops, postmortem—
+ el paquete que toca es aorus-egpu-forensics; este solo responde "qué pasó y
+ dónde mirar".
+ .
+ Lo que este paquete NO hace: no toca la GPU. Ni la externa ni la interna. Solo
+ lee el journal y escribe su registro, así que no puede provocar lo que vigila
+ y el gate R4 no le aplica porque no tiene ninguna diana.
+ .
+ Reversible: apt remove para y deshabilita el servicio y devuelve el sistema a
+ su estado original, sin reiniciar. Los incidentes ya registrados se conservan
+ en /var/log/aorus-egpu/health/ — son evidencia, y borrarlos al desinstalar
+ sería perder el historial que justifica la siguiente investigación.
