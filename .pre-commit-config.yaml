@@ -163,7 +163,7 @@ repos:
         stages: [pre-commit]
 
       # ----- Tests del dominio -----
-      # 51 asserts sobre las reglas puras (gate R4, salud del enlace, perfiles
+      # 62 asserts sobre las reglas puras (gate R4, salud del enlace, perfiles
       # de overclock) en ~0,3 s, sin root, sin GPU y sin tocar hardware. Esto
       # es exactamente lo que compra la arquitectura hexagonal, y es lo que
       # hace que quepa en un pre-commit: antes estas reglas solo se podían
@@ -173,7 +173,7 @@ repos:
       # tienen algo que decir cuando se toca src/ o los propios tests. El
       # barrido incondicional ya lo hace ci/30-unit-tests.sh.
       - id: domain-tests
-        name: tests/run.sh (51 asserts del dominio, sin root ni GPU)
+        name: tests/run.sh (62 asserts del dominio, sin root ni GPU)
         entry: bash tests/run.sh
         language: system
         pass_filenames: false
