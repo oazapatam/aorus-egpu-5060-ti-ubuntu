@@ -10,10 +10,20 @@ ordinal 0 es la GPU INTERNA (RTX PRO 4000). Daba `pytorch_smoke=pass` sin haber
 tocado la eGPU. La regla del repo (CLAUDE.md, gate R4) es direccionar por PCI
 bus-id y nunca por índice: los índices se reordenan entre arranques.
 
-El pin se hace con CUDA_VISIBLE_DEVICES=<bus-id> ANTES de importar torch, que
-es la única forma de fijar la GPU física sin depender del orden de enumeración
-del runtime (que por defecto es FASTEST_FIRST, no por bus). Así `cuda:0` dentro
-del proceso ES la eGPU, sin ambigüedad.
+CÓMO *NO* SE HACE, porque ya se intentó y falla EN SILENCIO:
+poner CUDA_VISIBLE_DEVICES="0000:B4:00.0" antes de importar torch. CUDA NO
+acepta bus-ids en esa variable -solo índices y `GPU-<uuid>`-, así que parsea la
+cadena como entero, `strtol` se para en el primer ':' y lo lee como índice 0.
+Resultado medido el 2026-11-02: `device_count=1` y
+`device_name=NVIDIA RTX PRO 4000` -o sea, el pin "funcionaba" y seleccionaba la
+GPU INTERNA-, con el test diciendo `pass`. Exactamente el fallo que se quería
+eliminar, por una vía nueva.
+
+CÓMO SE HACE: torch expone el bus de cada device en
+`torch.cuda.get_device_properties(i)` como `pci_domain_id` / `pci_bus_id` /
+`pci_device_id` (enteros; `pci_bus_id=180` es 0xB4). Se enumera, se empareja
+contra el BDF objetivo y se usa ese ordinal. Sin variables de entorno y sin
+suponer nada del orden de enumeración.
 
 Sale 0 con 'pytorch_smoke=pass'. Si algo falla, dice qué paso y sale != 0.
 
@@ -67,33 +77,65 @@ def find_egpu_bus_id():
     return None
 
 
-def pin_to_egpu():
-    """Fija CUDA_VISIBLE_DEVICES al bus-id de la eGPU. Antes de importar torch."""
-    want = sys.argv[1] if len(sys.argv) > 1 else None
+def parse_bdf(bdf):
+    """"0000:B4:00.0" o "B4:00.0" -> (dominio, bus, device) como enteros."""
+    text = bdf.strip().lower()
+    parts = text.split(":")
+    if len(parts) == 3:
+        domain, bus, rest = parts
+    elif len(parts) == 2:
+        domain, (bus, rest) = "0", parts
+    else:
+        return None
+    dev = rest.split(".")[0]
+    try:
+        return (int(domain, 16), int(bus, 16), int(dev, 16))
+    except ValueError:
+        return None
 
-    preset = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if preset and not want:
-        # Respetar una decisión explícita del entorno, pero dejarla registrada:
-        # si apunta a la interna, el 'pass' no valdría para la eGPU.
-        print(f"cuda_visible_devices=heredado:{preset}", flush=True)
-        return preset
 
-    bus_id = want or find_egpu_bus_id()
-    if not bus_id:
-        fail("find_egpu", RuntimeError(
-            "no hay ninguna GPU NVIDIA 'removable' en sysfs; "
-            "¿está conectada la eGPU? Pasa el bus-id a mano si lo sabes."))
+def pick_ordinal(torch, want_bdf):
+    """Ordinal de torch cuyo BDF coincide con want_bdf. Enumera y empareja.
 
-    # CUDA_VISIBLE_DEVICES acepta bus-ids PCI, no solo índices.
-    os.environ["CUDA_VISIBLE_DEVICES"] = bus_id
-    print(f"cuda_visible_devices={bus_id}", flush=True)
-    return bus_id
+    No se usa CUDA_VISIBLE_DEVICES: no acepta bus-ids y los lee como índices
+    (ver la cabecera de este fichero).
+    """
+    target = parse_bdf(want_bdf)
+    if target is None:
+        fail("parse_bdf", ValueError(f"no entiendo el bus-id {want_bdf!r}"))
+
+    chosen = None
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        here = (props.pci_domain_id, props.pci_bus_id, props.pci_device_id)
+        hit = (here == target) and chosen is None
+        print("gpu %d  %04x:%02x:%02x.0  %s%s"
+              % (i, here[0], here[1], here[2], props.name,
+                 "   <-- elegida" if hit else ""), flush=True)
+        if hit:
+            chosen = i
+
+    if chosen is None:
+        fail("pick_ordinal", RuntimeError(
+            f"ninguna GPU visible de torch está en {want_bdf}; "
+            "¿está conectada la eGPU, o CUDA_VISIBLE_DEVICES la oculta?"))
+    return chosen
 
 
 def main():
-    # 0. Fijar la GPU física ANTES de importar torch: al importar, el runtime
-    #    ya congela la lista de devices visibles.
-    target_bus_id = pin_to_egpu()
+    # 0. Resolver el BDF objetivo antes de nada: argumento explícito o la
+    #    primera GPU NVIDIA marcada `removable` en sysfs.
+    target_bus_id = sys.argv[1] if len(sys.argv) > 1 else find_egpu_bus_id()
+    if not target_bus_id:
+        fail("find_egpu", RuntimeError(
+            "no hay ninguna GPU NVIDIA 'removable' en sysfs; "
+            "¿está conectada la eGPU? Pasa el bus-id a mano si lo sabes."))
+    print(f"target_bus_id={target_bus_id}", flush=True)
+    preset = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if preset:
+        # Se respeta, pero se deja registrado: si oculta la eGPU, el emparejado
+        # de abajo falla en vez de probar otra GPU.
+        print(f"cuda_visible_devices=heredado:{preset}", flush=True)
 
     # 1. Import torch
     try:
@@ -117,27 +159,25 @@ def main():
     if dc < 1:
         fail("device_count_zero")
 
-    # Con el pin por bus-id el proceso debe ver UNA sola GPU: la eGPU. Si ve
-    # más, el pin no se aplicó y `cuda:0` podría ser la interna, así que el
-    # resultado del test no significaría lo que dice significar.
-    if dc != 1:
-        fail("pin_not_applied", RuntimeError(
-            f"esperaba 1 GPU visible tras fijar {target_bus_id}, veo {dc}"))
-    print(f"target_bus_id={target_bus_id}", flush=True)
+    # Emparejar el BDF objetivo con un ordinal de torch. Aquí está el valor del
+    # test: si esto elige la GPU equivocada, todo lo que venga después es un
+    # `pass` que no significa nada.
+    ordinal = pick_ordinal(torch, target_bus_id)
+    print(f"ordinal={ordinal}", flush=True)
 
     try:
-        name = torch.cuda.get_device_name(0)
+        name = torch.cuda.get_device_name(ordinal)
     except Exception as e:
         fail("device_name", e)
     print(f"device_name={name}", flush=True)
 
     try:
-        cap_major, cap_minor = torch.cuda.get_device_capability(0)
+        cap_major, cap_minor = torch.cuda.get_device_capability(ordinal)
     except Exception as e:
         fail("device_capability", e)
     print(f"compute_capability={cap_major}.{cap_minor}", flush=True)
 
-    d = torch.device("cuda:0")
+    d = torch.device(f"cuda:{ordinal}")
 
     # 4. Allocate deterministic tensors on CUDA
     print("before_tensor_alloc=ok", flush=True)
@@ -176,8 +216,8 @@ def main():
 
     # 7. Memory stats
     try:
-        alloc = torch.cuda.memory_allocated(0)
-        reserved = torch.cuda.memory_reserved(0)
+        alloc = torch.cuda.memory_allocated(ordinal)
+        reserved = torch.cuda.memory_reserved(ordinal)
     except Exception as e:
         fail("memory_stats", e)
     print(f"memory_allocated_bytes={alloc}", flush=True)

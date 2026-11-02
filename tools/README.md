@@ -73,21 +73,42 @@ deterministic correctness check (every element of result == 1024.0)
 
 Reports `torch_version`, `torch_cuda_version`, `compute_capability`, and post-test memory stats. Exits 0 with `pytorch_smoke=pass` on success.
 
-Requires `torch` installed in a venv. Setup once:
+Targets the eGPU by PCI bus-id, like the Driver API test.
+It enumerates `torch.cuda.get_device_properties(i)` and matches
+`pci_domain_id`/`pci_bus_id`/`pci_device_id` against the target BDF, printing
+every GPU it saw and marking the one it chose, so a `pass` is auditable.
+
+Do **not** try to pin the GPU with `CUDA_VISIBLE_DEVICES=<bus-id>`.
+That variable accepts only indices and `GPU-<uuid>`, never bus-ids:
+CUDA parses the string as an integer, `strtol` stops at the first `:`, and
+`"0000:B4:00.0"` becomes **index 0**.
+Measured here on 2026-11-02, that produced `device_count=1` and
+`device_name=NVIDIA RTX PRO 4000` — the pin appeared to work and selected the
+*internal* GPU, with the test still reporting `pass`.
+
+Requires `torch` in a venv.
+Setup once, in a venv of its own — do not install ~3 GB of PyTorch into a
+project venv:
 
 ```bash
-python3 -m venv /root/torch-test
-/root/torch-test/bin/pip install --upgrade pip
-/root/torch-test/bin/pip install torch
+uv venv ~/.venvs/egpu-torch-test
+VIRTUAL_ENV=~/.venvs/egpu-torch-test uv pip install torch
 ```
 
-This downloads ~3 GB of PyTorch + CUDA runtime wheels. Takes 5-10 minutes depending on bandwidth.
+Without `uv`, `python3 -m venv` plus `pip install torch` does the same job more
+slowly.
+Either way it pulls ~3 GB of PyTorch and CUDA runtime wheels.
 
 Run directly (after venv setup):
 
 ```bash
-/root/torch-test/bin/python3 tools/pytorch-cuda-smoke-test.py
+~/.venvs/egpu-torch-test/bin/python3 tools/pytorch-cuda-smoke-test.py             # the eGPU
+~/.venvs/egpu-torch-test/bin/python3 tools/pytorch-cuda-smoke-test.py 0000:B4:00.0
 ```
+
+Verified on this host with torch 2.15.0+cu132: picks ordinal 1
+(`0000:b4:00.0`, the GeForce RTX 5060 Ti), runs the GEMM and passes.
+A bus-id that matches nothing exits 1 instead of falling back to another GPU.
 
 WARNING: same precondition as the CUDA Driver API test - `nvidia_uvm` must be loaded. The TTY runner (`tty-pytorch-test.sh`) checks this before invoking the test.
 
