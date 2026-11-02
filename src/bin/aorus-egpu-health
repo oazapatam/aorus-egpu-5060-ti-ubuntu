@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# aorus-egpu-health — detecta y registra los incidentes de salud de la eGPU.
+#
+# Nació de un Xid 79 real (2026-11-02 13:31:53) que nadie vio hasta dos horas
+# después, buscándolo a mano en dmesg. Esto lo convierte en una línea con
+# veredicto, y distingue "se cayó la caja" de "falló la GPU", que es la
+# diferencia entre investigar el túnel y perder el tiempo con el driver.
+set -uo pipefail
+
+for _root in "$(dirname "$(readlink -f "$0")")/.." /usr/lib/aorus-egpu; do
+  if [ -r "$_root/bootstrap.sh" ]; then . "$_root/bootstrap.sh"; break; fi
+done
+if ! declare -F aorus_use >/dev/null; then
+  printf 'aorus-egpu-health: no encuentro bootstrap.sh\n' >&2; exit 70
+fi
+aorus_use app/health
+
+usage() {
+  cat <<-USAGE
+	aorus-egpu-health — incidentes de salud de la eGPU, con veredicto de causa
+
+	Uso:
+	  aorus-egpu-health scan [desde]    lista incidentes (por defecto: este arranque)
+	  aorus-egpu-health watch           vigila en continuo (modo del servicio)
+	  aorus-egpu-health check [desde]   igual, pero REGISTRA en disco y avisa
+	  aorus-egpu-health status          resumen del registro persistente
+	  aorus-egpu-health explain <v>     qué significa un veredicto
+
+	<desde> es cualquier expresión que entienda journalctl --since
+	("-30 min", "13:31:45", "2026-11-02"), o "boot" para el arranque actual.
+
+	Veredictos:
+	  tb_device_loss   se fue el dispositivo Thunderbolt entero (USB + PCIe)
+	  pcie_link_loss   cayó solo la rama PCIe de la eGPU
+	  gpu_fault        Xid de pérdida con el bus intacto
+	  degraded         avisos sin pérdida del dispositivo
+	  healthy          nada que reportar
+
+	watch es BLOQUEANTE y es lo que ejecuta aorus-egpu-health.service.
+	Sale 75 si la fuente de eventos se cierra, para que systemd lo reinicie.
+
+	check sale 1 si hubo un incidente crítico: sirve de sonda.
+	Registro: \${AORUS_HEALTH_DIR:-/var/log/aorus-egpu/health}/incidents.log
+	USAGE
+}
+
+cmd="${1:-}"; [ "$#" -gt 0 ] && shift
+
+case "$cmd" in
+  scan)
+    out="$(health_scan "${1:-boot}")"; rc=$?
+    if [ -z "$out" ]; then
+      printf 'sin incidentes desde %s — veredicto=healthy\n' "${1:-el arranque}"
+      exit 0
+    fi
+    printf '%s\n' "$out"
+    # La explicación va una sola vez por veredicto distinto, no por incidente:
+    # un registro con 40 caídas no necesita 40 copias del mismo párrafo.
+    printf '\n'
+    printf '%s\n' "$out" | sed -n 's/.*veredicto=\([a-z_]*\).*/\1/p' | sort -u | while read -r v; do
+      printf '%s: %s\n' "$v" "$(health_explain "$v")"
+    done
+    exit "$rc"
+    ;;
+  check)
+    health_scan_and_record "${1:-boot}"
+    exit $?
+    ;;
+  watch)
+    # Bloqueante a propósito: es el ExecStart del servicio. No se le pasa
+    # "desde" porque sigue el journal desde AHORA; el pasado es cosa de `check`,
+    # que el postinst ejecuta una vez al instalar.
+    health_watch "${1:-}"
+    exit $?
+    ;;
+  status)
+    f="${AORUS_HEALTH_DIR:-/var/log/aorus-egpu/health}/incidents.log"
+    if [ ! -s "$f" ]; then printf 'registro vacío (%s)\n' "$f"; exit 0; fi
+    printf 'registro: %s\n' "$f"
+    printf 'incidentes totales: %s\n' "$(grep -c . "$f")"
+    printf '\npor veredicto:\n'
+    sed -n 's/.*veredicto=\([a-z_]*\).*/\1/p' "$f" | sort | uniq -c | sort -rn | sed 's/^/  /'
+    printf '\núltimo:\n  %s\n' "$(tail -1 "$f")"
+    ;;
+  explain)
+    [ -n "${1:-}" ] || { printf 'falta el veredicto\n' >&2; usage >&2; exit 2; }
+    printf '%s: %s\n' "$1" "$(health_explain "$1")"
+    ;;
+  -h|--help|help)
+    usage ;;
+  '')
+    usage >&2; exit 2 ;;
+  *)
+    printf 'comando desconocido: %s\n' "$cmd" >&2; usage >&2; exit 2 ;;
+esac

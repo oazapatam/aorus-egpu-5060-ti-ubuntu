@@ -150,6 +150,91 @@ yes_ "power_limit es op válida"   domain_oc_op_is_valid power_limit
 yes_ "reset es op válida"         domain_oc_op_is_valid reset
 no_  "op inventada se rechaza"    domain_oc_op_is_valid overvolt_now
 
+echo "== domain/health: clasificar lo que dice el kernel =="
+# Las líneas son LITERALES del incidente del 2026-11-02 13:31:52-53, copiadas
+# del journal. Si NVIDIA o el kernel cambian la redacción, estos asserts fallan
+# y hay que actualizar los patrones -que es exactamente lo que se quiere, en vez
+# de un detector que calla porque dejó de reconocer el mensaje.
+XID79='NVRM: Xid (PCI:0000:b4:00): 79, GPU has fallen off the bus.'
+XID154='NVRM: Xid (PCI:0000:b4:00): 154, GPU recovery action changed from 0x0 (None) to 0x1 (GPU Reset Required)'
+USBDIS='usb 6-2: USB disconnect, device number 2'
+LINKDN='pcieport 0000:89:03.0: pciehp: Slot(3): Link Down'
+CARDGO='pcieport 0000:89:03.0: pciehp: Slot(3): Card not present'
+TBDIS='thunderbolt 1-3: device disconnected'
+TBCON='thunderbolt 1-3: new device found, vendor=0xed device=0x41cd'
+LINKUP='pcieport 0000:89:03.0: pciehp: Slot(3): Link Up'
+GPULOST='NVRM: nvCheckOkFailedNoLog: Check failed: GPU lost from the bus [NV_ERR_GPU_IS_LOST] (0x0000000F)'
+
+is "Xid 79 se clasifica"        "$(domain_health_classify "$XID79")"   "xid_fallen_off_bus"
+is "Xid 154 se clasifica"       "$(domain_health_classify "$XID154")"  "xid_recovery_required"
+is "USB disconnect"             "$(domain_health_classify "$USBDIS")"  "usb_disconnect"
+is "Link Down"                  "$(domain_health_classify "$LINKDN")"  "pcie_link_down"
+is "Card not present"           "$(domain_health_classify "$CARDGO")"  "pcie_card_gone"
+is "TB disconnect"              "$(domain_health_classify "$TBDIS")"   "tb_disconnect"
+is "TB connect"                 "$(domain_health_classify "$TBCON")"   "tb_connect"
+is "Link Up"                    "$(domain_health_classify "$LINKUP")"  "pcie_link_up"
+is "GPU lost from the bus"      "$(domain_health_classify "$GPULOST")" "gpu_lost"
+is "una linea cualquiera"       "$(domain_health_classify 'usb 1-1: new high-speed USB device')" "none"
+is "linea vacia"               "$(domain_health_classify '')"         "none"
+# El orden del case importa: "fallen off the bus" contiene "Xid" y debe ganar
+# al patrón genérico, o el Xid 79 se degradaría a xid_other.
+is "Xid 79 NO cae en xid_other" "$(domain_health_classify "$XID79")"   "xid_fallen_off_bus"
+is "un Xid sin patron propio"   "$(domain_health_classify 'NVRM: Xid (PCI:0000:b4:00): 13, Graphics SM Warp Exception')" "xid_other"
+
+echo "== domain/health: severidad =="
+is "Xid 79 es critical"    "$(domain_health_severity xid_fallen_off_bus)" "critical"
+is "Link Down es critical" "$(domain_health_severity pcie_link_down)"     "critical"
+is "TB connect es info"    "$(domain_health_severity tb_connect)"         "info"
+is "gpu_lost es warning"   "$(domain_health_severity gpu_lost)"           "warning"
+is "clase none"            "$(domain_health_severity none)"               "none"
+
+echo "== domain/health: extraer Xid y BDF =="
+is "numero de Xid 79"      "$(domain_health_xid_number "$XID79")"  "79"
+is "numero de Xid 154"     "$(domain_health_xid_number "$XID154")" "154"
+no_ "sin Xid no hay numero" domain_health_xid_number "$USBDIS"
+# El journal da "0000:b4:00" sin función; sysfs la necesita.
+is "BDF normaliza la funcion" "$(domain_health_xid_bdf "$XID79")" "0000:b4:00.0"
+no_ "sin Xid no hay BDF"      domain_health_xid_bdf "$LINKDN"
+yes_ "79 es perdida de dispositivo"  domain_health_xid_is_device_loss 79
+yes_ "154 es perdida de dispositivo" domain_health_xid_is_device_loss 154
+no_  "13 NO es perdida"              domain_health_xid_is_device_loss 13
+
+echo "== domain/health: veredicto de incidente (la regla que importa) =="
+# La secuencia REAL del 2026-11-02, en el orden exacto en que ocurrio.
+is "la secuencia real = perdida del dispositivo TB" \
+   "$(domain_health_incident_verdict usb_disconnect pcie_link_down pcie_card_gone tb_disconnect xid_fallen_off_bus tb_connect pcie_link_up)" \
+   "tb_device_loss"
+# Sin USB, la caida es solo de la rama PCIe de la GPU.
+is "link down sin USB = perdida del enlace PCIe" \
+   "$(domain_health_incident_verdict pcie_link_down xid_fallen_off_bus)" \
+   "pcie_link_loss"
+# Xid con el bus INTACTO: eso si seria culpa de la GPU o del driver.
+is "Xid sin caida de enlace = fallo de GPU" \
+   "$(domain_health_incident_verdict xid_fallen_off_bus gpu_lost)" \
+   "gpu_fault"
+is "solo avisos = degradado"  "$(domain_health_incident_verdict gpu_lost xid_other)" "degraded"
+is "nada = sano"              "$(domain_health_incident_verdict)"                    "healthy"
+is "solo ruido = sano"        "$(domain_health_incident_verdict none none)"          "healthy"
+# El arranque normal: la caja se conecta y el enlace sube, sin caida previa.
+# Esto salia 'degraded' y llenaba el registro de falsos positivos.
+is "solo conexion (arranque) = sano" \
+   "$(domain_health_incident_verdict tb_connect pcie_card_present pcie_link_up)" "healthy"
+# USB solo, sin PCIe ni tunel detras: NO se puede atribuir a la caja -podria
+# ser cualquier pendrive-, asi que no se reporta. Ver la limitacion documentada
+# en domain/health.sh: 6 casos ajenos en 13 dias de journal frente a 0 caidas
+# reales de la caja sin Link Down.
+is "USB suelto no se atribuye a la eGPU" \
+   "$(domain_health_incident_verdict usb_disconnect)"     "healthy"
+# El USB manda aunque solo haya tb_disconnect y ningun Link Down.
+is "USB + TB disconnect = perdida del dispositivo" \
+   "$(domain_health_incident_verdict usb_disconnect tb_disconnect)" "tb_device_loss"
+
+echo "== domain/health: recuperacion =="
+yes_ "con TB connect hubo recuperacion" \
+     domain_health_incident_recovered usb_disconnect pcie_link_down tb_connect
+no_  "sin reconexion no hubo recuperacion" \
+     domain_health_incident_recovered usb_disconnect pcie_link_down xid_fallen_off_bus
+
 echo "== ports: todo adaptador cumple su contrato =="
 aorus_use ports/gpu.port ports/pci.port ports/log.port ports/thunderbolt.port ports/trace.port
 ( aorus_use adapters/gpu/nvidia-smi        && port_gpu_assert ) >/dev/null 2>&1 \
@@ -266,6 +351,62 @@ rc_plan=$?
 # Un fallo NORMAL no aborta: se intentan las tres y se reporta error al final.
 is "fallo normal: no aborta el plan"  "$(grep -c . "$WL")" "3"
 is "y el ejecutor devuelve 1"         "$rc_plan"           "1"
+
+echo "== app/health: el acumulador (orquestacion, no reglas) =="
+# Estos asserts existen por un BUG REAL: _health_acc_emit se llamaba con
+# sustitucion de comandos, o sea en un SUBSHELL, asi que su _health_acc_reset
+# no llegaba al proceso padre y el acumulador NO se vaciaba nunca. Sobre 13
+# dias de journal daba 13 incidentes con el mismo instante de inicio, dur
+# creciendo hasta 929465 s, el BDF de la GPU INTERNA pegado del primer evento,
+# y 5 tb_device_loss donde solo hay 2. El dominio estaba correcto; lo roto era
+# la orquestacion, que ningun test del dominio podia ver.
+AORUS_ADAPTER_KEVENTS=adapters/kevents/fake; export AORUS_ADAPTER_KEVENTS
+AORUS_HEALTH_DIR="$TD/health"; export AORUS_HEALTH_DIR
+AORUS_KEVENTS_FIXTURE="$TD/kevents.txt"; export AORUS_KEVENTS_FIXTURE
+aorus_use app/health
+# health_scan imprime los incidentes; al pasarlo a un assert hay que callarlo o
+# ensucia la salida del runner.
+quiet() { "$@" >/dev/null 2>&1; }
+
+# DOS incidentes separados por mas de la ventana (30 s por defecto):
+#  - el primero a las 1000, solo avisos de la GPU interna -> degraded
+#  - el segundo a las 2000, la secuencia real de perdida del dispositivo
+{
+  printf '1000.100\tNVRM: Xid (PCI:0000:01:00): 13, Graphics SM Warp Exception\n'
+  printf '2000.903\tusb 6-2: USB disconnect, device number 2\n'
+  printf '2000.906\tpcieport 0000:89:03.0: pciehp: Slot(3): Link Down\n'
+  printf '2000.907\tthunderbolt 1-3: device disconnected\n'
+  printf '2001.213\tNVRM: Xid (PCI:0000:b4:00): 79, GPU has fallen off the bus.\n'
+} > "$AORUS_KEVENTS_FIXTURE"
+
+out="$(health_scan whatever)"
+is "el acumulador separa 2 incidentes"  "$(printf '%s\n' "$out" | grep -c 'veredicto=')" "2"
+is "el 1o es degraded"                  "$(printf '%s\n' "$out" | sed -n '1s/.*veredicto=\([a-z_]*\).*/\1/p')" "degraded"
+is "el 2o es perdida del dispositivo"   "$(printf '%s\n' "$out" | sed -n '2s/.*veredicto=\([a-z_]*\).*/\1/p')" "tb_device_loss"
+# El sintoma mas claro del bug: el BDF del primer evento se quedaba pegado a
+# TODOS los incidentes siguientes, atribuyendo la caida a la GPU interna.
+is "cada incidente lleva SU bdf"        "$(printf '%s\n' "$out" | sed -n '2s/.*bdf=\([^ ]*\).*/\1/p')" "0000:b4:00.0"
+is "el 1o NO contamina al 2o"           "$(printf '%s\n' "$out" | sed -n '1s/.*bdf=\([^ ]*\).*/\1/p')" "0000:01:00.0"
+# Con el bug, dur era la distancia al PRIMER evento de todo el barrido.
+is "la duracion es la del incidente"    "$(printf '%s\n' "$out" | sed -n '2s/.*dur=\([0-9]*\)s.*/\1/p')" "1"
+no_ "health_scan devuelve 1 si hay critico" quiet health_scan whatever
+
+# El acumulador queda vacio tras emitir: si no, el siguiente barrido arrastra.
+_health_acc_reset
+no_ "tras reset el acumulador esta cerrado" _health_acc_open
+
+# Una ventana de solo conexion (el arranque) no se reporta como incidente.
+printf '3000.100\tthunderbolt 1-3: new device found, vendor=0xed\n' > "$AORUS_KEVENTS_FIXTURE"
+is "el arranque no genera incidente" "$(health_scan whatever | grep -c 'veredicto=')" "0"
+
+# Y el registro persistente recibe lo mismo que se reporto.
+{
+  printf '4000.903\tusb 6-2: USB disconnect, device number 2\n'
+  printf '4000.906\tpcieport 0000:89:03.0: pciehp: Slot(3): Link Down\n'
+} > "$AORUS_KEVENTS_FIXTURE"
+health_scan_and_record whatever >/dev/null 2>&1
+is "health_record escribe el incidente" \
+   "$(grep -c 'tb_device_loss' "$AORUS_HEALTH_DIR/incidents.log" 2>/dev/null)" "1"
 
 printf '\n%d pasados, %d fallados\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
