@@ -218,4 +218,13 @@ repos:
     hooks:
       - id: markdownlint
         stages: [pre-push]
+        # `language_version: system` usa el node ya instalado en vez de que
+        # pre-commit monte uno con nodeenv. Medido el 2026-11-02: el nodeenv
+        # de Ubuntu (/usr/lib/python3/dist-packages/nodeenv.py) revienta al
+        # resolver la version mas nueva de node, porque parse_version() no
+        # sabe leer un sufijo como "0-alpha" de la lista de nodejs.org:
+        #   ValueError: invalid literal for int() with base 10: '0-alpha'
+        # Eso hacia FALLAR EL PUSH ENTERO por un bug del instalador, sin que
+        # hubiera nada que objetar en los .md. Con `system` no se monta nada.
+        language_version: system
         args: ['--config', '.markdownlint.yaml', '--ignore', 'archive', '--ignore', 'patches']
