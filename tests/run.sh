@@ -10,7 +10,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AORUS_LIB_ROOT="$ROOT/src"; export AORUS_LIB_ROOT
 . "$ROOT/src/bootstrap.sh"
-aorus_use domain/target domain/link domain/overclock domain/display
+aorus_use domain/target domain/link domain/overclock domain/display domain/health
 
 pass=0 fail=0
 ok()   { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
@@ -195,6 +195,77 @@ is "trace_end cierra el meta"       "$(grep -c '^estado:' "$AORUS_TRACE_DIR/00-m
 # Sin traza abierta, trace_mark no debe explotar ni escribir fuera de sitio.
 AORUS_TRACE_DIR=""
 yes_ "trace_mark sin traza abierta no falla" trace_mark "HUERFANO" ""
+
+echo "== app/overclock: los gates de seguridad (con dobles de puerto) =="
+# Estos asserts existen porque la auditoria del 2026-11-02 encontro TRES huecos
+# de seguridad en app/, no en el dominio, y ningun test podia verlos: hacen
+# falta un enlace roto y un nvidia-smi colgado, que con hardware real no se
+# provocan a voluntad. Con los dobles es trivial.
+AORUS_ADAPTER_GPU=adapters/gpu/fake; export AORUS_ADAPTER_GPU
+AORUS_ADAPTER_PCI=adapters/pci/fake; export AORUS_ADAPTER_PCI
+AORUS_OC_STATE="$TD/oc.state"; export AORUS_OC_STATE
+aorus_use app/overclock
+
+# Devuelve solo el rc de oc_resolve_target, callando su salida.
+oc_rc() { oc_resolve_target >/dev/null 2>&1; printf '%s' "$?"; }
+
+# Enlace sano: Gen3 x4 es exactamente lo que mide esta maquina.
+is "enlace Gen3 x4 -> resolve OK" \
+   "$(AORUS_FAKE_GEN_MAX=3 AORUS_FAKE_LINK='8.0 GT/s PCIe|4' oc_rc)" "0"
+
+# degraded: por debajo de Gen3. El gate cierra, y --force SI puede abrirlo.
+is "Gen1 -> gate CIERRA" \
+   "$(AORUS_FAKE_GEN_MAX=1 AORUS_FAKE_LINK='2.5 GT/s PCIe|4' oc_rc)" "2"
+is "Gen1 + --force -> abre (riesgo asumible)" \
+   "$(AORUS_OC_FORCE=1 AORUS_FAKE_GEN_MAX=1 AORUS_FAKE_LINK='2.5 GT/s PCIe|4' oc_rc)" "0"
+
+# unknown: capacidad ilegible. CLAUDE.md: el gate CIERRA. --force NO lo abre.
+is "capacidad ilegible -> gate CIERRA" \
+   "$(AORUS_FAKE_GEN_MAX='' AORUS_FAKE_LINK='8.0 GT/s PCIe|4' oc_rc)" "2"
+is "capacidad ilegible + --force -> SIGUE CERRADO" \
+   "$(AORUS_OC_FORCE=1 AORUS_FAKE_GEN_MAX='' AORUS_FAKE_LINK='8.0 GT/s PCIe|4' oc_rc)" "2"
+
+# dead: el tunel no esta entrenado (width 0). --force tampoco lo abre.
+is "enlace muerto -> gate CIERRA" \
+   "$(AORUS_FAKE_GEN_MAX=3 AORUS_FAKE_LINK='2.5 GT/s PCIe|0' oc_rc)" "2"
+is "enlace muerto + --force -> SIGUE CERRADO" \
+   "$(AORUS_OC_FORCE=1 AORUS_FAKE_GEN_MAX=3 AORUS_FAKE_LINK='2.5 GT/s PCIe|0' oc_rc)" "2"
+
+# Solo lectura sigue permitida con el enlace roto: no escribe nada.
+is "solo lectura pasa con enlace muerto" \
+   "$(AORUS_OC_READONLY=1 AORUS_FAKE_GEN_MAX=3 AORUS_FAKE_LINK='2.5 GT/s PCIe|0' oc_rc)" "0"
+
+# nvidia-smi colgado al resolver: 124 se propaga, no se degrada a fallo generico.
+is "nvidia-smi colgado -> 124" "$(AORUS_FAKE_FIND_RC=124 oc_rc)" "124"
+is "colgado leyendo el enlace -> 124" "$(AORUS_FAKE_GENMAX_RC=124 oc_rc)" "124"
+
+echo "== app/overclock: rc=124 en una escritura ABORTA el plan =="
+# El hueco era este: un 124 se trataba como fallo generico y el ejecutor
+# SEGUIA con las dos escrituras siguientes. Tres escrituras de 12 s contra una
+# tarjeta en estado-D es el martilleo que CLAUDE.md prohibe.
+WL="$TD/writes.log"
+: > "$WL"
+plan_3ops() {
+  printf 'power_limit\t180\n'
+  printf 'gpu_clock\t1800\t3090\n'
+  printf 'mem_clock\t14001\n'
+}
+# Caso sano: las tres escrituras se intentan.
+plan_3ops | AORUS_FAKE_WRITELOG="$WL" AORUS_FAKE_WRITE_RC=0 oc_execute_plan 00000000:B4:00.0 >/dev/null 2>&1
+is "plan sano: se intentan las 3 escrituras" "$(grep -c . "$WL")" "3"
+
+: > "$WL"
+plan_3ops | AORUS_FAKE_WRITELOG="$WL" AORUS_FAKE_WRITE_RC=124 oc_execute_plan 00000000:B4:00.0 >/dev/null 2>&1
+rc_plan=$?
+is "colgado en la 1a: solo UNA escritura intentada" "$(grep -c . "$WL")" "1"
+is "y el ejecutor devuelve 124"                     "$rc_plan"              "124"
+
+: > "$WL"
+plan_3ops | AORUS_FAKE_WRITELOG="$WL" AORUS_FAKE_WRITE_RC=1 oc_execute_plan 00000000:B4:00.0 >/dev/null 2>&1
+rc_plan=$?
+# Un fallo NORMAL no aborta: se intentan las tres y se reporta error al final.
+is "fallo normal: no aborta el plan"  "$(grep -c . "$WL")" "3"
+is "y el ejecutor devuelve 1"         "$rc_plan"           "1"
 
 printf '\n%d pasados, %d fallados\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

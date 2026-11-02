@@ -73,10 +73,35 @@ domain_oc_validate() { # usa OC_* del entorno; $1=cap_power_min $2=cap_power_max
       printf 'power_limit_w: %s W fuera de [%s,%s] - se acotará\n' "$OC_power_limit_w" "$pmin" "$pmax"
     fi
   fi
+  # Los TRES relojes pasan por domain_oc_is_uint antes de cualquier comparación
+  # numérica. Antes solo lo hacía power_limit_w, y las claves de reloj iban
+  # directas a `-gt`: con un valor no entero, bash devuelve 2 y escupe
+  # "integer expected" por stderr, la condición queda falsa, no se registra
+  # error y validate salía rc=0. Medido el 2026-11-02 ejecutando solo el
+  # dominio: `gpu_clock_max_mhz=abc` validaba bien y el plan emitía
+  # `gpu_clock<TAB>abc<TAB>abc`, que acaba en `nvidia-smi -lgc abc,abc`.
+  # Un valor que no es un entero no se acota: se rechaza.
+  local k v
+  for k in gpu_clock_min_mhz gpu_clock_max_mhz mem_clock_mhz; do
+    eval "v=\${OC_$k:-}"
+    if [ -n "$v" ] && ! domain_oc_is_uint "$v"; then
+      printf '%s: "%s" no es un entero\n' "$k" "$v"; errs=1
+    fi
+  done
+  # Con algún reloj no entero se vuelve ya: las comparaciones de abajo no son
+  # seguras y seguir solo añadiría ruido sobre un perfil que ya está rechazado.
+  [ "$errs" -eq 0 ] || return 1
+
   if [ -n "${OC_gpu_clock_min_mhz:-}" ] && [ -n "${OC_gpu_clock_max_mhz:-}" ]; then
     if [ "$OC_gpu_clock_min_mhz" -gt "$OC_gpu_clock_max_mhz" ]; then
       printf 'gpu_clock: min (%s) > max (%s)\n' "$OC_gpu_clock_min_mhz" "$OC_gpu_clock_max_mhz"; errs=1
     fi
+  fi
+  # Un `min` a solas no produce ninguna operación -domain_oc_plan solo emite
+  # gpu_clock si hay `max`-, así que el perfil se descartaba EN SILENCIO.
+  if [ -n "${OC_gpu_clock_min_mhz:-}" ] && [ -z "${OC_gpu_clock_max_mhz:-}" ]; then
+    printf 'gpu_clock_min_mhz sin gpu_clock_max_mhz: no se puede fijar un suelo de reloj sin techo\n'
+    errs=1
   fi
   if [ -n "${OC_gpu_clock_max_mhz:-}" ] && [ "$OC_gpu_clock_max_mhz" -gt "$gmax" ]; then
     printf 'gpu_clock_max_mhz: %s > máximo soportado %s - se acotará\n' "$OC_gpu_clock_max_mhz" "$gmax"

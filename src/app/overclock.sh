@@ -103,15 +103,30 @@ oc_resolve_target() {
   if [ "$link_verdict" != "healthy" ]; then
     if [ "${AORUS_OC_READONLY:-0}" = "1" ]; then
       log_warn "enlace $link_verdict ($info); sigo porque esta operación es de SOLO LECTURA."
-    elif [ "${AORUS_OC_FORCE:-0}" = "1" ]; then
+    elif [ "${AORUS_OC_FORCE:-0}" = "1" ] && [ "$link_verdict" = "degraded" ]; then
+      # --force relaja SOLO 'degraded': un enlace entrenado por debajo de Gen3
+      # es un riesgo que el operador puede decidir asumir.
+      #
+      # NUNCA relaja 'dead' ni 'unknown', y esto es el invariante de CLAUDE.md,
+      # no una preferencia: "Si la capacidad no se puede leer el veredicto es
+      # unknown y el gate CIERRA". Con 'dead' el túnel no existe, y con
+      # 'unknown' nadie puede afirmar en qué estado está. Antes la condición
+      # era solo `AORUS_OC_FORCE=1`, así que --force escribía igual en los dos
+      # casos; con H23 abierto -el dispositivo TB entero se cae cada ~6,5 h-
+      # eso es exactamente escribir justo después de una caída.
       log_warn "enlace $link_verdict ($info) y --force activo: continúo BAJO TU RIESGO."
     else
       log_err "GATE de enlace: enlace $link_verdict ($info)."
-      if [ "$link_verdict" = "unknown" ]; then
-        log_err "No he podido leer la capacidad del enlace, así que no puedo afirmar que sea seguro."
-      else
-        log_err "Apretar la eGPU con el enlace degradado ha congelado el host. Usa --force si lo asumes."
-      fi
+      case "$link_verdict" in
+        unknown)
+          log_err "No he podido leer la capacidad del enlace, así que no puedo afirmar que sea seguro."
+          log_err "--force NO abre este caso: sin capacidad legible no hay riesgo que puedas asumir." ;;
+        dead)
+          log_err "El enlace no está entrenado: el túnel Thunderbolt no existe ahora mismo."
+          log_err "--force NO abre este caso. Comprueba la conexión y vuelve a intentarlo." ;;
+        *)
+          log_err "Apretar la eGPU con el enlace degradado ha congelado el host. Usa --force si lo asumes." ;;
+      esac
       return 2
     fi
   fi
@@ -119,18 +134,40 @@ oc_resolve_target() {
 }
 
 # --- ejecutor del plan --------------------------------------------------------
+# Una escritura del plan. Devuelve 124 tal cual si nvidia-smi se colgó, para
+# que el ejecutor pueda abortar en vez de pasar a la siguiente operación.
+_oc_write() { # $1=etiqueta $2..=comando
+  local label="$1"; shift
+  local wrc
+  "$@"; wrc=$?
+  if [ "$wrc" -eq 124 ]; then
+    log_err "  nvidia-smi se COLGÓ escribiendo $label (rc=124)."
+    return 124
+  fi
+  [ "$wrc" -eq 0 ] || log_err "  falló $label"
+  return "$wrc"
+}
+
 oc_execute_plan() { # $1=busid; plan por stdin
-  local bus="$1" op a b rc=0
+  local bus="$1" op a b rc=0 wrc
   while IFS=$'\t' read -r op a b; do
+    # Si una escritura anterior se colgó, no se toca más la tarjeta. El bucle
+    # sigue consumiendo stdin para no romper la tubería, pero sin escribir:
+    # martillear un eGPU semi-roto lo deja wedged en estado-D (CLAUDE.md).
+    if [ "$rc" -eq 124 ]; then continue; fi
     case "$op" in
       power_limit) log_info "  power limit -> ${a} W"
-                   gpu_set_power_limit "$bus" "$a" || { log_err "  falló power limit"; rc=1; } ;;
+                   _oc_write "power limit" gpu_set_power_limit "$bus" "$a"
+                   wrc=$?; [ "$wrc" -eq 0 ] || rc=$wrc ;;
       gpu_clock)   log_info "  reloj gráfico -> ${a}-${b} MHz"
-                   gpu_set_gpu_clock "$bus" "$a" "$b" || { log_err "  falló lock de reloj gráfico"; rc=1; } ;;
+                   _oc_write "lock de reloj gráfico" gpu_set_gpu_clock "$bus" "$a" "$b"
+                   wrc=$?; [ "$wrc" -eq 0 ] || rc=$wrc ;;
       mem_clock)   log_info "  reloj memoria -> ${a} MHz"
-                   gpu_set_mem_clock "$bus" "$a" || { log_err "  falló lock de reloj memoria"; rc=1; } ;;
+                   _oc_write "lock de reloj memoria" gpu_set_mem_clock "$bus" "$a"
+                   wrc=$?; [ "$wrc" -eq 0 ] || rc=$wrc ;;
       reset)       log_info "  reset a valores de fábrica"
-                   gpu_reset_clocks "$bus" || { log_err "  falló el reset"; rc=1; } ;;
+                   _oc_write "el reset" gpu_reset_clocks "$bus"
+                   wrc=$?; [ "$wrc" -eq 0 ] || rc=$wrc ;;
       '')          : ;;
       clock_offset) log_err "  clock_offset no tiene adaptador en este sistema"; rc=1 ;;
       *)           if domain_oc_op_is_valid "$op"; then
@@ -141,6 +178,7 @@ oc_execute_plan() { # $1=busid; plan por stdin
                    rc=1 ;;
     esac
   done
+  [ "$rc" -eq 124 ] && log_err "  plan ABORTADO tras el cuelgue; no se reintenta."
   return "$rc"
 }
 
@@ -179,7 +217,21 @@ oc_apply() { # $1=perfil
 
   # Verificación post-aplicación: si la eGPU dejó de responder, revertir. Un
   # perfil que tumba la tarjeta no debe sobrevivir a un reinicio del servicio.
-  if ! gpu_state "$bus" >/dev/null 2>&1; then
+  # Prueba de vida tras aplicar. OJO con el rc: un 124 significa que nvidia-smi
+  # se colgó, y entonces un "revert de emergencia" son DOS invocaciones más
+  # contra una tarjeta que ya no responde — el martilleo que CLAUDE.md prohíbe
+  # y que deja el dispositivo wedged en estado-D. Antes se revertía en los dos
+  # casos por usar `if ! gpu_state ...`, que no distingue 124 de "respondió
+  # mal".
+  local srefresh_rc
+  gpu_state "$bus" >/dev/null 2>&1; srefresh_rc=$?
+  if [ "$srefresh_rc" -eq 124 ] || [ "$rc" -eq 124 ]; then
+    log_err "nvidia-smi está colgado; NO reverto para no seguir martilleando la tarjeta."
+    log_err "El perfil puede haber quedado a medias. Revisa con 'aorus-egpu-oc status'"
+    log_err "cuando la tarjeta responda, y usa 'aorus-egpu-oc reset' entonces."
+    return 124
+  fi
+  if [ "$srefresh_rc" -ne 0 ]; then
     log_err "la eGPU no responde tras aplicar el perfil; REVIRTIENDO a fábrica."
     gpu_reset_clocks "$bus" || log_err "el reset de emergencia también falló."
     return 1
