@@ -20,7 +20,7 @@
 # Mandos (todos por entorno):
 #   AORUS_FAKE_BUS        bus-id que publica (default 00000000:B4:00.0)
 #   AORUS_FAKE_GEN_MAX    generación máxima; vacío => el gate ve 'unknown'
-#   AORUS_FAKE_CAPS       "pmin pmax gpumax memmax"
+#   AORUS_FAKE_CAPS       "pmin pmax gpumax memmax gpumin memmin"
 #   AORUS_FAKE_FIND_RC    rc de gpu_find_by_device_id (124 = colgado)
 #   AORUS_FAKE_GENMAX_RC  rc de gpu_link_gen_max
 #   AORUS_FAKE_STATE_RC   rc de gpu_state
@@ -30,7 +30,7 @@
 
 : "${AORUS_FAKE_BUS:=00000000:B4:00.0}"
 : "${AORUS_FAKE_GEN_MAX:=3}"
-: "${AORUS_FAKE_CAPS:=150 180 3090 14001}"
+: "${AORUS_FAKE_CAPS:=150 180 3090 14001 180 405}"
 : "${AORUS_FAKE_FIND_RC:=0}"
 : "${AORUS_FAKE_GENMAX_RC:=0}"
 : "${AORUS_FAKE_STATE_RC:=0}"
@@ -69,4 +69,4 @@ _fake_write() { # $@=descripcion
 gpu_set_power_limit() { _fake_write "power_limit $2"; }
 gpu_set_gpu_clock()   { _fake_write "gpu_clock $2 $3"; }
 gpu_set_mem_clock()   { _fake_write "mem_clock $2"; }
-gpu_reset_clocks()    { _fake_write "reset"; }
+gpu_reset_all()       { _fake_write "reset"; }

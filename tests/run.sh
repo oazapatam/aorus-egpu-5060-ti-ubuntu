@@ -125,25 +125,59 @@ no_  "clave inventada"  domain_oc_key_is_valid turbo_boost_please
 # variables, y exportarlas las filtraría a awk/grep sin ninguna necesidad.
 # shellcheck disable=SC2034
 OC_profile=test OC_power_limit_w=250 OC_gpu_clock_max_mhz=9999 OC_mem_clock_mhz=99999
-plan="$(domain_oc_plan 150 180 3090 14001)"
+plan="$(domain_oc_plan 150 180 3090 14001 180 405)"
 is "plan acota potencia a 180" "$(printf '%s' "$plan" | awk -F'\t' '/power_limit/{print $2}')" "180"
 is "plan acota reloj a 3090"   "$(printf '%s' "$plan" | awk -F'\t' '/gpu_clock/{print $3}')"   "3090"
 is "plan acota memoria a 14001" "$(printf '%s' "$plan" | awk -F'\t' '/mem_clock/{print $2}')"  "14001"
 
 OC_profile=stock
-is "perfil stock = reset" "$(domain_oc_plan 150 180 3090 14001 | tr '\t' ' ')" "reset all"
+is "perfil stock = reset" "$(domain_oc_plan 150 180 3090 14001 180 405 | tr '\t' ' ')" "reset all"
 
 # Los offsets de +MHz deben RECHAZARSE, no aplicarse en silencio.
 unset OC_power_limit_w OC_gpu_clock_max_mhz OC_mem_clock_mhz
 # shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
 OC_profile=oc OC_gpu_clock_offset_mhz=200
-no_ "offset de reloj se rechaza" domain_oc_validate 150 180 3090 14001
+no_ "offset de reloj se rechaza" domain_oc_validate 150 180 3090 14001 180 405
 
 # min > max es un error del usuario y debe abortar antes de escribir nada.
 unset OC_gpu_clock_offset_mhz
 # shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
 OC_gpu_clock_min_mhz=3000 OC_gpu_clock_max_mhz=1000
-no_ "min>max se rechaza" domain_oc_validate 150 180 3090 14001
+no_ "min>max se rechaza" domain_oc_validate 150 180 3090 14001 180 405
+
+
+# --- el defecto de "solo techo" (cap-only) --------------------------------
+# Un TECHO de reloj a solas usaba el propio techo como suelo, asi que
+# `gpu_clock_max_mhz=2400` emitia `gpu_clock 2400 2400` -> `-lgc 2400,2400`,
+# que ANCLA el reloj en duro tambien en reposo. El usuario pedia un tope y
+# obtenia un suelo, con mas consumo y temperatura en reposo: el regimen donde
+# pega H23. Por eso efficient.profile tenia que inventarse un min=500.
+unset OC_power_limit_w OC_gpu_clock_min_mhz OC_gpu_clock_max_mhz OC_mem_clock_mhz
+# shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
+OC_profile=caponly OC_gpu_clock_max_mhz=2400
+cap_plan="$(domain_oc_plan 150 180 3090 14001 180 405)"
+is "techo a solas: el suelo es el MINIMO de la tarjeta" \
+   "$(printf '%s' "$cap_plan" | awk -F'\t' '/gpu_clock/{print $2}')" "180"
+is "techo a solas: el techo es el pedido" \
+   "$(printf '%s' "$cap_plan" | awk -F'\t' '/gpu_clock/{print $3}')" "2400"
+is "techo a solas: NO ancla el reloj en duro" \
+   "$(printf '%s' "$cap_plan" | awk -F'\t' '/gpu_clock/{print ($2==$3)?"anclado":"rango"}')" "rango"
+# Sin minimo legible -el adaptador devuelve vacio si la lectura falla- no se
+# adivina un suelo: la operacion se OMITE en vez de escribir un 0 no verificado.
+is "sin minimo legible la op se omite" \
+   "$(domain_oc_plan 150 180 3090 14001 '' '' 2>/dev/null | grep -c gpu_clock)" "0"
+# Un suelo explicito sigue mandando sobre el minimo de la tarjeta.
+# shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
+OC_gpu_clock_min_mhz=1200
+is "suelo explicito manda" \
+   "$(domain_oc_plan 150 180 3090 14001 180 405 | awk -F'\t' '/gpu_clock/{print $2}')" "1200"
+unset OC_gpu_clock_min_mhz OC_gpu_clock_max_mhz
+# El clamp de memoria usa el minimo REAL (405), no 0.
+# shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
+OC_mem_clock_mhz=1
+is "memoria se acota al minimo real" \
+   "$(domain_oc_plan 150 180 3090 14001 180 405 | awk -F'\t' '/mem_clock/{print $2}')" "405"
+unset OC_mem_clock_mhz
 
 echo "== domain/overclock: allowlist de operaciones del plan =="
 yes_ "power_limit es op válida"   domain_oc_op_is_valid power_limit

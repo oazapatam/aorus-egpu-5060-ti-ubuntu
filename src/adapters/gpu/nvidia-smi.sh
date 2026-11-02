@@ -62,15 +62,35 @@ gpu_read_vendor_device() { # $1=busid -> "<vendor> <device>"
 # Capacidades reales de ESTA tarjeta: "pmin pmax gpumax memmax".
 # Se leen del hardware en vez de hardcodearse para que el dominio acote contra
 # los límites verdaderos (en la RTX 5060 Ti: 150-180 W, 3090 MHz, 14001 MHz).
-gpu_caps() { # $1=busid
-  local out rc pmin pmax gmax mmax
+gpu_caps() { # $1=busid -> "pmin pmax gmax mmax gmin mmin"
+  local out rc pmin pmax gmax mmax gmin mmin
   out="$(_smi -i "$1" --query-gpu=power.min_limit,power.max_limit,clocks.max.gr,clocks.max.mem \
         --format=csv,noheader,nounits 2>/dev/null)"; rc=$?
   [ "$rc" -eq 124 ] && return 124
   [ "$rc" -ne 0 ] && return 1
   IFS=, read -r pmin pmax gmax mmax <<< "$out"
-  # power.*_limit vienen con decimales ("150.00"); el dominio trabaja en enteros.
-  printf '%s %s %s %s' "${pmin%%.*}" "${pmax%%.*}" "${gmax// /}" "${mmax// /}"
+
+  # gmin/mmin se APPENDEAN al final a propósito: un consumidor que siga
+  # haciendo `read -r pmin pmax gmax mmax` sigue leyendo lo correcto.
+  #
+  # Hacen falta para que un perfil pueda expresar un TECHO de reloj a solas.
+  # Sin gmin, domain_oc_plan usaba el propio techo como suelo y
+  # `gpu_clock_max_mhz=2400` se convertía en `-lgc 2400,2400`, que ancla el
+  # reloj en duro -también en reposo- en vez de poner un tope.
+  # Medido el 2026-11-02 en esta tarjeta: gmin=180 MHz, mmin=405 MHz.
+  #
+  # Si la lectura falla se devuelven VACÍOS, nunca un 0 inventado: el dominio
+  # rechaza entonces el perfil de solo-techo en lugar de escribir un suelo que
+  # no se ha comprobado que -lgc acepte.
+  out="$(_smi -i "$1" --query-supported-clocks=graphics,memory \
+        --format=csv,noheader,nounits 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 124 ] && return 124
+  if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
+    gmin="$(printf '%s\n' "$out" | cut -d, -f1 | tr -d ' ' | sort -n | head -1)"
+    mmin="$(printf '%s\n' "$out" | cut -d, -f2 | tr -d ' ' | sort -n | head -1)"
+  fi
+  printf '%s %s %s %s %s %s' "${pmin%%.*}" "${pmax%%.*}" "${gmax// /}" "${mmax// /}" \
+    "${gmin:-}" "${mmin:-}"
 }
 
 # Generación PCIe MÁXIMA que este enlace puede negociar, como entero.
@@ -115,9 +135,27 @@ gpu_set_mem_clock()   { _smi -i "$1" -lmc "$2" >/dev/null; }
 
 # Reset completo: relojes a default. El power limit se devuelve a su máximo por
 # defecto, que es el estado de fábrica de esta tarjeta.
-gpu_reset_clocks() { # $1=busid
-  local rc=0
+# Devuelve la tarjeta a FÁBRICA: relojes Y límite de potencia.
+#
+# Antes se llamaba gpu_reset_clocks y solo hacía -rgc/-rmc, así que un
+# `aorus-egpu-oc reset` tras aplicar un perfil con power_limit dejaba la
+# tarjeta DE-RATED en silencio. Medido el 2026-11-02: tras aplicar
+# `efficient` (150 W) y resetear, la tarjeta se quedó en 150 W con
+# power.default_limit=180 W. Para una carga de IA eso es rendimiento perdido
+# sin que nada lo diga.
+#
+# El default se LEE, no se asume: power.default_limit es lo que el vBIOS
+# declara, y es lo único a lo que "fábrica" puede significar algo.
+gpu_reset_all() { # $1=busid
+  local rc=0 pdef
   _smi -i "$1" -rgc >/dev/null 2>&1 || rc=1
   _smi -i "$1" -rmc >/dev/null 2>&1 || rc=1
+  pdef="$(_smi -i "$1" --query-gpu=power.default_limit --format=csv,noheader,nounits 2>/dev/null)"
+  if [ "$?" -eq 124 ]; then return 124; fi
+  pdef="${pdef%%.*}"; pdef="${pdef// /}"
+  case "$pdef" in
+    ''|*[!0-9]*) rc=1 ;;
+    *) _smi -i "$1" -pl "$pdef" >/dev/null 2>&1 || rc=1 ;;
+  esac
   return "$rc"
 }

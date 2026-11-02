@@ -63,7 +63,7 @@ domain_oc_key_is_valid() { # $1=clave
 
 # Valida un perfil ya parseado a variables OC_<clave>. Imprime los errores
 # encontrados (uno por línea) y devuelve 1 si hubo alguno.
-domain_oc_validate() { # usa OC_* del entorno; $1=cap_power_min $2=cap_power_max $3=cap_gpu_max $4=cap_mem_max
+domain_oc_validate() { # usa OC_* del entorno; $1=cap_power_min $2=cap_power_max $3=cap_gpu_max $4=cap_mem_max [$5=cap_gpu_min] [$6=cap_mem_min]
   local pmin="$1" pmax="$2" gmax="$3" mmax="$4" errs=0
   if [ -n "${OC_power_limit_w:-}" ]; then
     if ! domain_oc_is_uint "$OC_power_limit_w"; then
@@ -118,8 +118,11 @@ domain_oc_validate() { # usa OC_* del entorno; $1=cap_power_min $2=cap_power_max
 
 # Emite el PLAN: líneas "op<TAB>args". Es la única salida que el ejecutor
 # consume. Vacío = nada que hacer.
-domain_oc_plan() { # $1=cap_power_min $2=cap_power_max $3=cap_gpu_max $4=cap_mem_max
-  local pmin="$1" pmax="$2" gmax="$3" mmax="$4" v lo hi
+# $5=cap_gpu_min y $6=cap_mem_min se APPENDEAN: un llamador que no los pase
+# sigue funcionando, pero entonces un perfil de SOLO TECHO se rechaza en vez
+# de anclar el reloj en duro (ver abajo).
+domain_oc_plan() { # $1=cap_power_min $2=cap_power_max $3=cap_gpu_max $4=cap_mem_max [$5=cap_gpu_min] [$6=cap_mem_min]
+  local pmin="$1" pmax="$2" gmax="$3" mmax="$4" gmin="${5:-}" mmin="${6:-}" v lo hi
   if [ "${OC_profile:-}" = "stock" ]; then
     printf 'reset\tall\n'
     return 0
@@ -130,12 +133,28 @@ domain_oc_plan() { # $1=cap_power_min $2=cap_power_max $3=cap_gpu_max $4=cap_mem
   fi
   if [ -n "${OC_gpu_clock_max_mhz:-}" ]; then
     hi="$(domain_oc_clamp "$OC_gpu_clock_max_mhz" 0 "$gmax")"
-    lo="${OC_gpu_clock_min_mhz:-$hi}"
-    lo="$(domain_oc_clamp "$lo" 0 "$hi")"
-    printf 'gpu_clock\t%s\t%s\n' "$lo" "$hi"
+    # Un TECHO a solas usaba el propio techo como suelo, así que
+    # `gpu_clock_max_mhz=2400` emitía `gpu_clock 2400 2400` -o sea
+    # `nvidia-smi -lgc 2400,2400`-, que ANCLA el reloj en duro también en
+    # reposo. El usuario pedía un tope y obtenía un suelo, con más consumo y
+    # temperatura en reposo: justo el régimen donde pega H23. Por eso el
+    # defecto obligaba a que efficient.profile se inventara un
+    # gpu_clock_min_mhz=500 que nadie había pedido.
+    # Ahora el suelo por defecto es el MÍNIMO de la tarjeta (180 MHz aquí).
+    lo="${OC_gpu_clock_min_mhz:-$gmin}"
+    if [ -z "$lo" ]; then
+      # Sin suelo explícito y sin gmin legible no se adivina: se omite la
+      # operación. Escribir un 0 no verificado sería peor que no hacer nada.
+      printf 'gpu_clock_max_mhz pedido sin gpu_clock_min_mhz y sin mínimo legible: operación omitida\n' >&2
+    else
+      lo="$(domain_oc_clamp "$lo" 0 "$hi")"
+      printf 'gpu_clock\t%s\t%s\n' "$lo" "$hi"
+    fi
   fi
   if [ -n "${OC_mem_clock_mhz:-}" ]; then
-    v="$(domain_oc_clamp "$OC_mem_clock_mhz" 0 "$mmax")"
+    # El suelo del clamp es el mínimo REAL de la tarjeta cuando se conoce
+    # (405 MHz aquí), no 0: un 0 no es un reloj de memoria que -lmc acepte.
+    v="$(domain_oc_clamp "$OC_mem_clock_mhz" "${mmin:-0}" "$mmax")"
     printf 'mem_clock\t%s\n' "$v"
   fi
 }

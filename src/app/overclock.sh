@@ -166,7 +166,7 @@ oc_execute_plan() { # $1=busid; plan por stdin
                    _oc_write "lock de reloj memoria" gpu_set_mem_clock "$bus" "$a"
                    wrc=$?; [ "$wrc" -eq 0 ] || rc=$wrc ;;
       reset)       log_info "  reset a valores de fábrica"
-                   _oc_write "el reset" gpu_reset_clocks "$bus"
+                   _oc_write "el reset" gpu_reset_all "$bus"
                    wrc=$?; [ "$wrc" -eq 0 ] || rc=$wrc ;;
       '')          : ;;
       clock_offset) log_err "  clock_offset no tiene adaptador en este sistema"; rc=1 ;;
@@ -184,7 +184,7 @@ oc_execute_plan() { # $1=busid; plan por stdin
 
 # --- caso de uso: aplicar -----------------------------------------------------
 oc_apply() { # $1=perfil
-  local profile="${1:-}" bus caps pmin pmax gmax mmax plan rc
+  local profile="${1:-}" bus caps pmin pmax gmax mmax gmin mmin plan rc
   [ -n "$profile" ] || { log_err "falta el nombre del perfil"; return 2; }
 
   oc_load_profile "$profile" || return $?
@@ -195,15 +195,15 @@ oc_apply() { # $1=perfil
   caps="$(gpu_caps "$bus")"; rc=$?
   [ "$rc" -eq 124 ] && { log_err "nvidia-smi se colgó leyendo capacidades; ABORTO."; return 124; }
   [ "$rc" -ne 0 ] && { log_err "no puedo leer las capacidades de la eGPU."; return 1; }
-  read -r pmin pmax gmax mmax <<< "$caps"
+  read -r pmin pmax gmax mmax gmin mmin <<< "$caps"
 
   # Validación: los avisos se muestran, los errores abortan ANTES de escribir.
   local msgs
-  msgs="$(domain_oc_validate "$pmin" "$pmax" "$gmax" "$mmax")"; rc=$?
+  msgs="$(domain_oc_validate "$pmin" "$pmax" "$gmax" "$mmax" "$gmin" "$mmin")"; rc=$?
   [ -n "$msgs" ] && printf '%s\n' "$msgs" | while IFS= read -r m; do log_warn "$m"; done
   [ "$rc" -ne 0 ] && { log_err "perfil '$profile' inválido; no se ha tocado nada."; return 2; }
 
-  plan="$(domain_oc_plan "$pmin" "$pmax" "$gmax" "$mmax")"
+  plan="$(domain_oc_plan "$pmin" "$pmax" "$gmax" "$mmax" "$gmin" "$mmin")"
   [ -z "$plan" ] && { log_info "perfil '$profile': nada que aplicar."; return 0; }
 
   log_info "aplicando perfil '$profile' a la eGPU $bus (enlace $link_verdict: $link_info):"
@@ -233,7 +233,7 @@ oc_apply() { # $1=perfil
   fi
   if [ "$srefresh_rc" -ne 0 ]; then
     log_err "la eGPU no responde tras aplicar el perfil; REVIRTIENDO a fábrica."
-    gpu_reset_clocks "$bus" || log_err "el reset de emergencia también falló."
+    gpu_reset_all "$bus" || log_err "el reset de emergencia también falló."
     return 1
   fi
 
@@ -254,14 +254,14 @@ oc_reset() {
   resolved="$(oc_resolve_target)" || return $?
   bus="${resolved%%$'\t'*}"   # primer campo: el bus-id
   log_info "reseteando la eGPU $bus a valores de fábrica"
-  gpu_reset_clocks "$bus" || { log_err "el reset falló."; return 1; }
+  gpu_reset_all "$bus" || { log_err "el reset falló."; return 1; }
   rm -f "$AORUS_OC_STATE" 2>/dev/null || true
   log_info "hecho."
 }
 
 # --- caso de uso: status ------------------------------------------------------
 oc_status() {
-  local bus caps pmin pmax gmax mmax resolved link_verdict link_info
+  local bus caps pmin pmax gmax mmax gmin mmin resolved link_verdict link_info
   # `status` es SOLO LECTURA y debe informar del estado incluso -sobre todo-
   # cuando el enlace no está sano. Se marca como tal en vez de simular un
   # --force: antes el mensaje decía "--force activo: continúo BAJO TU RIESGO"
@@ -269,11 +269,12 @@ oc_status() {
   resolved="$(AORUS_OC_READONLY=1 oc_resolve_target)" || return $?
   IFS=$'\t' read -r bus link_verdict link_info <<< "$resolved"
   caps="$(gpu_caps "$bus")" || { log_err "no puedo leer capacidades."; return 1; }
-  read -r pmin pmax gmax mmax <<< "$caps"
+  read -r pmin pmax gmax mmax gmin mmin <<< "$caps"
   log_info "eGPU:            $bus"
   log_info "enlace:          $link_verdict ($link_info)"
   log_info "power limit:     ${pmin}-${pmax} W (rango soportado)"
   log_info "reloj máx:       ${gmax} MHz gráfico / ${mmax} MHz memoria"
+  log_info "reloj mín:       ${gmin:-?} MHz gráfico / ${mmin:-?} MHz memoria"
   log_info "--- estado actual ---"
   gpu_state "$bus" | while IFS= read -r l; do log_info "$l"; done
   if [ -r "$AORUS_OC_STATE" ]; then
