@@ -1,20 +1,36 @@
 #!/usr/bin/env python3
-"""PyTorch CUDA smoke test for the AORUS RTX 5090 eGPU stack.
+"""PyTorch CUDA smoke test SOBRE LA eGPU.
 
-Validates the path that vLLM actually uses: torch.cuda runtime init,
-device tensor allocation, real CUDA kernels (cuBLAS GEMM), sync, and
-deterministic correctness check.
+Valida el camino que usa vLLM de verdad: init del runtime de torch.cuda,
+asignación de tensores en device, kernels CUDA reales (GEMM de cuBLAS), sync y
+una comprobación determinista del resultado.
 
-Exits 0 with 'pytorch_smoke=pass' on success. On any failure prints
-which step failed and exits non-zero.
+POR QUÉ FIJA LA GPU POR BUS-ID: este test usaba `cuda:0`, y en esta máquina el
+ordinal 0 es la GPU INTERNA (RTX PRO 4000). Daba `pytorch_smoke=pass` sin haber
+tocado la eGPU. La regla del repo (CLAUDE.md, gate R4) es direccionar por PCI
+bus-id y nunca por índice: los índices se reordenan entre arranques.
 
-Run from inside a venv that has 'torch' installed:
-    /root/torch-test/bin/python3 tools/pytorch-cuda-smoke-test.py
+El pin se hace con CUDA_VISIBLE_DEVICES=<bus-id> ANTES de importar torch, que
+es la única forma de fijar la GPU física sin depender del orden de enumeración
+del runtime (que por defecto es FASTEST_FIRST, no por bus). Así `cuda:0` dentro
+del proceso ES la eGPU, sin ambigüedad.
 
-Or via the TTY runner:
+Sale 0 con 'pytorch_smoke=pass'. Si algo falla, dice qué paso y sale != 0.
+
+Uso, desde un venv que tenga 'torch':
+    python3 tools/pytorch-cuda-smoke-test.py              # la eGPU (removable)
+    python3 tools/pytorch-cuda-smoke-test.py 0000:B4:00.0 # un bus-id concreto
+
+O con el runner de TTY:
     tools/tty-pytorch-test.sh
 """
+import os
 import sys
+from pathlib import Path
+
+SYSFS_PCI = Path("/sys/bus/pci/devices")
+PCI_CLASS_VGA = "0x030000"
+PCI_VENDOR_NVIDIA = "0x10de"
 
 
 def fail(stage, exc=None):
@@ -25,7 +41,60 @@ def fail(stage, exc=None):
     sys.exit(1)
 
 
+def _read(path):
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def find_egpu_bus_id():
+    """Bus-id de la primera GPU NVIDIA marcada `removable` en sysfs.
+
+    `removable` es la confirmación topológica que fija CLAUDE.md: el
+    controlador Thunderbolt es un HERMANO en el árbol PCI, no un ancestro, así
+    que subir el árbol buscando el driver `thunderbolt` da un falso negativo.
+    La GPU interna tiene este atributo VACÍO; la externa dice "removable".
+    """
+    for device in sorted(SYSFS_PCI.iterdir()):
+        if _read(device / "class") != PCI_CLASS_VGA:
+            continue
+        if _read(device / "vendor") != PCI_VENDOR_NVIDIA:
+            continue
+        if _read(device / "removable") != "removable":
+            continue
+        return device.name.upper()
+    return None
+
+
+def pin_to_egpu():
+    """Fija CUDA_VISIBLE_DEVICES al bus-id de la eGPU. Antes de importar torch."""
+    want = sys.argv[1] if len(sys.argv) > 1 else None
+
+    preset = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if preset and not want:
+        # Respetar una decisión explícita del entorno, pero dejarla registrada:
+        # si apunta a la interna, el 'pass' no valdría para la eGPU.
+        print(f"cuda_visible_devices=heredado:{preset}", flush=True)
+        return preset
+
+    bus_id = want or find_egpu_bus_id()
+    if not bus_id:
+        fail("find_egpu", RuntimeError(
+            "no hay ninguna GPU NVIDIA 'removable' en sysfs; "
+            "¿está conectada la eGPU? Pasa el bus-id a mano si lo sabes."))
+
+    # CUDA_VISIBLE_DEVICES acepta bus-ids PCI, no solo índices.
+    os.environ["CUDA_VISIBLE_DEVICES"] = bus_id
+    print(f"cuda_visible_devices={bus_id}", flush=True)
+    return bus_id
+
+
 def main():
+    # 0. Fijar la GPU física ANTES de importar torch: al importar, el runtime
+    #    ya congela la lista de devices visibles.
+    target_bus_id = pin_to_egpu()
+
     # 1. Import torch
     try:
         import torch
@@ -47,6 +116,14 @@ def main():
     print(f"device_count={dc}", flush=True)
     if dc < 1:
         fail("device_count_zero")
+
+    # Con el pin por bus-id el proceso debe ver UNA sola GPU: la eGPU. Si ve
+    # más, el pin no se aplicó y `cuda:0` podría ser la interna, así que el
+    # resultado del test no significaría lo que dice significar.
+    if dc != 1:
+        fail("pin_not_applied", RuntimeError(
+            f"esperaba 1 GPU visible tras fijar {target_bus_id}, veo {dc}"))
+    print(f"target_bus_id={target_bus_id}", flush=True)
 
     try:
         name = torch.cuda.get_device_name(0)
