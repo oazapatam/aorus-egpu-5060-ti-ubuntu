@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# aorus-egpu-status — read-only diagnostics for the GIGABYTE AORUS RTX 5060 Ti
+# Thunderbolt/USB4 eGPU on Ubuntu. Touches nothing; it only reports state and
+# the next concrete step. Part of the aorus-egpu-config package.
+set -u
+
+# The eGPU is a GeForce RTX 5060 Ti. The internal Lenovo dGPU is an RTX PRO 4000
+# (10de:2c39), so matching the 5060 Ti device id cleanly isolates the eGPU.
+EGPU_VID=10de
+EGPU_DID=2d04
+
+bold() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+ok()   { printf '  \033[32m\xe2\x9c\x93\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31m\xe2\x9c\x97\033[0m %s\n' "$*"; }
+
+problems=0
+
+bold "Thunderbolt"
+if command -v boltctl >/dev/null 2>&1; then
+	if boltctl list 2>/dev/null | grep -qi aorus; then
+		status=$(boltctl list 2>/dev/null | awk -F': *' '/status:/{print $2; exit}')
+		ok "AORUS eGPU present (boltctl) — status: ${status:-unknown}"
+		# Authorization gates the PCI tunnel: connected-but-unauthorized means
+		# the GPU never enumerates. Read the sysfs attr directly and flag it.
+		auth=""
+		for d in /sys/bus/thunderbolt/devices/*-*; do
+			[ "$(cat "$d/device" 2>/dev/null)" = "0x41cd" ] || continue
+			auth=$(cat "$d/authorized" 2>/dev/null); break
+		done
+		if [ "$auth" = "0" ]; then
+			bad "TB box NOT authorized (authorized=0) — PCI tunnel won't come up."
+			echo "       Fix: sudo aorus-egpu-connect   (or: boltctl enroll --policy auto <uuid>)"
+			problems=$((problems + 1))
+		elif [ "$auth" = "1" ]; then
+			ok "TB box authorized"
+		fi
+	else
+		bad "AORUS eGPU NOT seen by boltctl — check the cable/connection"
+		problems=$((problems + 1))
+	fi
+else
+	warn "boltctl not installed (sudo apt install bolt) — skipping TB check"
+fi
+
+bold "Kernel command line"
+if grep -q 'pci=realloc=off' /proc/cmdline; then
+	bad "pci=realloc=off is present — it DISABLES BAR0 reallocation. Remove it."
+	problems=$((problems + 1))
+elif grep -qw 'pci=realloc' /proc/cmdline; then
+	ok "pci=realloc active"
+else
+	bad "pci=realloc NOT active — BAR0 cannot be assigned over Thunderbolt."
+	echo "       Fix: sudo apt install ./aorus-egpu-config_*.deb  then COLD BOOT."
+	problems=$((problems + 1))
+fi
+if grep -qw 'thunderbolt.host_reset=false' /proc/cmdline; then
+	warn "thunderbolt.host_reset=false presente — RETIRADO en 0.4.1 (cuelga el reboot en esta máquina)"
+else
+	ok "thunderbolt.host_reset=false ausente (correcto aquí); la BAR1 la sube el ReBAR de fix-bar0"
+fi
+
+bold "eGPU PCI device"
+slot=$(lspci -d "${EGPU_VID}:${EGPU_DID}" 2>/dev/null | awk '{print $1; exit}')
+if [ -z "$slot" ]; then
+	bad "RTX 5060 Ti (${EGPU_VID}:${EGPU_DID}) not on the PCI bus — eGPU not enumerated."
+	echo "       Connect the box (hotplug — it hangs at POST if attached at power-on)."
+	echo "       If already connected: sudo aorus-egpu-connect"
+	exit 1
+fi
+ok "Found at PCI $slot"
+dev="0000:$slot"
+
+drv=$(lspci -k -s "$slot" 2>/dev/null | awk -F': ' '/Kernel driver in use/{print $2}')
+if [ "$drv" = "nvidia" ]; then
+	ok "nvidia driver bound"
+else
+	bad "no driver bound (in use: ${drv:-none}) — typically caused by an unassigned BAR0"
+	problems=$((problems + 1))
+fi
+
+res="/sys/bus/pci/devices/$dev/resource"
+if [ -r "$res" ]; then
+	bar0_start=$(awk 'NR==1{print $1}' "$res")
+	bar1_start=$(awk 'NR==2{print $1}' "$res")
+	bar1_end=$(awk 'NR==2{print $2}' "$res")
+	if [ "$bar0_start" = "0x0000000000000000" ]; then
+		bad "BAR0 unassigned (0x0) — this is the probe blocker. Run: sudo aorus-egpu-fix-bar0"
+		problems=$((problems + 1))
+	else
+		ok "BAR0 assigned ($bar0_start)"
+	fi
+	if [ -n "${bar1_start:-}" ] && [ "$bar1_start" != "0x0000000000000000" ]; then
+		size=$(( (16#${bar1_end#0x} - 16#${bar1_start#0x} + 1) / 1024 / 1024 ))
+		if [ "$size" -ge 16384 ]; then
+			ok "BAR1 ~${size} MiB (resizable BAR active)"
+		else
+			warn "BAR1 ~${size} MiB (sin ReBAR; el ReBAR bump de fix-bar0 la sube a 16 GiB en un bind limpio)"
+		fi
+	fi
+fi
+
+bold "Driver DKMS (¿reboot pendiente?)"
+if [ -r /sys/module/nvidia/srcversion ]; then
+	ram_sv=$(cat /sys/module/nvidia/srcversion 2>/dev/null)
+	kver=$(uname -r)
+	disk_ko=""
+	for c in "/lib/modules/$kver/updates/dkms/nvidia.ko.zst" "/lib/modules/$kver/updates/dkms/nvidia.ko"; do
+		[ -e "$c" ] && { disk_ko="$c"; break; }
+	done
+	dkms_ver=$(dkms status 2>/dev/null | sed -n 's#^aorus-nvidia/\([^,]*\),.*#\1#p' | head -1)
+	if [ -n "$disk_ko" ] && command -v modinfo >/dev/null 2>&1; then
+		disk_sv=$(modinfo -F srcversion "$disk_ko" 2>/dev/null | head -1)
+		if [ -n "$disk_sv" ] && [ "$ram_sv" = "$disk_sv" ]; then
+			ok "módulo en RAM == DKMS en disco (srcversion $ram_sv${dkms_ver:+, $dkms_ver})"
+		elif [ -n "$disk_sv" ]; then
+			bad "REBOOT PENDIENTE: módulo en RAM (srcversion $ram_sv) != DKMS en disco ($disk_sv${dkms_ver:+, $dkms_ver})"
+			echo "       Se instaló un driver DKMS nuevo aún no cargado. Reinicia para aplicarlo."
+			problems=$((problems + 1))
+		else
+			warn "no pude leer srcversion del .ko en disco ($disk_ko) — omito el chequeo"
+		fi
+	else
+		warn "no encuentro el nvidia.ko de DKMS en /lib/modules/$kver/updates/dkms/ (¿driver stock?)"
+	fi
+else
+	warn "módulo nvidia no cargado (sin /sys/module/nvidia/srcversion)"
+fi
+
+bold "nvidia-smi"
+if command -v nvidia-smi >/dev/null 2>&1; then
+	if nvidia-smi -L 2>/dev/null | grep -qi '5060 Ti'; then
+		ok "eGPU visible to nvidia-smi:"
+		nvidia-smi -L 2>/dev/null | sed 's/^/       /'
+	else
+		warn "eGPU not yet visible to nvidia-smi. Current GPUs:"
+		nvidia-smi -L 2>/dev/null | sed 's/^/       /'
+	fi
+else
+	warn "nvidia-smi not found (driver not installed?)"
+fi
+
+bold "Summary"
+if [ "$problems" -eq 0 ]; then
+	ok "No blockers detected."
+else
+	bad "$problems blocker(s) above. Try: sudo aorus-egpu-connect (hotplug activation)."
+fi
+exit 0

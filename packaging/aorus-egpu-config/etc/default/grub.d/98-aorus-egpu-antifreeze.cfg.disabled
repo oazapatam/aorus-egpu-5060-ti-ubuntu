@@ -1,0 +1,37 @@
+# aorus-egpu-config — capa ANTI-FREEZE (OPT-IN, desactivada por defecto).
+#
+# Estos son los argumentos de kernel que el repo de Fedora usó para mitigar el
+# cuelgue de la eGPU bajo carga (docs/recommended-install-path.md, Layer 2).
+# NO se aplican por defecto porque son host-wide y pueden afectar el arranque o
+# la GPU interna que ya funciona. Por eso este archivo termina en `.disabled`
+# (update-grub solo lee *.cfg) y se activa con:
+#
+#     sudo aorus-egpu-escalation enable antifreeze
+#     sudo reboot
+#
+# Revertir:   sudo aorus-egpu-escalation disable antifreeze   (o apt remove)
+#
+# Recomendación: actívalos y, si el arranque o la GPU interna se degradan,
+# comenta líneas de a una (metodología "una variable por prueba" del repo).
+#
+# RECUPERACIÓN si un arg rompe el arranque: en el menú de GRUB pulsa `e`, borra
+# los args de esta línea del kernel, arranca, y luego `sudo aorus-egpu-escalation
+# disable antifreeze`.
+#
+#   pcie_aspm.policy=performance  Desactiva ASPM: el retraining del enlace PCIe
+#                                 congelaba el túnel TB. Riesgo bajo.
+#   thunderbolt.clx=0             Impide que el controlador TB entre en estados
+#                                 de bajo consumo a mitad de transferencia. Bajo.
+#   pcie_port_pm=off              Desactiva PM de los puertos PCIe. Bajo.
+#   pci=pcie_bus_perf             Política de MPS para rendimiento del bus.
+#   pci=hpmmioprefsize=256M       Cap a la reserva MMIO prefetchable por bridge
+#                                 hotplug; evita que puertos TB vacíos asfixien
+#                                 a la GPU (mismo principio que fix-bar0).
+#   iommu=off intel_iommu=off     "Lever T". Empíricamente lo que más redujo los
+#                                 cuelgues en Fedora (DMAR faults → 0). RIESGO
+#                                 ALTO: deshabilita el IOMMU para TODO el host
+#                                 (afecta seguridad DMA y la GPU interna). Última
+#                                 escalada; pruébalo solo. Bajo Secure Boot el
+#                                 kernel puede ignorarlo.
+
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT pcie_aspm.policy=performance thunderbolt.clx=0 pcie_port_pm=off pci=pcie_bus_perf,hpmmioprefsize=256M iommu=off intel_iommu=off"

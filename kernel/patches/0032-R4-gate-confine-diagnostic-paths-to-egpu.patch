@@ -1,0 +1,189 @@
+From: squadai-stable <noreply@local>
+Date: 2026-06-20
+Subject: [PATCH] R4 gate (0032) — confine the diagnostic/telemetry paths to the eGPU
+
+Companion to Patch 0031. 0031 gated every *active* recovery lever on
+os_pci_is_egpu_target(), and the live B2 test (2026-06-19, driver aorus13)
+confirmed R3+R4: under CUDA load the eGPU dropped (Xid 154 on b4:00.0) while
+the internal dGPU (10de:2c39 @ 01:00.0) stayed pristine and the PC never froze.
+
+But three *diagnostic* paths were left ungated and still fire on the wrong
+device — visible as dmesg noise over the GPU R4 says we must never touch:
+
+  1. nv-lever-m-recover.c tb_egpu_lever_m_close_path_diag() (Patch 0029):
+     the char-dev close marker emits "NVRM: GPU 0000:01:00.0: AORUS Lever
+     M-recover [CLOSE]" on the INTERNAL dGPU's closes too.
+  2. nv-pci.c nv_pci_mmio_enabled / nv_pci_cor_error_detected (Patch 0029):
+     dump AER/DIAG on any device's AER callback, internal included.
+  3. nvidia-uvm/uvm.c aorus_uvm_*  (Patch 0030): looked up the GPU via a
+     HARDCODED BDF 0000:04:00.0 — copied from the single-GPU Fedora reference
+     box. On this ThinkPad 0000:04:00.0 is the Samsung NVMe (BAR0 0x92200000),
+     so every [UVM-DIAG]/Mode-B Trigger dump was ioremap+ioread32'ing NVMe
+     registers and printing them as garbage GPU state (PMC_BOOT_0=0x28033fff,
+     WPR2=0xffffffff, pdev=0000:04:00.0). Harmless (read-only) but wrong,
+     misleading, and a needless cross-device MMIO poke on every UVM open/close.
+
+Fix — reuse the single-source R4 predicate everywhere:
+
+  - nv-lever-m-recover.c: export a plain-C wrapper tb_egpu_pci_is_egpu_target()
+    (takes struct pci_dev * directly) so nvidia-uvm.ko can call the predicate
+    without the NV_API_CALL ABI. This TU already pulls in <linux/module.h>
+    (EXPORT_SYMBOL) and os-interface.h (os_pci_is_egpu_target, via 0031).
+  - tb_egpu_lever_m_close_path_diag(): early-return for non-eGPU.
+  - nv_pci_mmio_enabled / nv_pci_cor_error_detected: early-return for non-eGPU
+    (mmio_enabled still returns RECOVERED, the prior no-op result).
+  - uvm.c: replace the hardcoded-BDF lookup with a topology lookup that walks
+    NVIDIA devices and returns the one matching the eGPU predicate (NULL when
+    the eGPU is absent), and gate the whole UVM close-path diag on it — so the
+    path emits nothing and touches nothing when no eGPU is present.
+
+Net: with the eGPU absent (or for the internal dGPU) the driver is silent on
+these paths; with the eGPU present they instrument the eGPU correctly.
+
+NOTE: prepared 2026-06-20, NOT yet built/installed (installed driver is still
+aorus13 = patches 0001-0031). This bumps the package to aorus14; build with
+`make egpu-dkms`, review with dpkg-deb -c/-I, install, reboot, then re-run the
+R3 load test to confirm the dmesg noise is gone and R3+R4 still hold. Because
+the patch was authored against reconstructed post-0031 source (the upstream
+tree is cloned at build time, not checked in), VERIFY `git apply` succeeds in
+the build before relying on it.
+---
+diff --git a/kernel-open/nvidia/nv-lever-m-recover.c b/kernel-open/nvidia/nv-lever-m-recover.c
+--- a/kernel-open/nvidia/nv-lever-m-recover.c
++++ b/kernel-open/nvidia/nv-lever-m-recover.c
+@@ -186,6 +186,18 @@ void tb_egpu_lever_m_diag_dump_pdev(struct pci_dev *pdev, const char *site)
+ }
+ EXPORT_SYMBOL(tb_egpu_lever_m_diag_dump_pdev);
+
++/* AORUS Patch 0032 (2026-06-20): plain-C exported wrapper around the R4
++ * predicate so cross-module callers (nvidia-uvm.ko) can confine their
++ * close-path instrumentation to the external eGPU without pulling in the
++ * NV_API_CALL ABI. os_pci_is_egpu_target() is declared via os-interface.h
++ * (included by Patch 0031) and defined in os-pci.c. */
++int tb_egpu_pci_is_egpu_target(struct pci_dev *pdev)
++{
++    return os_pci_is_egpu_target((void *)pdev) ? 1 : 0;
++}
++EXPORT_SYMBOL(tb_egpu_pci_is_egpu_target);
++
+ /* Commit 2: probe-time WPR2-stuck detection.
+  *
+  * Reads the GSP MMU WPR2 status register via a temporary ioremap of a
+@@ -1199,6 +1211,13 @@ void tb_egpu_lever_m_close_path_diag(nv_linux_state_t *nvl,
+
+     if (!nvl)
+         return;
++
++    /* AORUS Patch 0032 (2026-06-20): confine the close-path [CLOSE] diag to
++     * the external eGPU. Without this the marker fires on the internal dGPU's
++     * char-dev closes too (GPU 0000:01:00.0), spamming dmesg over the GPU that
++     * R4 says must never be touched. */
++    if (!os_pci_is_egpu_target(nvl->pci_dev))
++        return;
+
+     nv = NV_STATE_PTR(nvl);
+
+diff --git a/kernel-open/nvidia/nv-pci.c b/kernel-open/nvidia/nv-pci.c
+--- a/kernel-open/nvidia/nv-pci.c
++++ b/kernel-open/nvidia/nv-pci.c
+@@ -2956,6 +2956,10 @@ static pci_ers_result_t nv_pci_mmio_enabled(struct pci_dev *pci_dev)
+ {
+     nv_linux_state_t *nvl = pci_get_drvdata(pci_dev);
+
++    /* AORUS Patch 0032 (2026-06-20): only instrument the eGPU; for the
++     * internal dGPU (or any non-eGPU) return the prior no-op result. */
++    if (!os_pci_is_egpu_target(pci_dev))
++        return PCI_ERS_RESULT_RECOVERED;
++
+     nv_printf(NV_DBG_ERRORS,
+               "AORUS Lever M-recover: mmio_enabled callback fired on %s\n",
+               pci_name(pci_dev));
+@@ -2982,6 +2986,10 @@ static void nv_pci_cor_error_detected(struct pci_dev *pci_dev)
+ {
++    /* AORUS Patch 0032 (2026-06-20): only instrument the eGPU; never dump on
++     * the internal dGPU's correctable-AER callbacks. */
++    if (!os_pci_is_egpu_target(pci_dev))
++        return;
++
+     nv_printf(NV_DBG_ERRORS,
+               "AORUS Lever M-recover: cor_error_detected callback fired on %s\n",
+               pci_name(pci_dev));
+diff --git a/kernel-open/nvidia-uvm/uvm.c b/kernel-open/nvidia-uvm/uvm.c
+--- a/kernel-open/nvidia-uvm/uvm.c
++++ b/kernel-open/nvidia-uvm/uvm.c
+@@ -208,6 +208,7 @@
+ #include <linux/pci.h>
+ #include <linux/atomic.h>
+ extern void tb_egpu_lever_m_diag_dump_pdev(struct pci_dev *pdev, const char *site);
+ extern void tb_egpu_dump_aer_trigger_event(struct pci_dev *gpu_pdev,
+                                           const char *trigger,
+                                           void *out);
++extern int  tb_egpu_pci_is_egpu_target(struct pci_dev *pdev);  /* Patch 0032 */
+
+ /* Global UVM fd refcount — incremented in uvm_open, decremented in
+  * uvm_release. LAST-CLOSE detection: when the post-decrement value is 0,
+@@ -220,12 +221,18 @@ static atomic_t aorus_uvm_fd_count = ATOMIC_INIT(0);
+
+-/* Look up the GPU's pci_dev. Hardcoded BDF 0000:04:00.0 per project
+- * topology (only NVIDIA device on this host). Returns NULL if absent.
+- * Caller does NOT need to pci_dev_put — pci_get_domain_bus_and_slot
+- * increments refcount but for our DIAG snapshot use we only need the
+- * pointer momentarily. We pci_dev_put after each use to be safe. */
++/* AORUS Patch 0032 (2026-06-20): look up the EXTERNAL eGPU's pci_dev by
++ * topology instead of the hardcoded BDF 0000:04:00.0 (which on this dual-GPU
++ * ThinkPad is the Samsung NVMe, not a GPU — Patch 0030's dump was reading
++ * NVMe registers as garbage GPU state). Walk NVIDIA devices and return the
++ * first that satisfies the R4 eGPU predicate. Returns NULL when the eGPU is
++ * absent, so the close-path diag below stays silent and never touches the
++ * internal dGPU or the NVMe. Returned device has its refcount held;
++ * caller pci_dev_put()s it. */
+ static struct pci_dev *aorus_uvm_get_gpu_pdev(void)
+ {
+-    return pci_get_domain_bus_and_slot(0, 0x04, PCI_DEVFN(0, 0));
++    struct pci_dev *pdev = NULL;
++    while ((pdev = pci_get_device(0x10de, PCI_ANY_ID, pdev)) != NULL) {
++        if (tb_egpu_pci_is_egpu_target(pdev))
++            return pdev;
++    }
++    return NULL;
+ }
+
+-/* DIAG marker — always emits a one-line log with site + fd_count.
+- * On is_last_close (post-decrement count==0 OR pre-increment count==0),
+- * additionally calls the pdev-based DIAG dump and AER snapshot. */
++/* AORUS Patch 0032 (2026-06-20): DIAG marker, confined to the eGPU.
++ * Looks up the external eGPU first; if absent, emits nothing and touches
++ * nothing. When present, emits the one-line marker and, on is_last_close,
++ * the full pdev-based DIAG dump + AER snapshot on the eGPU. */
+ static void aorus_uvm_close_path_diag(const char *site, int fd_count, bool is_last_close)
+ {
+     struct pci_dev *pdev;
+
+-    pr_info("AORUS UVM [CLOSE]: site=%-18s fd_count=%d%s\n",
+-            site, fd_count, is_last_close ? " (LAST-CLOSE)" : "");
+-
+-    if (is_last_close) {
+-        pdev = aorus_uvm_get_gpu_pdev();
+-        if (pdev) {
+-            tb_egpu_lever_m_diag_dump_pdev(pdev, site);
+-            tb_egpu_dump_aer_trigger_event(pdev, site, NULL);
+-            pci_dev_put(pdev);
+-        } else {
+-            pr_info("AORUS UVM [CLOSE]: site=%s — no pdev for 0000:04:00.0; skipping DIAG\n",
+-                    site);
+-        }
+-    }
++    pdev = aorus_uvm_get_gpu_pdev();
++    if (!pdev)
++        return;   /* no eGPU -> no UVM instrumentation at all */
++
++    pr_info("AORUS UVM [CLOSE]: site=%-18s fd_count=%d%s\n",
++            site, fd_count, is_last_close ? " (LAST-CLOSE)" : "");
++
++    if (is_last_close) {
++        tb_egpu_lever_m_diag_dump_pdev(pdev, site);
++        tb_egpu_dump_aer_trigger_event(pdev, site, NULL);
++    }
++
++    pci_dev_put(pdev);
+ }

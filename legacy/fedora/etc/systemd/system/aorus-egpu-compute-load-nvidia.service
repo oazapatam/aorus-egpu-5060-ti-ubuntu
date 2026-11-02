@@ -1,0 +1,23 @@
+[Unit]
+Description=Bind AORUS RTX 5090 eGPU to NVIDIA driver
+Documentation=file:///root/aorus-5090-egpu/README.md
+
+# Order: run after udev settles and Thunderbolt has authorized the eGPU,
+# but before graphical.target so persistenced (which is After= this unit)
+# is up before GDM starts probing devices.
+After=systemd-udev-settle.service bolt.service
+Wants=bolt.service systemd-udev-settle.service
+Before=graphical.target
+
+# Skip cleanly if the eGPU is not on PCI. The bind script already
+# auto-detects via vendor 10de:2b85, so it works on either NUC TB4 port
+# (BDF differs: 04:00.0 on port A, 2e:00.0 on port B). Script exits 1
+# fast if GPU not found, which systemd treats as failed-but-skip.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/aorus-egpu-compute-load-nvidia
+
+[Install]
+WantedBy=multi-user.target

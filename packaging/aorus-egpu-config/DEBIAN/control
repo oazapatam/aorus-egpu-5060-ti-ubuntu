@@ -1,0 +1,117 @@
+Package: aorus-egpu-config
+Version: 0.5.9
+Architecture: all
+Maintainer: Omar Zapata <omar.zapata@arus.com.co>
+Section: kernel
+Priority: optional
+Depends: grub2-common, pciutils
+Recommends: bolt
+Conflicts: egpu-tb-fix
+Description: [SUPERSEDED] Reversible AORUS Thunderbolt eGPU config for Ubuntu
+ [SUPERSEDED 2026-06-28] egpu-tb-fix is now the primary, supported package
+ for this machine; this one was purged on 2026-06-28 and is kept only as a
+ documented, buildable archive of the 0.5.1-0.5.9 work. Do NOT install it
+ alongside egpu-tb-fix: both reassign the eGPU BAR0 from udev rules and
+ would fight each other (hence the Conflicts). See
+ docs/what-actually-works.md.
+ .
+ Ports the AORUS RTX 5060 Ti eGPU reliability stack (developed on Fedora) to
+ Ubuntu as a single reversible package. Removing it returns the system to its
+ original state (apt remove aorus-egpu-config).
+ .
+ BOOT-SAFE hotplug-only mode (v0.4.0): the eGPU is kept DORMANT at boot so a
+ dead Thunderbolt link (typical when the box is attached at power-on) can never
+ poison the NVIDIA RM and take down nvidia-smi / the internal dGPU. It activates
+ only on a real desktop hotplug. This is deterministic, not best-effort.
+ .
+ Active by default (safe on this dual-GPU laptop, never touches the internal
+ NVIDIA dGPU):
+  * kernel args para asignar la BAR1 de 16 GiB del eGPU detrás del puente TB:
+    pci=realloc,hpmmioprefsize=16G (v0.5.1). Reservan prefetchable MMIO en el
+    puente hotplug en el arranque para que la GPU quepa al enchufarla (el puente
+    intermedio TB recibía solo 2 MiB por defecto y la GPU no enumeraba).
+    resource_alignment RETIRADO en 0.5.1: inflaba BAR0/ROM a 16 GiB y rompía el
+    probe de nvidia (BAR0 0M); hpmmioprefsize sola basta para la ventana.
+  * v0.5.8: RETIRA iommu=pt (REGRESIÓN DE FREEZE). Lo metió 0.5.6; el passthrough
+    quita la contención de DMA del IOMMU y, con el enlace TB entrenando marginal
+    (Gen1 2.5GT/s, GPU-side Active=N), el eGPU bindeaba y segundos después un
+    acceso de bus malo CONGELABA TODO EL PC (hard-hang sin Xid ni panic; boot -1
+    2026-06-27). R4 intacto (la interna nunca tomó Xid: el gate del driver es
+    correcto; el freeze era del sistema). Vuelta al IOMMU completo del 0.5.1, que
+    YA verificó conectar-sin-congelar. Trade-off: el eGPU puede a veces no bindear
+    (vuelve el DMAR fault 0x71) pero "no bindea" respeta R3; "bindea y congela" lo
+    viola. La causa de fondo es el enlace Gen1 marginal (ningún IOMMU lo arregla).
+  * v0.5.6: añade al BASELINE los args anti-ASPM de la receta Fedora (verificado
+    en vivo 2026-06-27):
+      - pcie_aspm.policy=performance + thunderbolt.clx=0 + pcie_port_pm=off:
+        impiden que el puente/controlador TB reentrene el enlace a Gen1 tras el
+        idle (Fedora: "prevents link retraining that freezes the TB tunnel").
+        Estaban atrapados en la escalada antifreeze junto a iommu=off; ahora van
+        al baseline sin él. + pcie_bus_perf (MPS/MRRS performance).
+      thunderbolt.host_reset=false, resource_alignment e iommu=pt SIGUEN fuera
+      (cuelgan/rompen/congelan esta máquina); BAR1 queda en 256 MiB (rendimiento).
+  * boltd policy of the AORUS box set to manual: it no longer auto-authorizes
+    at boot (restored to auto on apt remove).
+  * aorus-egpu-hotplug-ready.service: creates /run/aorus-egpu/hotplug-ready once
+    the system is up (after multi-user.target); the TB-authorize udev rule is
+    gated on this flag, so authorization happens only on a post-boot hotplug,
+    never during the boot coldplug.
+  * aorus-egpu-fix-bar0: udev-triggered BAR0 reassignment when the eGPU appears,
+    with a HEALTH GATE that ejects the eGPU from the bus if its link is dead
+    (so it cannot poison the internal GPU) instead of letting nvidia bind it.
+    v0.5.6: SBR LINK RECOVERY. Si la eGPU enumera y PASA el health gate (enlace no
+    muerto) pero NO bindea tras el remove+rescan normal —típico del enlace marginal
+    Gen1 2.5GT/s que falla "Failed to enable MSI-X" -> "RmInitAdapter failed"— el
+    script ESCALA automáticamente: quita las funciones de la eGPU, hace un Secondary
+    Bus Reset del puente TB inmediato (BDF dinámico = padre sysfs) y reescanea, hasta
+    2 veces. Empaqueta el force-load manual (remove+SBR+rescan) verificado en vivo
+    2026-06-27 -> el hotplug ya no necesita intervención a mano. R4-safe: solo toca la
+    rama Thunderbolt, nunca la GPU interna. Requiere setpci (pciutils).
+    v0.5.7: ReBAR BUMP. Tras un bind LIMPIO sube la BAR1 de la eGPU al máximo que
+    soporta (16 GiB en la RTX 5060 Ti; sin esto cae a 256 MiB = limitante #1 de CUDA).
+    El resize in-place del kernel falla -ENOSPC (la ventana del puente TB es ~288 MiB
+    y el kernel revierte); en su lugar fija el tamaño por setpci en el registro ReBAR
+    CTRL (detectado dinámico vía lspci), quita el puente TB superior constreñido (su
+    ventana se re-asigna desde el root TB de 64 GiB) y reescanea -> 16 GiB. Verificado
+    en vivo 2026-06-27. SOLO en bind limpio (un SBR resetea el ReBAR); best-effort con
+    fallback total (si falla, la eGPU queda bindeada igual) e idempotente. R4-safe.
+    Además: pciutils pasa de Recommends a Depends (setpci es ahora requisito del SBR
+    y del ReBAR).
+  * aorus-egpu-connect: one-shot manual activation from the terminal (authorize
+    TB, wait for PCI, run the BAR0 fix) — use it for a box left attached since
+    boot, or to activate on demand.
+  * aorus-egpu (v0.5.9): comando único up/down/status para cargar y DESCARGAR la
+    eGPU por línea de comandos. 'up' delega en aorus-egpu-connect; 'down' hace una
+    descarga limpia (unbind nvidia + remove de la MISMA rama PCI hotplug que
+    gestiona fix-bar0 + desautoriza el túnel TB), con guardas: aborta sin tocar
+    nada si no aísla la eGPU bajo el árbol Thunderbolt, y se niega si hay procesos
+    usándola (salvo --force; --keep-tunnel deja el túnel). R4-safe: nunca toca la
+    interna 01:00.0. Seguro descargar con aorus15 (compute-only): el compositor no
+    usa la eGPU como pantalla, así que sacarla no congela el escritorio.
+  * udev rule pinning the eGPU out of D3cold / runtime autosuspend.
+  * keep-resident (v0.5.3): activa NVIDIA persistence mode SOLO en la eGPU
+    (10de:2d04, por bus-id reconfirmado) al aparecer en hotplug. Mantiene el
+    adapter residente para que el último `close` no lo descargue; sin esto, al
+    quedar idle el enlace Thunderbolt cae a Gen1 y el GSP no re-inicializa
+    (RmInitAdapter failed 0x62:0x40:2192) y la eGPU desaparece de nvidia-smi.
+    R4-safe: la GPU interna (2c39) nunca se ve afectada; reversible (apt remove
+    revierte persistence vía el ExecStop de la unit).
+    v0.5.4: helper defensivo — GATE de enlace sano por sysfs (Gen≥3, width≥1)
+    ANTES de tocar nvidia-smi, `timeout` en cada llamada, y aborto si nvidia-smi
+    se cuelga (sin reintentar). Corrige el bug 0.5.3 que martilleaba nvidia-smi
+    sobre un eGPU semi-roto y lo dejaba wedged en estado-D.
+  * udev rule (v0.5.2) que deja la eGPU como SOLO-CÓMPUTO: saca su nodo KMS de
+    seat0 para que el compositor Wayland no la use como pantalla. Evita el FREEZE
+    al desconectarla en caliente (nvidia-modeset colgado esperando un flip a una
+    GPU que ya no existe). CUDA va por el render node y no se ve afectado.
+ .
+ Opt-in escalation (shipped disabled, enable with aorus-egpu-escalation):
+  * antifreeze: host-wide kernel args from the Fedora freeze mitigation
+    (pcie_aspm.policy=performance, thunderbolt.clx=0, pcie_port_pm=off,
+    pci hotplug MMIO cap, iommu=off).
+  * watchdog: panic-on-lockup + kdump forensics.
+ .
+ NOT included: the custom NVIDIA driver patch series (Levers I/J/N/O/Q/M). This
+ package stays on the stock Canonical-signed driver; the patched module ships
+ separately and reversibly as aorus-egpu-nvidia-dkms (Secure Boot is now off on
+ this machine, so it loads without MOK enrollment).

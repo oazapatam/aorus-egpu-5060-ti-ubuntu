@@ -1,0 +1,6 @@
+# Aplica el perfil de potencia/relojes cuando la eGPU queda bindeada a nvidia.
+# Se engancha a `bind` (no a `add`): en `add` la GPU aún no tiene driver y
+# nvidia-smi no la ve. El número 85 la deja DESPUÉS de la preparación del BAR0
+# que hace egpu-tb-fix (regla 90- en /usr/lib, pero disparada en el evento
+# `add` anterior) y después de las reglas de power/seat.
+ACTION=="bind", SUBSYSTEM=="pci", DRIVER=="nvidia", ATTR{vendor}=="0x10de", ATTR{device}=="0x2d04", TAG+="systemd", ENV{SYSTEMD_WANTS}+="aorus-egpu-overclock.service"

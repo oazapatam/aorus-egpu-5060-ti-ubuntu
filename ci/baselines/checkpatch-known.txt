@@ -1,0 +1,49 @@
+# ci/baselines/checkpatch-known.txt
+#
+# Recuento de hallazgos de checkpatch.pl POR PARCHE que la serie ya tenía
+# cuando se montó la etapa ci/40-kernel-patches.sh. La etapa falla solo si
+# un parche EMPEORA respecto a su línea aquí; no pretende que la serie
+# llegue a cero (es un fork de un driver fuera del árbol, con el estilo de
+# la casa NVIDIA, y ~2.600 de los ~2.800 hallazgos originales eran
+# indentación con espacios y llaves Allman, ya excluidas por --ignore).
+#
+# Formato:  <fichero.patch> <errores> <avisos>
+# Regenerar: CI_CHECKPATCH_REGEN=1 ci/40-kernel-patches.sh
+# Interpretación de los fallos: docs/ci-kernel-patches.md
+#
+# Generado con: checkpatch.pl --no-tree --no-signoff --terse --show-types
+#   --ignore CODE_INDENT,LEADING_SPACE,SUSPECT_CODE_INDENT,OPEN_BRACE,ELSE_AFTER_BRACE,POINTER_LOCATION,NEW_TYPEDEFS,FILE_PATH_CHANGES,COMMIT_LOG_LONG_LINE,EMAIL_SUBJECT,GIT_COMMIT_ID,UNKNOWN_COMMIT_ID,MISSING_SIGN_OFF,NO_AUTHOR_SIGN_OFF,BAD_SIGN_OFF,COMMIT_MESSAGE,COMMIT_LOG_USE_LINK,PREFER_LORE_ARCHIVE
+0001-osHandleGpuLost-retry-on-transient-pcie-failure.patch 0 0
+0002-journal-rcdbAddRmGpuDump-shortcircuit-and-relax-assert.patch 0 1
+0003-nvDumpAllEngines-break-on-gpu-lost.patch 0 0
+0004-resserv-cleanup-asserts-accept-gpu-lost.patch 0 2
+0005-version-mark-aorus-build.patch 0 0
+0006-rpcRmApiFree-GSP-shortcircuit-on-gpu-lost.patch 1 1
+0007-nv-pci-register-error-handlers-Lever-M-base.patch 1 1
+0008-issueRpcAndWait-shortcircuit-on-gpu-lost-Lever-O.patch 1 2
+0009-uvm-destroy-diagnostic-markers-Lever-P-probe.patch 0 21
+0010-os-pci-is-disconnected-helpers-Lever-Q.patch 0 8
+0011-osDevReadReg032-Lever-Q-passive.patch 1 2
+0012-osDevReadReg008-016-Lever-Q-passive.patch 0 2
+0013-osDevReadReg032-Lever-Q-active.patch 1 3
+0014-Lever-Q-watchdog-kthread.patch 0 22
+0015-Lever-Q-watchdog-sysfs-counters.patch 0 5
+0016-Lever-M-recover-scaffolding.patch 0 24
+0017-Lever-M-recover-probe-time-WPR2-detection.patch 0 9
+0018-Lever-M-recover-diagnostic-telemetry.patch 0 6
+0020-Phase-A-PCIe-LnkSta-AER-telemetry.patch 0 5
+0021-G3-G-AER-Header-Log-capture.patch 0 14
+0022-G3-H-clear-AER-UncMask-match-Windows.patch 0 5
+0023-mode-b-telemetry-S1-S2-S3.patch 32 28
+0024-Lever-M-recover-Commit3-hardening.patch 2 34
+0025-Kbuild-version-from-version-mk.patch 0 0
+0026-Lever-M-recover-sysfs-force-trigger.patch 0 2
+0027-Lever-M-recover-dispatch-slot-reset-resume-from-work-handler.patch 0 4
+0028-Lever-M-recover-attempt-count-reset-at-post-rmInit-OK.patch 0 2
+0029-Lever-M-recover-close-path-diag-and-AER-surface-completion.patch 0 10
+0030-Lever-M-recover-UVM-close-path-DIAG.patch 0 20
+0031-R4-gate-confine-active-levers-to-egpu.patch 0 9
+0032-R4-gate-confine-diagnostic-paths-to-egpu.patch 0 7
+0033-egpu-compute-only-skip-nvidia-drm-display-registration.patch 2 1
+0034-aorus16-rate-limit-egpu-diagnostic-dumps.patch 0 4
+0035-aorus17-quiet-rm-close-path-diag.patch 0 0

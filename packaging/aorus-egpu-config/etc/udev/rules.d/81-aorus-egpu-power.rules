@@ -1,0 +1,18 @@
+# aorus-egpu-config: mantiene la eGPU fuera de D3cold / autosuspend.
+#
+# Port de la regla 81-aorus-egpu-compute-power.rules del stack de Fedora,
+# acotada SOLO a la eGPU y su función de audio (no toca la GPU interna).
+#
+# Sin esto, una eGPU inactiva puede entrar en D3cold; volver de D3cold sobre el
+# túnel Thunderbolt es poco fiable y fue causa de cuelgues tipo "fallen off the
+# bus" / "Unable to change power state from D3cold to D0".
+#
+#   power/control=on    → sin autosuspend de runtime PM
+#   d3cold_allowed=0    → prohíbe la transición a D3cold
+#
+# Device ids:  GPU 10de:2d04   audio 10de:22eb
+
+ACTION=="add|bind|change", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{device}=="0x2d04", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|bind|change", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{device}=="0x2d04", TEST=="d3cold_allowed", ATTR{d3cold_allowed}="0"
+ACTION=="add|bind|change", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{device}=="0x22eb", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|bind|change", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{device}=="0x22eb", TEST=="d3cold_allowed", ATTR{d3cold_allowed}="0"

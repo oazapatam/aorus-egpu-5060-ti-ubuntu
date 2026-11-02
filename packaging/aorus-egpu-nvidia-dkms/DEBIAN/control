@@ -1,0 +1,85 @@
+Package: aorus-egpu-nvidia-dkms
+Version: 595.71.05-aorus17
+Architecture: all
+Maintainer: Omar Zapata <omar.zapata@arus.com.co>
+Section: kernel
+Priority: optional
+Depends: dkms (>= 2.8), make, gcc
+Recommends: nvidia-driver-595-open, nvidia-firmware-595-595.71.05
+Description: [SUPERSEDED] Patched NVIDIA 595.71.05 open kernel modules (AORUS)
+ [SUPERSEDED 2026-06-28] VERSION DEBT — do not install as-is. The 34
+ patches here are written against the open-gpu-kernel-modules tag 595.71.05
+ and pin NV_VERSION_STRING to it, but the driver installed on this machine
+ is the stock 595.99.02, so these modules would NOT load. They need a rebase
+ onto the new tag before this package can be used again. The eGPU works
+ today with no lever from this series (no SBR, no ReBAR, no persistence
+ mode): see docs/what-actually-works.md.
+ .
+ Builds, via DKMS, the NVIDIA open GPU kernel modules at version 595.71.05 with
+ the AORUS Thunderbolt eGPU reliability patch series applied (Levers I/J/M/O/P/Q,
+ the Lever-M WPR2 recovery state machine, the Q-watchdog kthread, and PCIe/AER
+ telemetry). The source is the upstream open-gpu-kernel-modules tag 595.71.05
+ with patches/*.patch applied; the reported module version is pinned to 595.71.05
+ so it matches the stock Canonical userspace and GSP firmware already installed.
+ .
+ Reversible: the DKMS-built modules install to /lib/modules/<kver>/updates/dkms,
+ which overrides (but never deletes) the stock linux-modules-nvidia-595-open
+ modules in /lib/modules/<kver>/kernel. Removing this package runs dkms remove +
+ depmod, so the stock signed modules take over again (apt remove
+ aorus-egpu-nvidia-dkms).
+ .
+ Secure Boot must be OFF for these self-built modules to load (they are not
+ Canonical-signed). Enroll a MOK and a module-signing hook if you re-enable it.
+ .
+ aorus13 (2026-06-19): R4 gate (patch 0031). Every active recovery lever is now
+ confined to the external Thunderbolt eGPU via os_pci_is_egpu_target() (behind a
+ TB/USB4 controller, or device-id 10de:2d04). Fixes aorus12 breaking the internal
+ dGPU (10de:2c39) with Xid 79: the ungated levers reset/disconnected it on a
+ transient 0xFFFFFFFF during a normal RTD3/GC6 resume.
+ .
+ aorus14 (2026-06-20): R4 gate part 2 (patch 0032). Confines the diagnostic/
+ telemetry paths to the eGPU too: the close-path [CLOSE] marker no longer fires
+ on the internal dGPU, and the UVM close-path DIAG stops reading a hardcoded BDF
+ 0000:04:00.0 (the NVMe on this host) — it now finds the real eGPU by topology
+ or stays silent when absent. Cosmetic/observability only; aorus13 already
+ satisfied R3+R4 in the live load test 2026-06-19.
+ .
+ aorus15 (2026-06-26): R1/R3 — kill the unplug/load hard freeze at its root
+ (patch 0033, kernel-open/nvidia-drm/nvidia-drm-drv.c). The freeze was never an
+ R4 gate gap (the internal dGPU had zero Xid in every freeze) — it was the
+ Wayland compositor: with nvidia-drm.modeset=1, nvidia-drm registered a KMS
+ device for the HEADLESS eGPU, KWin (session AND SDDM greeter) adopted it as a
+ display output, and hung on a page-flip when the TB link dropped on unplug/
+ load. nv_drm_register_drm_device() now skips DRM/KMS registration for the eGPU
+ (matched by the existing tb_egpu_pci_is_egpu_target predicate: behind a TB/USB4
+ controller, or device-id 10de:2d04), so no compositor can ever take it as a
+ display. The internal dGPU is NOT a predicate target — it keeps its DRM device,
+ so the external HDMI on 10de:2c39 @ 01:00.0 still works (unlike the solo-Intel
+ KWIN_DRM_DEVICES posture, which killed HDMI). CUDA/nvidia-smi on the eGPU are
+ unaffected (nvidia core char device, not nvidia-drm). Mirrors Fedora's
+ modeset=0 eGPU posture, done selectively so the internal display survives.
+ Trade-off: the internal dGPU is a display device again, so live driver reload
+ is unavailable while a session holds it (acceptable — HDMI requires it anyway).
+ .
+ aorus16 (2026-06-27): observability — rate-limit the eGPU diagnostic dumps
+ (patch 0034). With the eGPU present but its Thunderbolt link dead (PMC_BOOT_0=
+ 0xffffffff, AER permanent failure → RmInitAdapter fails), the patched driver
+ flooded dmesg: 323 AORUS lines in one 5-minute boot. The R4 gate held (every
+ line was on the eGPU 8d:00.0; the internal 01:00.0 had zero Xid), but the
+ volume buried the signal and the dumps ioremap'd MMIO on every UVM open/close.
+ The three heavy dumpers (tb_egpu_dump_aer_trigger_event, tb_egpu_lever_m_diag_
+ dump, tb_egpu_lever_m_diag_dump_pdev) now sit behind a 30-second __ratelimit so
+ the first occurrence of a real fault is logged in full and repeats collapse to
+ "N callbacks suppressed"; the AER dumper's guard is gated on out==NULL so the
+ Q-watchdog snapshot path keeps its data. The per-site "AORUS UVM [CLOSE]"
+ marker (vestigial P-probe telemetry) drops to pr_debug. Pure logging throttle:
+ no change to the R4 device gate, the M-recover state machine, or the watchdog.
+ .
+ aorus17 (2026-06-27): observability follow-up (patch 0035). aorus16 missed the
+ RM-level per-site [CLOSE] marker in tb_egpu_lever_m_close_path_diag()
+ (nv-lever-m-recover.c) — distinct from the UVM-side one it demoted. Measured in
+ vivo: a CUDA process exit fires it 4x per close (close-entry/pre-stop/post-
+ shutdown/close-exit), ~312 lines in one session. Demoted from NV_DBG_ERRORS to
+ NV_DBG_INFO so it is silent at the default debug level (and keeps the NVRM device
+ prefix, unlike pr_debug). The is_last_close full dump still fires (rate-limited
+ by 0034). Pure logging-level change: R4 gate and state machine untouched.

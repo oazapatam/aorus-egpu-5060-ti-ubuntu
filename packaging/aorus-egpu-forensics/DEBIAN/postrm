@@ -1,0 +1,26 @@
+#!/bin/sh
+# postrm de aorus-egpu-forensics: devuelve el sistema a su estado original.
+#
+# Las trazas y volcados en /var/log/aorus-egpu/ NO se borran ni en purge: son
+# evidencia que el usuario puede seguir necesitando. Se dice en pantalla para
+# que no quede como basura oculta.
+set -e
+
+case "$1" in
+  remove|purge)
+    systemctl daemon-reload 2>/dev/null || true
+    # Los ficheros de /etc ya los quitó dpkg; hay que regenerar GRUB para que
+    # los args de reserva de RAM desaparezcan del cmdline.
+    update-grub >/dev/null 2>&1 || update-grub2 >/dev/null 2>&1 || true
+    # Los sysctl vuelven a su default en el próximo arranque; se restauran ya
+    # para no dejar el sistema reiniciándose ante un lockup sin quererlo.
+    sysctl -w kernel.softlockup_panic=0 >/dev/null 2>&1 || true
+    sysctl -w kernel.hardlockup_panic=0 >/dev/null 2>&1 || true
+    if [ -d /var/log/aorus-egpu ]; then
+      echo "nota: las trazas y volcados se conservan en /var/log/aorus-egpu/"
+      echo "      bórralos a mano si ya no los necesitas."
+    fi
+    echo "Reinicia para quitar la reserva de RAM de ramoops del cmdline."
+    ;;
+esac
+exit 0

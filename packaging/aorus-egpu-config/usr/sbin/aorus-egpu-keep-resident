@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+#
+# aorus-egpu-keep-resident — activa PERSISTENCE MODE de NVIDIA SOLO en la eGPU
+# AORUS RTX 5060 Ti (10de:2d04), por su PCI bus-id, nunca en la GPU interna.
+#
+# POR QUÉ (root cause verificada en vivo 2026-06-27):
+#   El eGPU inicializa bien a Gen4 al conectarlo, pero al quedar IDLE el último
+#   `close` tira el adapter (RmShutdownAdapter, persistence OFF). En esa ventana
+#   el enlace Thunderbolt re-entrena a Gen1 y, al re-acceder, el GSP no
+#   re-inicializa (RmInitAdapter failed 0x62:0x40:2192) → el eGPU cae del bus y
+#   desaparece de nvidia-smi. Persistence mantiene el adapter residente → no hay
+#   teardown → no hay ventana idle → no hay re-entreno a Gen1.
+#
+# DISEÑO DEFENSIVO (0.5.4): un eGPU semi-roto cuelga a nvidia-smi en estado-D, y
+# cada llamada de init sobre él lo empeora. Por eso este helper:
+#   1) NO toca nvidia-smi si el ENLACE no está sano (lee sysfs: Gen≥3 y width≥1).
+#   2) Pone `timeout` a CADA nvidia-smi (un GPU colgado jamás nos cuelga).
+#   3) Si nvidia-smi se CUELGA (timeout/exit 124), ABORTA — no reintenta (eso es
+#      lo que martilleaba el adapter en 0.5.3). Solo reintenta el caso benigno
+#      "aún no publicado tras el bind".
+#
+# R4 (jamás la interna RTX PRO 4000 10de:2c39): target por DEVICE-ID 0x2d04 de
+# sysfs + reconfirmado contra pci.device_id de nvidia-smi antes de togglear. Si
+# el eGPU no está o el enlace está degradado → no-op silencioso.
+#
+# Reversible: `off` desactiva persistence. Lo invoca el .deb por udev al
+# aparecer la eGPU; el ExecStop de la unit lo llama con `off` al desinstalar.
+#
+# Uso:  sudo aorus-egpu-keep-resident [on|off]
+set -u
+
+EGPU_VID=0x10de
+EGPU_DID=0x2d04          # RTX 5060 Ti (eGPU). La interna es 2c39 — nunca aquí.
+SMI_TIMEOUT=12           # cap a CADA nvidia-smi; un eGPU colgado no nos cuelga
+PUBLISH_TRIES=4          # reintentos SOLO para el lag bind→publicado (no hammer)
+
+mode="${1:-on}"
+
+# --- auto-elevación (igual que aorus-egpu-fix-bar0) ---
+if [ "$(id -u)" -ne 0 ]; then
+  exec sudo -- "$0" "$@"
+fi
+
+# --- serialización: udev puede dispararnos varias veces en el hotplug ---
+LOCK=/run/aorus-egpu-keep-resident.lock
+exec 9>"$LOCK" 2>/dev/null || true
+flock -w 30 9 2>/dev/null || true
+
+log() { printf 'aorus-egpu-keep-resident: %s\n' "$*"; }
+
+# nvidia-smi SIEMPRE acotado por timeout. Devuelve 124 si se colgó.
+smi() { timeout "$SMI_TIMEOUT" nvidia-smi "$@"; }
+
+command -v nvidia-smi >/dev/null 2>&1 || { log "nvidia-smi no disponible; no-op."; exit 0; }
+
+# --- 1) localizar el eGPU (2d04) en sysfs; si no está, no-op inmediato ---
+egpu_sysfs=""
+for d in /sys/bus/pci/devices/*; do
+  [ "$(cat "$d/vendor" 2>/dev/null)" = "$EGPU_VID" ] || continue
+  [ "$(cat "$d/device" 2>/dev/null)" = "$EGPU_DID" ] || continue
+  egpu_sysfs="$d"; break
+done
+if [ -z "$egpu_sysfs" ]; then
+  log "eGPU (10de:2d04) no presente en el bus PCI; no-op."
+  exit 0
+fi
+
+# `off` no necesita el gate de enlace: revertir es seguro y barato.
+if [ "$mode" = "off" ]; then
+  busid="$(smi --query-gpu=pci.bus_id,pci.device_id --format=csv,noheader 2>/dev/null \
+           | awk -F', ' 'toupper($2) ~ /2D04/ { print $1; exit }')"
+  [ -n "$busid" ] && smi -i "$busid" -pm 0 >/dev/null 2>&1 || true
+  log "persistence OFF (revert)."
+  exit 0
+fi
+
+# --- 2) GATE DE ENLACE SANO (solo sysfs, sin tocar nvidia) ---
+# Si el enlace está degradado/muerto, NO poking a nvidia (evita wedge/hammer).
+speed="$(cat "$egpu_sysfs/current_link_speed" 2>/dev/null)"
+width="$(cat "$egpu_sysfs/current_link_width" 2>/dev/null)"
+case "$speed" in
+  8.0\ GT/s*|16.0\ GT/s*|32.0\ GT/s*) : ;;   # Gen3/4/5: sano
+  *) log "enlace eGPU degradado (speed='${speed:-?}'); no activo persistence (no-op)."; exit 0 ;;
+esac
+if [ "${width:-0}" -lt 1 ] 2>/dev/null; then
+  log "enlace eGPU width=${width:-?} (<1); no-op."; exit 0
+fi
+
+# --- 3) confirmar que el eGPU es USABLE en nvidia-smi y leer su bus-id ---
+# Reintenta SOLO el lag bind→publicado. Si nvidia-smi se CUELGA (124) o falla
+# de verdad, ABORTA sin volver a poking (eso era el bug 0.5.3).
+busid=""
+i=0
+while [ "$i" -lt "$PUBLISH_TRIES" ]; do
+  out="$(smi --query-gpu=pci.bus_id,pci.device_id --format=csv,noheader 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -eq 124 ]; then
+    log "nvidia-smi se colgó (timeout) — eGPU wedged en init; ABORTO (no martilleo)."
+    exit 1
+  fi
+  busid="$(printf '%s\n' "$out" | awk -F', ' 'toupper($2) ~ /2D04/ { print $1; exit }')"
+  [ -n "$busid" ] && break
+  i=$((i + 1))
+  sleep 3
+done
+
+if [ -z "$busid" ]; then
+  log "eGPU con enlace sano pero no publicado por el RM (adapter init no OK); no-op."
+  exit 1
+fi
+
+# Cinturón final: reconfirmar device-id 2D04 del bus-id antes de togglear (R4).
+did="$(smi -i "$busid" --query-gpu=pci.device_id --format=csv,noheader 2>/dev/null || true)"
+case "$(printf '%s' "$did" | tr 'a-f' 'A-F')" in
+  *2D04*) : ;;
+  *) log "ABORT: $busid reporta device_id '$did' ≠ 2D04; NO toco (protejo la interna)."; exit 1 ;;
+esac
+
+# --- 4) activar persistence (acotado) ---
+if smi -i "$busid" -pm 1 >/dev/null 2>&1; then
+  log "persistence ON en la eGPU $busid (no más teardown en last-close)."
+else
+  log "AVISO: no pude activar persistence en $busid."
+  exit 1
+fi
+
+exit 0

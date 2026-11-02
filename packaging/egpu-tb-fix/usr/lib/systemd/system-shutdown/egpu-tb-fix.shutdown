@@ -1,0 +1,32 @@
+#!/bin/sh
+# egpu-tb-fix: reinicio de emergencia si la eGPU NVIDIA sigue en el árbol PCI.
+#
+# Si el enlace Thunderbolt se cae con nvidia usando la eGPU (Xid 79), el remove de nvidia
+# se queda colgado con el lock del dispositivo tomado, y el device_shutdown() del kernel
+# se bloquea ahí: el equipo no reinicia y hay que apagarlo a la fuerza. Pasó en todos los
+# arranques con la eGPU del 2026-10-02.
+#
+# systemd-shutdown ejecuta esto justo antes del reboot(2), con los sistemas de archivos ya
+# desmontados o en solo lectura. Con la eGPU en el árbol PCI se reinicia por la vía de
+# emergencia (SysRq b), que salta los callbacks de apagado de los drivers. Para apagar no
+# hay vía equivalente: si se queda colgado, ya es seguro mantener el botón de encendido.
+
+[ "$1" = reboot ] || exit 0
+
+for dev in /sys/bus/pci/devices/*; do
+	[ "$(cat "$dev/vendor" 2>/dev/null)" = 0x10de ] || continue
+	[ "$(cat "$dev/removable" 2>/dev/null)" = removable ] || continue
+
+	# fwupd.shutdown corre en paralelo y puede estar activando firmware: se le deja terminar.
+	sleep 1
+	i=0
+	while [ $i -lt 120 ] && pgrep -x 'fwupd\.shutdown|fwupdtool' >/dev/null; do
+		sleep 0.5
+		i=$((i + 1))
+	done
+
+	echo "egpu-tb-fix: eGPU ${dev##*/} en el árbol PCI; reinicio de emergencia" > /dev/kmsg
+	sync
+	echo b > /proc/sysrq-trigger
+done
+exit 0

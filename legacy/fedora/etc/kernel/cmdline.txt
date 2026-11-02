@@ -1,0 +1,74 @@
+# Reference copy of the kernel cmdline arguments required for AORUS RTX 5090 eGPU.
+# Apply with:
+#   sudo grubby --update-kernel=ALL --args="<args from this file, single line>"
+# Verify with:
+#   cat /proc/cmdline
+#
+# Active arguments:
+
+module_blacklist=nouveau,nova_core
+rd.driver.blacklist=nouveau,nova_core
+modprobe.blacklist=nouveau,nova_core
+pci=realloc,pcie_bus_perf,hpmmioprefsize=256M,resource_alignment=35@0000:03:00.0
+thunderbolt.host_reset=false
+iommu=pt
+crashkernel=256M
+
+# Why each is needed:
+#
+# module_blacklist / rd.driver.blacklist / modprobe.blacklist (3 forms of nouveau/nova_core)
+#   Defensive: prevent any path from loading nouveau / nova_core at any boot stage.
+#   Cheap to keep, expensive if nouveau ever loads alongside nvidia.
+#
+# pci=realloc,pcie_bus_perf
+#   Required for BAR0/BAR1 allocation on Thunderbolt-attached GPU. Without this,
+#   the kernel skips reallocating the eGPU's resources after Thunderbolt
+#   authorization, leaving BAR0 unassigned and the driver unable to bind.
+#
+# hpmmioprefsize=256M
+#   Caps prefetchable MMIO reservation per hotplug bridge window to 256 MiB.
+#   Prevents oversized reservations on empty downstream Thunderbolt ports from
+#   starving the actual GPU's bridge of resources.
+#
+# resource_alignment=35@0000:03:00.0
+#   Forces the occupied downstream Thunderbolt bridge (the one the GPU is on) to
+#   be reassigned with 32 GiB alignment, large enough for the RTX 5090's
+#   resizable BAR1.
+#
+# thunderbolt.host_reset=false  (THE KEY FIX)
+#   Without this, the kernel's Thunderbolt authorization path issues a host
+#   router reset that destroys the firmware/early-boot 32 GiB BAR1 layout,
+#   collapsing it to 256 MiB. This kills NVIDIA driver bind. With this flag,
+#   the firmware-assigned 32 GiB BAR1 survives Thunderbolt authorization.
+#
+# iommu=pt
+#   IOMMU is already auto-enabled on this platform via ACPI DMAR tables (no
+#   intel_iommu=on needed; verify with `ls /sys/class/iommu/` showing dmar0
+#   and dmar1). 'pt' = passthrough: kernel-managed devices bypass the
+#   IOMMU's translation tables; only devices explicitly bound to vfio-pci
+#   (none on this host) go through full IOMMU mapping. Two reasons:
+#
+#     (1) Stability. Translated mode adds DMA address mapping for every
+#         device, including the eGPU over Thunderbolt. Passthrough avoids
+#         any subtle interaction between IOMMU TLB invalidation and the
+#         Thunderbolt PCIe bridge during high-throughput GPU DMA.
+#
+#     (2) Performance. Translated mode incurs an IOMMU TLB lookup per DMA
+#         transaction. For sustained CUDA workloads (model load, kernel
+#         launches, memory transfers) this is measurable overhead.
+#
+#   Layer-2 hardening complementary to BIOS PCIe ASPM disabled (Layer 1)
+#   and our driver-side tuning (Layer 3).
+#
+# crashkernel=256M  (added 2026-05-05, Phase 1c B2)
+#   Reserves 256 MiB at boot for the kdump crash kernel. When a kernel
+#   panic fires (e.g. NMI watchdog hardlockup detection per
+#   etc/sysctl.d/aorus-egpu-watchdog.conf), the kernel kexec's into
+#   the reserved crash kernel and dumps /proc/vmcore to /var/crash on
+#   next boot. Without this reservation, kdump.service cannot arm and
+#   panics produce no forensic data — exactly the gap exposed by the
+#   2026-05-05 Mode B silent freeze.
+#
+#   256 MiB is Fedora's recommended size for systems with <64 GiB RAM.
+#   Reservation lives in physical low-memory; does not reduce usable
+#   workload RAM on a 32 GiB system meaningfully.

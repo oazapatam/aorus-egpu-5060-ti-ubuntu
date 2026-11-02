@@ -1,0 +1,65 @@
+# markdownlint config for aorus-egpu repo.
+# Relaxes a few defaults that conflict with our conventions
+# (semantic line breaks → variable line lengths;
+# multiple sections with the same heading across different docs).
+
+# Default state for all rules
+default: true
+
+# Disabled rules:
+
+# MD013 — line length.
+# Disabled because we use semantic line breaks (per CLAUDE.md);
+# line lengths vary by clause boundary, not column count.
+MD013: false
+
+# MD024 — multiple headings with same content.
+# Many docs have repeated structural sections like
+# "## What changed" or "## Why retired" — that's the convention.
+MD024: false
+
+# MD033 — inline HTML.
+# Some docs use `<details>`/`<summary>` for collapsible sections
+# and `<br>` for explicit line breaks.
+MD033:
+  allowed_elements:
+    - details
+    - summary
+    - br
+    - sub
+    - sup
+
+# MD041 — first line must be top-level heading.
+# Some service docs start with frontmatter or a status block.
+MD041: false
+
+# MD004 — unordered list style.
+# Pin to dash; the codebase uses '-' consistently for new content.
+# Older content using '+' as continuation can be fixed when touched.
+MD004:
+  style: dash
+
+# MD040 — fenced code blocks should have a language specified.
+# Allow language-less code blocks for shell-output samples + tree snippets.
+MD040: false
+
+# MD028 — no blank lines inside blockquotes.
+# Modern markdown renderers handle this fine; sometimes blockquotes with
+# multiple paragraphs benefit from internal spacing.
+MD028: false
+
+# MD046 — code block style consistent (indented vs fenced).
+# We use fenced everywhere, but mixing is harmless and not worth flagging.
+MD046: false
+
+# MD031 — fenced code blocks should be surrounded by blank lines.
+# Modern renderers handle missing blanks; rule is style-not-substance.
+# Disabled to avoid noise on common bold-then-code or list-then-code patterns.
+MD031: false
+
+# MD032 — lists should be surrounded by blank lines.
+# Same rationale as MD031. Bold-text-then-list is a common pattern in this
+# repo (e.g., "**After (ordering):**" followed by a list of services).
+# We keep MD004 (list marker style) enabled — that one catches real bugs
+# like accidental '+' interpreted as a list marker.
+MD032: false

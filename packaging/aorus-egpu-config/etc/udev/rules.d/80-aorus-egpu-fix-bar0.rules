@@ -1,0 +1,14 @@
+# aorus-egpu-config: dispara la reasignación de BAR0 al aparecer la eGPU.
+#
+# Al conectar (hotplug) la AORUS RTX 5060 Ti (10de:2d04), el kernel suele
+# dejar el BAR0 sin asignar y el driver nvidia la rechaza. Esta regla arranca
+# aorus-egpu-fix-bar0.service, que libera los puertos TB vacíos y reescanea
+# para recolocar el BAR0 (ver /usr/sbin/aorus-egpu-fix-bar0).
+#
+# El servicio es idempotente y serializado con flock: si la eGPU ya quedó con
+# driver, sale al instante, así que el re-disparo tras el rescan es inofensivo.
+#
+# Solo matchea el device id de la eGPU (2d04); la dGPU interna (2c39) nunca
+# entra aquí.
+
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{device}=="0x2d04", TAG+="systemd", ENV{SYSTEMD_WANTS}+="aorus-egpu-fix-bar0.service"

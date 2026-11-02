@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+	remove|purge)
+		systemctl daemon-reload || true
+		udevadm control --reload-rules || true
+		rm -rf /run/egpu-tb-fix
+		# Por si se desinstala con la compuerta cerrada (autoprobe del bus PCI apagado).
+		echo 1 > /sys/bus/pci/drivers_autoprobe 2>/dev/null || true
+		# dpkg ya borró /etc/default/grub.d/egpu-tb-fix.cfg: quita los parámetros del kernel.
+		if command -v update-grub >/dev/null 2>&1; then
+			update-grub || echo "egpu-tb-fix: AVISO: update-grub falló; ejecútalo a mano para quitar los parámetros de thunderbolt." >&2
+		fi
+		;;
+esac

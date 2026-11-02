@@ -1,0 +1,220 @@
+# pre-commit hooks for the aorus-egpu repo.
+#
+# Setup (one-time per clone):
+#   sudo apt install pre-commit shellcheck   # Ubuntu; or: pip install pre-commit
+#   cargo install mdslw                      # OPCIONAL (ver el hook de mdslw)
+#   pre-commit install                       # escribe .git/hooks/pre-commit
+#   pre-commit install --hook-type pre-push   # escribe .git/hooks/pre-push
+#
+# Los DOS `install` hacen falta: `pre-commit install` a secas NO instala el
+# gancho de pre-push, así que los hooks de esa etapa (markdownlint) no se
+# dispararían nunca y darían una falsa sensación de cobertura.
+#
+# REGLA DE REPARTO (por qué cada hook está donde está):
+#   pre-commit  ->  milisegundos y solo sobre los ficheros TOCADOS. Nadie
+#                   espera a un commit; un pre-commit lento se desinstala.
+#   pre-push    ->  lo que necesita red o montar un entorno (node, ruby).
+#   ci/         ->  los barridos del repo entero, con ci/run.sh (10-shell-syntax,
+#                   20-shellcheck, 30-unit-tests, ..., 70-docs). Ver
+#                   docs/ci-docs.md. Los hooks de abajo NO lo sustituyen: son
+#                   la versión incremental y barata de las mismas reglas.
+#
+# Manual run (any time):
+#   pre-commit run --all-files                      # todos los de pre-commit
+#   pre-commit run mdslw --all-files                # solo uno
+#   pre-commit run --hook-stage pre-push --all-files
+#   pre-commit run docs-ci --hook-stage pre-push --all-files   # solo las docs
+#
+# Los hooks de pre-commit corren solo sobre lo que está en el índice (lo que
+# `git commit` va a grabar), pero `--all-files` sirve para limpiezas puntuales.
+
+repos:
+  # ----- Semantic line breaks for markdown (sembr.org convention) -----
+  # Reformat staged .md files so each line ends at a clause/sentence
+  # boundary. Rendered output is unchanged; diffs become cleaner because
+  # edits no longer reflow whole paragraphs.
+  #
+  # Rationale + repo-wide convention: see CLAUDE.md.
+  - repo: local
+    hooks:
+      - id: mdslw
+        name: mdslw (semantic line breaks for markdown)
+        # AUTO-OMISIÓN DELIBERADA. `mdslw` es un binario de Rust y NO se
+        # empaqueta para Ubuntu: se instala con `cargo install mdslw`. Con un
+        # `entry: mdslw` pelado, cualquiera que no lo tenga se come un
+        # "executable not found" y el commit muere por una herramienta
+        # OPCIONAL. El envoltorio comprueba el binario y, si falta, avisa y
+        # sale 0; quien sí lo tiene conserva el formateo automático.
+        #
+        # Esto NO relaja la convención: el markdown de este repo se escribe
+        # directamente en sembr (CLAUDE.md), y el hook es una red de
+        # seguridad, no la fuente de la regla. Si lo tienes instalado y aun
+        # así quieres saltártelo en un commit concreto: SKIP=mdslw git commit.
+        entry: |-
+          bash -c 'command -v mdslw >/dev/null 2>&1 || { echo "mdslw no instalado (cargo install mdslw): se omite el formateo sembr"; exit 0; }; exec mdslw "$@"' --
+        language: system
+        types: [markdown]
+        stages: [pre-commit]
+        # mdslw default: format in place. --max-width=80 caps soft-wrap
+        # column for terminals; 0 disables wrapping (sembr-only).
+        # Van en `args:` y no dentro del envoltorio porque pre-commit los
+        # pone ANTES de los nombres de fichero, así que "$@" los recibe igual.
+        args: ['--max-width=80']
+        # Skip generated/historical artefacts, patches we don't author,
+        # and table-heavy docs where mdslw can break wide table cells
+        # across lines (markdown tables require all pipes on one line;
+        # mdslw line-wrapping breaks table syntax for long rows).
+        #
+        # OJO con las rutas: la reestructura a monorepo movió las docs de
+        # investigación a docs/research/, y estas exclusiones seguían
+        # apuntando a docs/*.md — es decir, NO excluían nada y mdslw habría
+        # destrozado las tablas de lever-catalog.md en cuanto alguien lo
+        # tocase. Corregidas aquí.
+        #
+        # docs/freeze-forensics.md se añade por el mismo motivo: son 3 tablas
+        # con filas largas, y --max-width=80 las partiría.
+        exclude: |
+          (?x)^(
+            archive/.*
+            | patches/.*
+            | docs/freeze-forensics\.md
+            | docs/research/service-retirement-roadmap\.md
+            | docs/research/lever-catalog\.md
+            | docs/research/failure-modes-index\.md
+            | docs/research/reliability-hypothesis-ledger\.md
+          )$
+
+      # ----- Sintaxis de shell: lo más barato que existe -----
+      # `bash -n` parsea el script y no ejecuta NADA. Es el gancho con mejor
+      # relación coste/beneficio del repo: 80 ficheros de shell que se
+      # instalan en el sistema y corren como root desde udev o systemd, donde
+      # un paréntesis mal cerrado no se descubre hasta el hotplug.
+      #
+      # El intérprete se elige por el shebang: a un `#!/bin/sh` se le pasa
+      # `sh -n`, porque validarlo con bash dejaría pasar sintaxis que dash no
+      # entiende. Sin shebang -> bash, que es lo que usa el núcleo src/.
+      - id: shell-syntax
+        name: sintaxis de shell (bash -n / sh -n)
+        entry: |-
+          bash -c 'rc=0; for f in "$@"; do case "$(head -n1 "$f")" in *" sh"|*/sh|*dash*) sh -n "$f" || rc=1 ;; *) bash -n "$f" || rc=1 ;; esac; done; exit $rc' --
+        language: system
+        types: [shell]
+        stages: [pre-commit]
+
+      # ----- shellcheck -----
+      # Aquí NO hay auto-omisión, al contrario que en mdslw, y la asimetría es
+      # a propósito: shellcheck está en main de Ubuntu (`apt install
+      # shellcheck`), así que es una dependencia razonable de este repo, y
+      # degradarla a aviso silencioso dejaría pasar bugs reales.
+      #
+      # --severity=warning recorta el nivel `info` (SC2086 y compañía): el
+      # repo arrastra ~78 avisos informativos heredados, y con ellos el hook
+      # bloquearía commits por deuda que no has tocado tú. El barrido fino por
+      # capas (`-S style` en src/ y ci/) es trabajo de ci/20-shellcheck.sh, no
+      # del commit: aquí solo se cierra la puerta a los bugs nuevos.
+      # -x sigue los `source`/`.` entre ficheros, que es como está construido
+      # el núcleo src/; las rutas de búsqueda están en .shellcheckrc.
+      - id: shellcheck
+        name: shellcheck (-x, severidad warning y superior)
+        entry: shellcheck -x --severity=warning
+        language: system
+        types: [shell]
+        stages: [pre-commit]
+        # Excluye lo que NO es nuestro, igual que hace ci/20-shellcheck.sh
+        # (allí es ci_warn, nunca ci_fail). Si el hook es más estricto que el
+        # CI, bloquea commits por deuda ajena y la gente aprende a saltárselo
+        # con --no-verify, que es peor que no tenerlo.
+        #
+        #   tools/   obra de terceros (apnex/iecxiv). Los ficheros de
+        #            event-capture/hypotheses/ son declarativos: definen
+        #            variables que LEE el framework que los carga con `source`,
+        #            así que SC2034 "appears unused" es un falso positivo.
+        #   legacy/  stack Fedora retirado; archivo documentado, no se instala.
+        #   packaging/*/usr/  el PAYLOAD de los paquetes: egpu-tb-fix y los
+        #            usr/sbin de aorus-egpu-config están VALIDADOS EN VIVO.
+        #            Reescribirlos para contentar a un linter es justo el cambio
+        #            que no se puede justificar en este proyecto. Los
+        #            maintainer scripts (packaging/*/DEBIAN/) SÍ se comprueban:
+        #            un error ahí rompe `apt install` a mitad.
+        exclude: |
+          (?x)^(
+            tools/|
+            legacy/|
+            packaging/[^/]+/usr/
+          )
+
+      # ----- Deriva de identificadores -----
+      # CLAUDE.md exige correr esto antes de cada commit, pero hasta ahora
+      # NINGÚN hook lo disparaba: la regla vivía solo en la documentación.
+      # Comprueba que la superficie que se instala en el sistema usa los
+      # nombres vigentes (NVreg_TbEgpu*, tb_egpu_*, TB_EGPU_*, aorus-egpu-*);
+      # un modprobe.d con el nombre viejo no falla al construir, falla en el
+      # hotplug.
+      #
+      # always_run + pass_filenames: false porque el script hace su propio
+      # barrido de la superficie de instalación y necesita verla entera para
+      # juzgarla; 33 ms, así que no se nota.
+      - id: lint-identifiers
+        name: tools/lint-identifiers.sh (deriva de identificadores)
+        entry: tools/lint-identifiers.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      # ----- Tests del dominio -----
+      # 51 asserts sobre las reglas puras (gate R4, salud del enlace, perfiles
+      # de overclock) en ~0,3 s, sin root, sin GPU y sin tocar hardware. Esto
+      # es exactamente lo que compra la arquitectura hexagonal, y es lo que
+      # hace que quepa en un pre-commit: antes estas reglas solo se podían
+      # probar enchufando la caja.
+      #
+      # `files:` en vez de always_run: los tests cubren src/, así que solo
+      # tienen algo que decir cuando se toca src/ o los propios tests. El
+      # barrido incondicional ya lo hace ci/30-unit-tests.sh.
+      - id: domain-tests
+        name: tests/run.sh (51 asserts del dominio, sin root ni GPU)
+        entry: bash tests/run.sh
+        language: system
+        pass_filenames: false
+        files: '^(src/|tests/)'
+        stages: [pre-commit]
+
+      # ----- Etapa de CI de documentación -----
+      # ci/70-docs.sh comprueba enlaces relativos colgados, fences sin cerrar,
+      # sembr (aviso) y que las versiones de docs/packages/README.md cuadren
+      # con los DEBIAN/control. Detalle: docs/ci-docs.md.
+      #
+      # En pre-push y no en pre-commit porque barre los 61 .md del repo, no
+      # solo los tocados: 0,7 s, demasiado para un commit y nada para un push.
+      # Un enlace roto no se arregla editando el fichero que lo contiene
+      # —suele romperlo el commit que MUEVE el destino—, así que un hook sobre
+      # ficheros tocados no lo vería; tiene que ser un barrido.
+      #
+      # Para correrlo a mano:
+      #   pre-commit run docs-ci --hook-stage pre-push --all-files
+      #   ci/70-docs.sh            # lo mismo, sin pre-commit de por medio
+      - id: docs-ci
+        name: ci/70-docs.sh (enlaces, fences, versiones de la doc)
+        entry: ci/70-docs.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+  # ----- Markdownlint (structural checks; not prose flow) -----
+  # Catches inconsistent heading levels, missing blank lines around
+  # headings, mixed list markers, broken fenced code blocks, etc.
+  # Runs via Docker-less standalone binary if present; harmless if not.
+  # Add per-rule disable in .markdownlint.yaml if needed.
+  #
+  # En pre-push y no en pre-commit: este hook viene de un repo remoto y la
+  # primera ejecución CLONA el repo y monta un entorno de node, que es lo
+  # único lento de toda esta configuración. En un commit sería inaceptable;
+  # una vez por push, no se nota.
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.42.0
+    hooks:
+      - id: markdownlint
+        stages: [pre-push]
+        args: ['--config', '.markdownlint.yaml', '--ignore', 'archive', '--ignore', 'patches']

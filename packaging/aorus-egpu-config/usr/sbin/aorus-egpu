@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+#
+# aorus-egpu — carga/descarga la eGPU AORUS RTX 5060 Ti desde la terminal.
+#
+#   aorus-egpu up      (load|on|connect)    autoriza TB + fix-BAR0 + bind nvidia
+#                                           -> delega en aorus-egpu-connect
+#   aorus-egpu down    (unload|off|eject)   descarga LIMPIA: unbind nvidia, saca
+#                                           la rama PCI de la eGPU del bus y
+#                                           desautoriza el túnel Thunderbolt
+#   aorus-egpu status  (st)                 diagnóstico solo-lectura
+#                                           -> delega en aorus-egpu-status
+#
+# SEGURIDAD (R4): 'down' SOLO toca la rama Thunderbolt de la eGPU (device
+# 10de:2d04). La GPU interna RTX PRO 4000 (10de:2c39, 01:00.0) NUNCA se ve
+# afectada: el script ABORTA sin tocar nada si no puede aislar la eGPU bajo el
+# árbol TB. Es el equivalente en software a desenchufar el cable de forma
+# segura — y con el driver aorus15 (compute-only, el eGPU no registra display)
+# el compositor ya no lo usa como pantalla, así que descargarlo no congela el
+# escritorio.
+#
+# Espeja la rama PCI EXACTA que gestiona aorus-egpu-fix-bar0 (mismo gpu_port),
+# así 'up' y 'down' son simétricos.
+#
+# Uso:
+#   sudo aorus-egpu up
+#   sudo aorus-egpu down                 # también desautoriza el túnel TB
+#   sudo aorus-egpu down --keep-tunnel   # solo saca la GPU del bus, deja el túnel
+#   sudo aorus-egpu down --force         # descarga aunque haya procesos usándola
+#   aorus-egpu status
+set -u
+
+EGPU_VID=0x10de
+EGPU_DID=0x2d04          # RTX 5060 Ti (eGPU). La interna es 0x2c39 — jamás se toca.
+TB_DID=0x41cd            # controlador Thunderbolt de la box AORUS
+
+self=$(basename "$0")
+
+log() { printf '%s\n' "$*"; }
+err() { printf '%s\n' "$*" >&2; }
+
+usage() {
+  cat <<EOF
+$self — carga/descarga la eGPU AORUS por línea de comandos.
+
+  $self up        cargar:    autoriza Thunderbolt, reasigna BAR0 y bindea nvidia
+  $self down      descargar: unbind nvidia + saca la eGPU del bus PCI + desautoriza TB
+  $self status    diagnóstico (solo lectura)
+
+  alias:  up = load|on|connect      down = unload|off|disconnect|eject
+  flags de 'down':
+    --keep-tunnel   no desautorizar el túnel Thunderbolt (solo saca la GPU del bus)
+    --force         descargar aunque haya procesos usando la eGPU
+
+Seguridad: 'down' solo toca la rama Thunderbolt (10de:2d04); la GPU interna
+(10de:2c39, 01:00.0) nunca se ve afectada.
+EOF
+}
+
+# Sube desde la eGPU al bridge 0000:* más alto = root port TB del PCH.
+tb_root_of() { # $1=egpu addr -> BDF del root port TB; vacío si no se puede
+  local cur parent
+  cur=$(readlink -f "/sys/bus/pci/devices/$1") || return 1
+  while parent=$(dirname "$cur"); do
+    case "$(basename "$parent")" in 0000:*) cur="$parent" ;; *) break ;; esac
+  done
+  basename "$cur"
+}
+
+find_egpu() { # imprime el addr de la VGA NVIDIA 2d04; falla si no está presente
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [ -r "$d/vendor" ] && [ -r "$d/device" ] || continue
+    [ "$(cat "$d/vendor")" = "$EGPU_VID" ] && [ "$(cat "$d/device")" = "$EGPU_DID" ] || continue
+    basename "$d"; return 0
+  done
+  return 1
+}
+
+do_down() {
+  local keep_tunnel=0 force=0 a
+  for a in "$@"; do
+    case "$a" in
+      --keep-tunnel) keep_tunnel=1 ;;
+      --force)       force=1 ;;
+      *) err "flag desconocido para 'down': $a"; echo; usage; exit 2 ;;
+    esac
+  done
+
+  local egpu
+  egpu=$(find_egpu) || { log "No hay eGPU AORUS (10de:2d04) en el bus — nada que descargar."; exit 0; }
+
+  # --- SEGURIDAD: jamás la GPU interna -------------------------------------
+  if [ "$egpu" = "0000:01:00.0" ]; then
+    err "ABORTO: el device localizado es 01:00.0 (GPU interna). No se toca."
+    exit 1
+  fi
+
+  local tb_root egpu_real tb_real rel gpu_port
+  tb_root=$(tb_root_of "$egpu") || { err "ABORTO: no pude hallar el root TB de $egpu; no toco nada."; exit 1; }
+  egpu_real=$(readlink -f "/sys/bus/pci/devices/$egpu")
+  tb_real=$(readlink -f "/sys/bus/pci/devices/$tb_root")
+  case "$egpu_real" in
+    "$tb_real"/*) ;;  # bien: la eGPU cuelga del árbol Thunderbolt
+    *) err "ABORTO: $egpu no cuelga del árbol Thunderbolt ($tb_root)."
+       err "        No puedo aislar su rama -> no toco nada (protejo la interna)."; exit 1 ;;
+  esac
+  # gpu_port = el MISMO segmento que quita aorus-egpu-fix-bar0 (campo 2 del rel):
+  # el puerto hotplug downstream que lleva a la GPU (no el router TB host).
+  rel=${egpu_real#"$tb_real"/}
+  gpu_port=$(printf '%s\n' "$rel" | cut -d/ -f2)
+  case "$gpu_port" in
+    0000:*) ;;
+    *) err "ABORTO: no pude derivar la rama PCI hotplug de la eGPU; no toco nada."; exit 1 ;;
+  esac
+
+  log "eGPU: $egpu  (rama TB a quitar: $gpu_port bajo root $tb_root)"
+
+  # --- ¿en uso por algún proceso? -----------------------------------------
+  local info minor holders
+  info="/proc/driver/nvidia/gpus/$egpu/information"
+  minor=$(grep -i 'Device Minor' "$info" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+  if [ -n "${minor:-}" ] && [ -e "/dev/nvidia$minor" ] && command -v fuser >/dev/null 2>&1; then
+    holders=$(fuser "/dev/nvidia$minor" 2>/dev/null | tr -s ' ')
+    if [ -n "${holders:-}" ]; then
+      if [ "$force" -ne 1 ]; then
+        err "La eGPU (/dev/nvidia$minor) está EN USO:"
+        fuser -v "/dev/nvidia$minor" 2>&1 | sed 's/^/    /' >&2 || true
+        err "Cierra esos procesos, o fuerza con:  sudo $self down --force"
+        exit 1
+      fi
+      log "AVISO: --force con procesos usando la eGPU; pueden recibir errores."
+    fi
+  fi
+
+  # --- 1) unbind graceful de nvidia en las funciones de la eGPU -----------
+  local fn name drv
+  for fn in /sys/bus/pci/devices/${egpu%.*}.*; do
+    [ -e "$fn/driver/unbind" ] || continue
+    name=$(basename "$fn")
+    drv=$(basename "$(readlink -f "$fn/driver")")
+    log "  unbind $drv de $name"
+    echo "$name" > "$fn/driver/unbind" 2>/dev/null || true
+  done
+  sleep 0.3
+
+  # --- 2) sacar la rama de la eGPU del bus PCI ----------------------------
+  if [ -e "/sys/bus/pci/devices/$gpu_port/remove" ]; then
+    log "  remove de la rama PCI: $gpu_port"
+    echo 1 > "/sys/bus/pci/devices/$gpu_port/remove"
+    sleep 0.3
+  else
+    err "  AVISO: $gpu_port no tiene nodo 'remove'; ¿ya se fue?"
+  fi
+
+  # --- 3) desautorizar el túnel Thunderbolt (salvo --keep-tunnel) ---------
+  if [ "$keep_tunnel" -ne 1 ]; then
+    local d
+    for d in /sys/bus/thunderbolt/devices/*-*; do
+      [ "$(cat "$d/device" 2>/dev/null)" = "$TB_DID" ] || continue
+      if [ "$(cat "$d/authorized" 2>/dev/null)" != "0" ]; then
+        log "  desautorizando túnel Thunderbolt: $(basename "$d")"
+        echo 0 > "$d/authorized" 2>/dev/null \
+          || err "  AVISO: no pude escribir authorized=0 (alternativa: boltctl forget <uuid>)."
+      fi
+      break
+    done
+  fi
+
+  # --- verificación --------------------------------------------------------
+  udevadm settle --timeout=5 2>/dev/null || true
+  if lspci -d 10de:2d04 2>/dev/null | grep -q .; then
+    err "⚠️ La eGPU sigue en el bus PCI. Reintenta, o desenchufa el cable."
+    exit 1
+  fi
+  if [ "$keep_tunnel" -eq 1 ]; then
+    log "✅ eGPU descargada del bus PCI (túnel Thunderbolt intacto)."
+  else
+    log "✅ eGPU descargada (fuera del bus PCI y túnel Thunderbolt desautorizado)."
+  fi
+  log "   La GPU interna 01:00.0 no se tocó.  Re-cargar:  sudo $self up"
+  exit 0
+}
+
+case "${1:-}" in
+  up|load|on|connect|start)
+    command -v aorus-egpu-connect >/dev/null 2>&1 \
+      || { err "aorus-egpu-connect no está en PATH."; exit 1; }
+    exec aorus-egpu-connect
+    ;;
+  down|unload|off|disconnect|eject|stop)
+    if [ "$(id -u)" -ne 0 ]; then exec sudo -- "$0" "$@"; fi
+    shift
+    do_down "$@"
+    ;;
+  status|st|"")
+    command -v aorus-egpu-status >/dev/null 2>&1 \
+      || { err "aorus-egpu-status no está en PATH."; exit 1; }
+    exec aorus-egpu-status
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    err "comando desconocido: ${1:-}"; echo; usage; exit 2
+    ;;
+esac

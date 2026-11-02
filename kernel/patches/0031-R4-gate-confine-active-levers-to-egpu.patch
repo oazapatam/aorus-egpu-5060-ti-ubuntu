@@ -1,0 +1,218 @@
+From: squadai-stable <noreply@local>
+Date: 2026-06-19
+Subject: [PATCH] R4 gate (0031) — confine every active lever to the eGPU
+
+Plan B2 of CLAUDE.md / docs/egpu-driver-dkms-reference.md. The prior
+build (aorus12) broke the INTERNAL dGPU (RTX PRO 4000, 10de:2c39 @
+01:00.0) with Xid 79 because NO lever had a device gate: the recovery
+machinery fires on any NVIDIA GPU the driver binds. During a normal
+RTD3/GC6 resume the internal GPU's BAR firewall briefly reads
+0xFFFFFFFF, the levers read that as "GPU lost", and reset/disconnect
+the internal — exactly the R4 violation.
+
+This patch adds a single source-of-truth predicate
+os_pci_is_egpu_target() (topology: behind a Thunderbolt/USB4 controller;
+plus device-id 0x2d04 as a fallback) and gates EVERY active lever on it,
+so recovery is confined to the external eGPU and the internal dGPU is
+never touched:
+
+  - os-pci.c / os-interface.h (x2): define + declare the predicate.
+  - nv-pci.c error_detected: non-eGPU -> stock M-base DISCONNECT
+    (never NEED_RESET -> never pci_reset_bus).
+  - nv-pci.c slot_reset/resume: defensive guards.
+  - nv-pci.c probe: only spawn the Q-watchdog kthread for the eGPU.
+  - nv-lever-m-recover.c trigger_post_rminit_fail: early-return for
+    non-eGPU (this is the pci_reset_bus-on-upstream-bridge path).
+  - nv-lever-m-recover.c G3-H: only rewrite AER UncMask on the eGPU.
+  - os.c Q-active: only declare disconnected / set_disconnected for the eGPU.
+
+Satisfies R3 (eGPU still recovers / drops alone) and R4 (internal dGPU
+never reset or marked disconnected) together.
+---
+diff --git a/kernel-open/common/inc/os-interface.h b/kernel-open/common/inc/os-interface.h
+index 0728057..33bc9de 100644
+--- a/kernel-open/common/inc/os-interface.h
++++ b/kernel-open/common/inc/os-interface.h
+@@ -116,6 +116,12 @@ void        NV_API_CALL  os_pci_remove                    (void *);
+ //
+ NvBool      NV_API_CALL  os_pci_is_disconnected           (void *);
+ void        NV_API_CALL  os_pci_set_disconnected          (void *);
++//
++// AORUS R4 gate (Patch 0031): is this device the external Thunderbolt eGPU
++// (legit target of the recovery levers) vs the internal dGPU (never touch)?
++// Single source of truth gating every active lever. See os-pci.c.
++//
++NvBool      NV_API_CALL  os_pci_is_egpu_target            (void *);
+ void*       NV_API_CALL  os_map_kernel_space              (NvU64, NvU64, NvU32);
+ void        NV_API_CALL  os_unmap_kernel_space            (void *, NvU64);
+ #if defined(NV_VMWARE)
+diff --git a/kernel-open/nvidia/nv-lever-m-recover.c b/kernel-open/nvidia/nv-lever-m-recover.c
+index c082ead..7ba4e29 100644
+--- a/kernel-open/nvidia/nv-lever-m-recover.c
++++ b/kernel-open/nvidia/nv-lever-m-recover.c
+@@ -45,6 +45,7 @@
+ #include "nv-linux.h"
+ #include "nv-pci-types.h"
+ #include "nv-qwatchdog.h"  /* tb_egpu_qwatchdog_aer_snapshot */
++#include "os-interface.h"  /* AORUS R4 gate: os_pci_is_egpu_target (Patch 0031) */
+ 
+ #include <linux/module.h>
+ #include <linux/workqueue.h>
+@@ -1035,6 +1036,12 @@ int tb_egpu_lever_m_trigger_post_rminit_fail(nv_linux_state_t *nvl)
+     if (!nvl)
+         return 0;
+ 
++    /* AORUS R4 gate (Patch 0031): the post-rmInit-FAIL path schedules a
++     * pci_reset_bus on the upstream bridge. On the internal dGPU that would
++     * reset its CPU root port — the Xid-79 path. Only ever fire for the eGPU. */
++    if (!os_pci_is_egpu_target(nvl->pci_dev))
++        return 0;
++
+     if (!NVreg_TbEgpuLeverMRecoverEnable || !nvl->lever_m)
+         return 0;   /* M-base fallback: leave existing path in place */
+ 
+@@ -1351,7 +1358,10 @@ int tb_egpu_lever_m_recover_init(nv_linux_state_t *nvl)
+      * Runs regardless of NVreg_TbEgpuLeverMRecoverEnable since unmasking
+      * is independent of the recovery state machine — even with M-recover
+      * disabled, we want errors visible rather than silently demoted. */
+-    if (NVreg_TbEgpuUncMaskClearEnable && nvl->pci_dev)
++    /* AORUS R4 gate (Patch 0031): only rewrite AER UncMask on the eGPU;
++     * never touch the internal dGPU's error-reporting config. */
++    if (NVreg_TbEgpuUncMaskClearEnable && nvl->pci_dev &&
++        os_pci_is_egpu_target(nvl->pci_dev))
+     {
+         struct pci_dev *pdev = nvl->pci_dev;
+         int aer_pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_ERR);
+diff --git a/kernel-open/nvidia/nv-pci.c b/kernel-open/nvidia/nv-pci.c
+index f403749..279d04b 100644
+--- a/kernel-open/nvidia/nv-pci.c
++++ b/kernel-open/nvidia/nv-pci.c
+@@ -2224,7 +2224,12 @@ nv_pci_probe
+      * so the device stays in D0 and the kthread can safely read MMIO
+      * indefinitely. Failure here is non-fatal — driver continues without
+      * watchdog, falling back to the existing Q-active wrapper. */
+-    (void)tb_egpu_qwatchdog_init(nvl);
++    /* AORUS R4 gate (Patch 0031): only run the heartbeat kthread for the
++     * external eGPU. On the internal dGPU the kthread's PMC_BOOT_0 reads
++     * would see a transient 0xFFFFFFFF during a normal RTD3/GC6 resume and
++     * call os_pci_set_disconnected on it — exactly the Xid-79 path. */
++    if (os_pci_is_egpu_target(pci_dev))
++        (void)tb_egpu_qwatchdog_init(nvl);
+ 
+     /* AORUS Lever M-recover init was moved earlier in probe (line ~1920)
+      * in Commit 2 so the WPR2 check has lever_m available; no longer
+@@ -2876,6 +2881,17 @@ nv_pci_error_detected(struct pci_dev *pci_dev, pci_channel_state_t state)
+     if (nvl)
+         lm = nvl->lever_m;
+ 
++    /* AORUS R4 gate (Patch 0031): never drive a bus reset on anything but
++     * the external Thunderbolt eGPU. For the internal dGPU (or any non-eGPU)
++     * fall back to stock M-base DISCONNECT — exactly the upstream behaviour,
++     * so the kernel's normal teardown runs and the internal is never reset. */
++    if (!os_pci_is_egpu_target(pci_dev))
++    {
++        result = PCI_ERS_RESULT_DISCONNECT;
++        reason = "M-base (R4 gate: not the eGPU target)";
++        goto log_and_return;
++    }
++
+     if (!NVreg_TbEgpuLeverMRecoverEnable || !lm)
+     {
+         /* M-base behaviour (Enable=0 OR per-device state not allocated). */
+@@ -2945,11 +2961,18 @@ log_and_return:
+  * in nv-lever-m-recover.c so the recovery logic stays in one TU. */
+ static pci_ers_result_t nv_pci_slot_reset(struct pci_dev *pci_dev)
+ {
++    /* AORUS R4 gate (Patch 0031): defensive — error_detected never returns
++     * NEED_RESET for a non-eGPU, so the kernel should not call slot_reset
++     * here, but never run the recovery verify/reset path on the internal. */
++    if (!os_pci_is_egpu_target(pci_dev))
++        return PCI_ERS_RESULT_DISCONNECT;
+     return tb_egpu_lever_m_slot_reset(pci_dev);
+ }
+ 
+ static void nv_pci_resume(struct pci_dev *pci_dev)
+ {
++    if (!os_pci_is_egpu_target(pci_dev))
++        return;
+     tb_egpu_lever_m_slot_reset_resume(pci_dev);
+ }
+ 
+diff --git a/kernel-open/nvidia/os-pci.c b/kernel-open/nvidia/os-pci.c
+index 46f459a..ae449fb 100644
+--- a/kernel-open/nvidia/os-pci.c
++++ b/kernel-open/nvidia/os-pci.c
+@@ -188,6 +188,39 @@ void NV_API_CALL os_pci_set_disconnected(
+     WRITE_ONCE(pdev->error_state, pci_channel_io_perm_failure);
+ }
+ 
++//
++// AORUS R4 gate (Patch 0031, 2026-06-19): is this device the external
++// Thunderbolt eGPU (the recovery levers' legitimate target), as opposed
++// to the internal dGPU which must NEVER be touched?
++//
++// Single source of truth for every active lever (M-recover bus reset,
++// Q-watchdog kthread, Q-active set_disconnected, G3-H AER UncMask clear).
++// On this dual-GPU laptop the internal RTX PRO 4000 (10de:2c39 @ 01:00.0)
++// hangs off a CPU root port and its transient 0xFFFFFFFF reads during a
++// normal RTD3/GC6 resume were mis-read as "GPU lost", so the ungated
++// levers reset/disconnected it (Xid 79). Gating every active path on this
++// predicate keeps recovery confined to the eGPU.
++//
++// Primary gate: topology — the device sits behind a Thunderbolt/USB4
++// controller (pci_is_thunderbolt_attached walks the bridge chain). The
++// internal dGPU is not TB-attached, so it can never match.
++// Secondary gate: device-id 0x2d04 (AORUS RTX 5060 Ti), belt-and-suspenders
++// in case TB attribution is ever missing for the tunnelled GPU.
++//
++NvBool NV_API_CALL os_pci_is_egpu_target(
++    void *handle
++)
++{
++    struct pci_dev *pdev = (struct pci_dev *) handle;
++    if (!pdev)
++        return NV_FALSE;
++    if (pci_is_thunderbolt_attached(pdev))
++        return NV_TRUE;
++    if (pdev->vendor == 0x10de && pdev->device == 0x2d04)
++        return NV_TRUE;
++    return NV_FALSE;
++}
++
+ NV_STATUS NV_API_CALL
+ os_enable_pci_req_atomics(
+     void *handle,
+diff --git a/src/nvidia/arch/nvalloc/unix/include/os-interface.h b/src/nvidia/arch/nvalloc/unix/include/os-interface.h
+index f9e0ec0..95b846b 100644
+--- a/src/nvidia/arch/nvalloc/unix/include/os-interface.h
++++ b/src/nvidia/arch/nvalloc/unix/include/os-interface.h
+@@ -116,6 +116,12 @@ void        NV_API_CALL  os_pci_remove                    (void *);
+ //
+ NvBool      NV_API_CALL  os_pci_is_disconnected           (void *);
+ void        NV_API_CALL  os_pci_set_disconnected          (void *);
++//
++// AORUS R4 gate (Patch 0031): is this device the external Thunderbolt eGPU
++// (legit target of the recovery levers) vs the internal dGPU (never touch)?
++// Single source of truth gating every active lever. See os-pci.c.
++//
++NvBool      NV_API_CALL  os_pci_is_egpu_target            (void *);
+ void*       NV_API_CALL  os_map_kernel_space              (NvU64, NvU64, NvU32);
+ void        NV_API_CALL  os_unmap_kernel_space            (void *, NvU64);
+ NV_STATUS   NV_API_CALL  os_flush_cpu_cache_all           (void);
+diff --git a/src/nvidia/arch/nvalloc/unix/src/os.c b/src/nvidia/arch/nvalloc/unix/src/os.c
+index 4793700..286016e 100644
+--- a/src/nvidia/arch/nvalloc/unix/src/os.c
++++ b/src/nvidia/arch/nvalloc/unix/src/os.c
+@@ -2022,7 +2022,12 @@ NvU32 osDevReadReg032(
+     if (retval == 0xFFFFFFFFU && pGpu)
+     {
+         nv_state_t *nv = NV_GET_NV_STATE(pGpu);
++        /* AORUS R4 gate (Patch 0031): Q-active may declare the GPU lost and
++         * call os_pci_set_disconnected. Restrict that to the external eGPU —
++         * a transient 0xFFFFFFFF on the internal dGPU during RTD3/GC6 resume
++         * must NOT mark it disconnected (that was part of the Xid-79 cascade). */
+         if (nv && nv->regs && nv->regs->map_u &&
++            os_pci_is_egpu_target(nv->handle) &&
+             !pGpu->getProperty(pGpu, PDB_PROP_GPU_IS_LOST))
+         {
+             nv_priv_t *nvp = NV_GET_NV_PRIV(nv);

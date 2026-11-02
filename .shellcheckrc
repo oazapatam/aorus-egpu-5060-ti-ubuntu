@@ -1,0 +1,43 @@
+# .shellcheckrc — configuración de shellcheck para TODO el repo.
+#
+# Principio: aquí NO se silencia ningún check. Lo único que se configura es
+# dónde buscar los ficheros que se cargan con `.`, para que shellcheck pueda
+# seguirlos (con `-x`) en vez de emitir SC1091 por cada `source`. Las
+# supresiones de verdad viven acotadas a la línea que las necesita, con un
+# comentario que explica el porqué; un `disable=` global aquí dejaría el repo
+# sin red de seguridad para siempre.
+#
+# La severidad NO se fija aquí a propósito: la etapa ci/20-shellcheck.sh usa un
+# nivel distinto por capa (`-S style` para src/ y ci/, `-S warning` para
+# scripts/ y tests/) y un `severity=` en este fichero lo pisaría.
+
+# --- resolución de `source` ---------------------------------------------------
+#
+# Las rutas de los `.` del repo llevan variables ("$_root/bootstrap.sh",
+# "$ROOT/src/bootstrap.sh", "$ROOT/scripts/lib/bundle.sh"), así que shellcheck
+# no puede resolverlas y se queda con el basename. Estas entradas le dicen
+# dónde buscarlo.
+#
+# Todas son SCRIPTDIR-relativas (el directorio del fichero analizado), no
+# relativas al cwd: así `shellcheck src/bin/aorus-egpu-oc` resuelve igual desde
+# la raíz del repo, desde un hook de git o desde /tmp.
+
+# El propio directorio del script: scripts/lib/bundle.sh, ci/lib/report.sh.
+source-path=SCRIPTDIR
+
+# src/bin/* -> src/bootstrap.sh   y   ci/NN-*.sh -> ci/lib (vía la de abajo).
+source-path=SCRIPTDIR/..
+
+# tests/run.sh -> src/bootstrap.sh
+source-path=SCRIPTDIR/../src
+
+# scripts/build-*.sh -> scripts/lib/bundle.sh
+source-path=SCRIPTDIR/lib
+
+# NOTA sobre `external-sources`: no se activa porque no hace falta. Los
+# `source-path` declarados en este fichero (no en los scripts) shellcheck los
+# honra siempre; `external-sources=true` solo sería necesario para permitir que
+# un SCRIPT se autorice a sí mismo a leer ficheros de fuera de su árbol con
+# `# shellcheck source=...`, y en este repo no hay ninguna directiva así.
+# Verificado: con este .shellcheckrc y sin external-sources, `shellcheck -x`
+# resuelve los cuatro `source` del repo y no queda ni un SC1090/SC1091.

@@ -1,0 +1,26 @@
+[Unit]
+Description=Aplica el perfil de potencia/relojes a la eGPU AORUS
+Documentation=man:nvidia-smi(1)
+# Solo tiene sentido con la eGPU ya bindeada por nvidia. La dispara udev
+# (ver 85-aorus-egpu-overclock.rules), no un target de arranque: la eGPU es
+# hotplug y en el arranque normalmente no está.
+After=egpu-tb-fix.service
+ConditionPathExists=/etc/aorus-egpu/overclock.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/aorus-egpu/overclock.conf
+# El perfil 'stock' hace un reset, así que un PROFILE vacío nunca deja la
+# tarjeta en un estado que nadie pidió.
+ExecStart=/bin/sh -c '/usr/sbin/aorus-egpu-oc apply "${PROFILE:-stock}"'
+# Reversibilidad: parar el servicio (o desinstalar el paquete) devuelve la
+# tarjeta a fábrica.
+ExecStop=/usr/sbin/aorus-egpu-oc reset
+# Un fallo del tuning NUNCA debe dejar el sistema en estado raro ni reintentar
+# en bucle sobre una tarjeta frágil.
+TimeoutStartSec=60
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

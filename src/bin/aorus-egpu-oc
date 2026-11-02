@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# aorus-egpu-oc — control de potencia y relojes de la eGPU AORUS RTX 5060 Ti.
+#
+# ENTRYPOINT FINO (capa bin/): parsea argumentos, elige el caso de uso y sale.
+# Ni una regla de negocio aquí — viven en src/domain/, orquestadas por
+# src/app/overclock.sh. Ver docs/architecture.md.
+set -uo pipefail
+
+# Localiza el bootstrap tanto en el repo como instalado.
+for _root in "$(dirname "$(readlink -f "$0")")/.." /usr/lib/aorus-egpu; do
+  if [ -r "$_root/bootstrap.sh" ]; then . "$_root/bootstrap.sh"; break; fi
+done
+if ! declare -F aorus_use >/dev/null; then
+  printf 'aorus-egpu-oc: no encuentro bootstrap.sh\n' >&2; exit 70
+fi
+aorus_use app/overclock
+
+usage() {
+  cat <<-USAGE
+	aorus-egpu-oc — potencia y relojes de la eGPU (nunca de la GPU interna)
+
+	Uso:
+	  aorus-egpu-oc status              estado actual, límites y perfil aplicado
+	  aorus-egpu-oc list               perfiles disponibles
+	  aorus-egpu-oc apply <perfil>     aplica un perfil
+	  aorus-egpu-oc reset              vuelve a valores de fábrica
+
+	Opciones:
+	  --dry-run     muestra el plan sin tocar el hardware
+	  --force       aplica aunque el enlace esté degradado (BAJO TU RIESGO:
+	                apretar la eGPU con el enlace Gen1 ha congelado el host)
+	  -h, --help    esta ayuda
+
+	Alcance: ajusta power limit y BLOQUEOS de reloj vía nvidia-smi. Los offsets
+	de +MHz sobre stock NO están disponibles en este sistema (requieren Xorg con
+	Coolbits o NVML VF offset); un perfil que los pida se rechaza en vez de
+	fingir que se aplicó.
+
+	ESTADO: en desarrollo, sin validar en hardware todavía.
+	USAGE
+}
+
+cmd="" args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) export AORUS_OC_DRYRUN=1 ;;
+    --force)   export AORUS_OC_FORCE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*)        printf 'opción desconocida: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    *)         if [ -z "$cmd" ]; then cmd="$1"; else args+=("$1"); fi ;;
+  esac
+  shift
+done
+
+gpu_available || { log_err "nvidia-smi no está disponible."; exit 69; }
+
+# Las escrituras necesitan root; las lecturas no. Auto-elevamos solo cuando hace
+# falta, para que `status` y `list` funcionen como usuario normal.
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    exec sudo -E -- "$0" "$@"
+  fi
+}
+
+case "$cmd" in
+  status|'') oc_status ;;
+  list)      oc_list_profiles ;;
+  apply)     [ "${AORUS_OC_DRYRUN:-0}" = "1" ] || need_root apply "${args[@]}"
+             oc_apply "${args[0]:-}" ;;
+  reset)     need_root reset
+             oc_reset ;;
+  *)         printf 'comando desconocido: %s\n' "$cmd" >&2; usage >&2; exit 2 ;;
+esac

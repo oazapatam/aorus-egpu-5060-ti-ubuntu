@@ -1,0 +1,15 @@
+#!/bin/sh
+# After the source tree is gone, refresh module dep/initramfs so the stock
+# nvidia modules are the ones resolved on next load.
+set -e
+
+case "$1" in
+  remove|purge)
+    depmod -a || true
+    if command -v update-initramfs >/dev/null 2>&1; then
+      update-initramfs -u || true
+    fi
+    ;;
+esac
+
+exit 0

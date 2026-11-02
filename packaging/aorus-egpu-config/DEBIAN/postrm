@@ -1,0 +1,47 @@
+#!/bin/sh
+# postrm — full revert to the original system state on `apt remove`.
+#
+# dpkg removes every packaged file (grub.d/udev/sysctl/service/bins, including
+# the .disabled templates). Here we additionally delete any ACTIVE escalation
+# copies the user enabled via aorus-egpu-escalation (those are created at
+# runtime, so dpkg does not track them), then regenerate grub and reload
+# udev/systemd so nothing the package added survives.
+set -e
+
+case "$1" in
+	remove | purge)
+		# escalation copies created at runtime (not dpkg-tracked)
+		rm -f /etc/default/grub.d/98-aorus-egpu-antifreeze.cfg
+		rm -f /etc/sysctl.d/60-aorus-egpu-watchdog.conf
+
+		# Restaurar boltd policy=auto en la box AORUS (la fijó el postinst a
+		# manual). Así el sistema vuelve a su comportamiento original.
+		if command -v boltctl >/dev/null 2>&1; then
+			uuid=$(boltctl list 2>/dev/null | awk '/AORUS|RTX506T AI BOX/{f=1} f&&/uuid:/{print $NF; exit}')
+			[ -n "$uuid" ] && boltctl config device.policy "$uuid" auto >/dev/null 2>&1 || true
+		fi
+
+		# Parar/deshabilitar la unit hotplug-ready y limpiar su flag de runtime.
+		systemctl disable --now aorus-egpu-hotplug-ready.service >/dev/null 2>&1 || true
+		rm -f /etc/systemd/system/multi-user.target.wants/aorus-egpu-hotplug-ready.service
+		rm -rf /run/aorus-egpu
+
+		# Parar keep-resident: su ExecStop revierte persistence en la eGPU
+		# (la devuelve a su política de power por defecto). La unit no se habilita
+		# en ningún target; `stop` basta para correr el ExecStop antes de que dpkg
+		# borre el archivo de la unit.
+		systemctl stop aorus-egpu-keep-resident.service >/dev/null 2>&1 || true
+
+		if command -v update-grub >/dev/null 2>&1; then
+			update-grub
+		elif command -v grub-mkconfig >/dev/null 2>&1; then
+			grub-mkconfig -o /boot/grub/grub.cfg
+		fi
+		command -v udevadm >/dev/null 2>&1 && udevadm control --reload-rules >/dev/null 2>&1 || true
+		systemctl daemon-reload >/dev/null 2>&1 || true
+		echo "aorus-egpu-config removed (boltd policy restaurada a auto). Reboot to drop the eGPU kernel args."
+		;;
+	upgrade | failed-upgrade | abort-install | abort-upgrade | disappear) ;;
+esac
+
+exit 0

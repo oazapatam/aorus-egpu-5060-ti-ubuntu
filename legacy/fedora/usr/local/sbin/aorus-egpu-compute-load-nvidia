@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Bind the AORUS RTX 5060 Ti eGPU to the NVIDIA driver.
+#
+# Run by aorus-egpu-compute-load-nvidia.service at boot, or manually for
+# diagnostics. Idempotent: if NVIDIA is already loaded and bound, this
+# script's bind step is a no-op.
+#
+# Diagnostic env vars (default off, leave alone for normal operation):
+#   AORUS_EGPU_DISABLE_GSP=1               -> NVreg_EnableGpuFirmware=0
+#                                             (Blackwell requires GSP; this WILL
+#                                              fail to bind on this GPU. Diagnostic only.)
+#   AORUS_EGPU_DISABLE_NONBLOCKING_OPEN=1  -> NVreg_EnableNonblockingOpen=0
+#                                             (does not fix the close-path wedge
+#                                              on this stack; persistenced is the fix.)
+
+set -euo pipefail
+
+# shellcheck source=/usr/local/lib/aorus-egpu/common.sh
+source /usr/local/lib/aorus-egpu/common.sh
+
+gpu_dev=""
+audio_dev=""
+
+for dev in /sys/bus/pci/devices/*; do
+    [[ -r "$dev/vendor" && -r "$dev/device" ]] || continue
+    if [[ "$(<"$dev/vendor")" == "$EGPU_VENDOR_ID" && "$(<"$dev/device")" == "$EGPU_DEVICE_ID" ]]; then
+        gpu_dev="$dev"
+    fi
+
+    if [[ "$(<"$dev/vendor")" == "$EGPU_VENDOR_ID" && "$(<"$dev/device")" == "$EGPU_AUDIO_DEVICE_ID" ]]; then
+        audio_dev="$dev"
+    fi
+done
+
+if [[ -z "$gpu_dev" ]]; then
+    echo "TB-attached NVIDIA eGPU not present on PCI (looking for $EGPU_VENDOR_ID:$EGPU_DEVICE_ID)." >&2
+    exit 1
+fi
+
+set_attr() {
+    local path="$1"
+    local value="$2"
+
+    if [[ -w "$path" ]]; then
+        printf '%s\n' "$value" > "$path"
+    fi
+}
+
+restore_manual_override_on_exit() {
+    local rc=$?
+
+    if [[ -n "${gpu_dev:-}" && -w "$gpu_dev/driver_override" ]]; then
+        printf '%s\n' aorus_egpu_manual > "$gpu_dev/driver_override" || true
+    fi
+
+    exit "$rc"
+}
+
+trap restore_manual_override_on_exit EXIT
+
+# Power-management policy (power/control=on, d3cold_allowed=0) is set by
+# the udev rule etc/udev/rules.d/81-aorus-egpu-compute-power.rules on
+# every relevant device on the eGPU PCI path:
+#   - Intel TB upstream (0x8086:0x7ec4)
+#   - Intel root port (0x8086:0x5786)
+#   - RTX 5060 Ti (0x10de:0x2d04)
+#   - HDMI audio function (0x10de:0x22eb)
+# udev is the single source of truth; status.sh verifies the policy on all
+# four devices.
+
+if [[ -n "$audio_dev" ]]; then
+    /usr/local/sbin/aorus-egpu-disable-audio "${audio_dev##*/}"
+fi
+
+mapfile -t gpu_resources < "$gpu_dev/resource"
+read -r bar0_start bar0_end _ <<< "${gpu_resources[0]}"
+if [[ "$bar0_start" == "0x0000000000000000" && "$bar0_end" == "0x0000000000000000" ]]; then
+    echo "RTX 5060 Ti BAR0 is unassigned; refusing to load NVIDIA." >&2
+    echo "Cold boot with the eGPU connected so pci=realloc can allocate BAR0." >&2
+    exit 3
+fi
+
+read -r bar1_start bar1_end _ <<< "${gpu_resources[1]}"
+bar1_size=$((bar1_end - bar1_start + 1))
+min_bar1_size=$((16 * 1024 * 1024 * 1024))
+if (( bar1_size < min_bar1_size )); then
+    echo "RTX 5060 Ti BAR1 is smaller than 16 GiB; refusing to load NVIDIA." >&2
+    echo "Confirm thunderbolt.host_reset=false is in /proc/cmdline and cold boot with the eGPU connected." >&2
+    printf 'Current BAR1: %s-%s (%s bytes)\n' "$bar1_start" "$bar1_end" "$bar1_size" >&2
+    exit 6
+fi
+
+# Allow drivers_probe to bind the nvidia driver when modprobe loads it.
+set_attr "$gpu_dev/driver_override" ""
+
+modprobe_args=()
+if [[ "${AORUS_EGPU_DISABLE_GSP:-0}" == "1" ]]; then
+    modprobe_args+=(NVreg_EnableGpuFirmware=0)
+fi
+if [[ "${AORUS_EGPU_DISABLE_NONBLOCKING_OPEN:-0}" == "1" ]]; then
+    modprobe_args+=(NVreg_EnableNonblockingOpen=0)
+fi
+
+modprobe --ignore-install nvidia "${modprobe_args[@]}"
+
+if [[ ! -L "$gpu_dev/driver" && -w /sys/bus/pci/drivers_probe ]]; then
+    printf '%s\n' "${gpu_dev##*/}" > /sys/bus/pci/drivers_probe
+fi
+
+if [[ -e /sys/module/nvidia_drm ]]; then
+    echo "nvidia_drm is loaded; this is not the intended compute-only state." >&2
+    exit 2
+fi
+
+if [[ ! -L "$gpu_dev/driver" ]]; then
+    echo "Base nvidia module loaded, but the RTX 5060 Ti did not bind to it." >&2
+    exit 4
+fi
+
+bound_driver="$(basename "$(readlink "$gpu_dev/driver")")"
+if [[ "$bound_driver" != "nvidia" ]]; then
+    echo "RTX 5060 Ti is bound to '$bound_driver', not 'nvidia'." >&2
+    exit 5
+fi
+
+# Pre-load nvidia_uvm before any CUDA process can run.
+#
+# Why: cuInit() ensures nvidia_uvm is loaded as part of CUDA initialization.
+# Our compute-only modprobe config has 'install nvidia_uvm /bin/false' to block
+# spurious auto-loads, which means cuInit's modprobe call would fail. A failed
+# cuInit on this stack does not return cleanly - it leaves the device in a
+# partial-init state that has caused delayed kernel panics. Pre-loading here
+# (with --ignore-install to bypass our own block) means cuInit always finds
+# nvidia_uvm already present and never has to invoke modprobe.
+modprobe --ignore-install nvidia_uvm
+
+# Materialise /dev/nvidia-uvm-tools alongside /dev/nvidia-uvm.
+nvidia-modprobe -u -c 0 || echo "WARNING: nvidia-modprobe -u -c 0 failed; /dev/nvidia-uvm-tools may not exist" >&2
+
+# Tighten /dev/nvidia* permissions to 0660 root:ollama.
+if getent group ollama >/dev/null 2>&1; then
+    chgrp ollama /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools 2>/dev/null || true
+    chmod 0660   /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools 2>/dev/null || true
+    if [[ -d /dev/nvidia-caps ]]; then
+        chgrp ollama /dev/nvidia-caps/* 2>/dev/null || true
+        chmod 0660   /dev/nvidia-caps/* 2>/dev/null || true
+    fi
+fi
+
+# Restore the manual override now that we have bound on purpose.
+set_attr "$gpu_dev/driver_override" aorus_egpu_manual
+trap - EXIT
+
+# Engage full hardware init + persistence mode.
+nvidia-smi -pm 1 >/dev/null 2>&1 \
+    || echo "WARNING: nvidia-smi -pm 1 failed; GPU may stay in lazy-init state (cooler at floor RPM, elevated idle power until first client open)" >&2
+
+echo "RTX 5060 Ti is bound to the base nvidia driver."
+echo "nvidia_uvm is loaded (pre-staged for CUDA)."
+echo "Persistence mode enabled (GSP loaded, thermal subsystem engaged)."
+if [[ "${AORUS_EGPU_DISABLE_GSP:-0}" == "1" ]]; then
+    echo "NVIDIA GSP firmware was disabled for this bind attempt."
+fi
+if [[ "${AORUS_EGPU_DISABLE_NONBLOCKING_OPEN:-0}" == "1" ]]; then
+    echo "NVIDIA nonblocking open was disabled for this bind attempt."
+fi

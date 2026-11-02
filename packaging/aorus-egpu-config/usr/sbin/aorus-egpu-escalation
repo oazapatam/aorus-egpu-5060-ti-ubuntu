@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+#
+# aorus-egpu-escalation — activa/desactiva las capas opt-in del paquete
+# aorus-egpu-config (anti-freeze de kernel y watchdog forense).
+#
+# Las plantillas vienen en el .deb como conffiles `.disabled` (gestionados por
+# dpkg). "enable" las COPIA a un archivo activo que NO es conffile; "disable" lo
+# borra. Así `apt remove` siempre revierte todo de forma limpia.
+#
+# Uso:
+#   sudo aorus-egpu-escalation enable  antifreeze   # args de kernel (reboot)
+#   sudo aorus-egpu-escalation disable antifreeze
+#   sudo aorus-egpu-escalation enable  watchdog     # panic/kdump
+#   sudo aorus-egpu-escalation disable watchdog
+#   aorus-egpu-escalation status
+set -u
+
+GRUBD=/etc/default/grub.d
+SYSCTLD=/etc/sysctl.d
+AF_SRC="$GRUBD/98-aorus-egpu-antifreeze.cfg.disabled"
+AF_DST="$GRUBD/98-aorus-egpu-antifreeze.cfg"
+WD_SRC="$SYSCTLD/60-aorus-egpu-watchdog.conf.disabled"
+WD_DST="$SYSCTLD/60-aorus-egpu-watchdog.conf"
+
+need_root() { [ "$(id -u)" -eq 0 ] || exec sudo -- "$0" "$@"; }
+regen_grub() {
+  if command -v update-grub >/dev/null 2>&1; then update-grub
+  elif command -v grub-mkconfig >/dev/null 2>&1; then grub-mkconfig -o /boot/grub/grub.cfg; fi
+}
+
+case "${1:-}" in
+  status)
+    printf 'antifreeze : %s\n' "$([ -f "$AF_DST" ] && echo ENABLED || echo disabled)"
+    printf 'watchdog   : %s\n' "$([ -f "$WD_DST" ] && echo ENABLED || echo disabled)"
+    exit 0
+    ;;
+  enable)  need_root "$@"; action=enable ;;
+  disable) need_root "$@"; action=disable ;;
+  *)
+    echo "uso: aorus-egpu-escalation {enable|disable} {antifreeze|watchdog}" >&2
+    echo "     aorus-egpu-escalation status" >&2
+    exit 2 ;;
+esac
+
+case "${2:-}" in
+  antifreeze)
+    if [ "$action" = enable ]; then
+      [ -f "$AF_SRC" ] || { echo "falta $AF_SRC (¿paquete instalado?)" >&2; exit 1; }
+      cp -f "$AF_SRC" "$AF_DST"
+      regen_grub
+      echo "anti-freeze ACTIVADO. Reinicia para aplicar los args de kernel."
+    else
+      rm -f "$AF_DST"
+      regen_grub
+      echo "anti-freeze desactivado. Reinicia para soltar los args de kernel."
+    fi ;;
+  watchdog)
+    if [ "$action" = enable ]; then
+      [ -f "$WD_SRC" ] || { echo "falta $WD_SRC (¿paquete instalado?)" >&2; exit 1; }
+      cp -f "$WD_SRC" "$WD_DST"
+      sysctl --system >/dev/null 2>&1 || true
+      echo "watchdog ACTIVADO (panic/kdump). Instala kdump-tools para capturar vmcore."
+    else
+      rm -f "$WD_DST"
+      echo "watchdog desactivado. Los valores sysctl actuales persisten hasta el próximo reinicio."
+    fi ;;
+  *)
+    echo "capa desconocida: ${2:-}. Usa: antifreeze | watchdog" >&2
+    exit 2 ;;
+esac
+exit 0

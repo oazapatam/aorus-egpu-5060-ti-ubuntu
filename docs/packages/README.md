@@ -1,0 +1,59 @@
+# Estado de los paquetes
+
+Tabla de verdad única sobre qué paquete usar.
+La evidencia de por qué está en
+[`../what-actually-works.md`](../what-actually-works.md).
+
+| Paquete | Versión | Estado | Validado en vivo |
+|---|---|---|---|
+| `egpu-tb-fix` | 1.5.0 | **principal** | **sí** — es lo que hace funcionar la eGPU hoy |
+| `aorus-egpu-forensics` | 0.1.0 | nuevo, recomendado al depurar | capas 1-2 sí; capa 3 (ramoops) por construcción |
+| `aorus-egpu-overclock` | 0.1.0 | **en desarrollo, no usar** | no |
+| `aorus-egpu-config` | 0.5.9 | **superseded** (archivo) | lo estuvo hasta el 2026-06-28; purgado |
+| `aorus-egpu-nvidia-dkms` | 595.71.05-aorus17 | **superseded + deuda de versión** | lo estuvo hasta el 2026-06-28; purgado |
+
+## Qué instalar
+
+Para que la eGPU funcione, solo esto:
+
+```bash
+make
+sudo apt install ./dist/egpu-tb-fix_*.deb
+sudo reboot
+```
+
+Si además quieres poder depurar los cuelgues:
+
+```bash
+sudo apt install ./dist/aorus-egpu-forensics_*.deb
+```
+
+## Qué NO instalar, y por qué
+
+- **`aorus-egpu-config` junto a `egpu-tb-fix`.**
+  Los dos reasignan el BAR0 desde reglas udev y se pisarían.
+  El paquete declara `Conflicts: egpu-tb-fix`, así que `apt` lo impedirá.
+- **`aorus-egpu-nvidia-dkms` tal cual.**
+  Sus 34 parches están escritos contra el tag 595.71.05 y fijan
+  `NV_VERSION_STRING` a esa versión, pero el driver instalado es el stock
+  595.99.02:
+  los módulos no cargarían.
+  Necesita un rebase al tag nuevo antes de volver a usarse.
+  La eGPU funciona sin ninguna de sus palancas.
+- **`aorus-egpu-overclock`.**
+  El núcleo y los tests están hechos, pero no se ha validado en hardware y la
+  capacidad está aparcada a propósito.
+
+## Un paquete por capacidad
+
+La división no es por componente del sistema sino por **capacidad**, para que
+cada una se pueda instalar, revertir y razonar por separado:
+
+- `egpu-tb-fix` — que la eGPU enumere y bindee.
+- `aorus-egpu-forensics` — que un cuelgue deje evidencia.
+- `aorus-egpu-overclock` — que se pueda ajustar potencia y relojes.
+
+Todas comparten el mismo núcleo `src/`, ensamblado en el payload por
+`scripts/lib/bundle.sh`;
+`egpu-tb-fix` es la excepción, porque es anterior al núcleo y está validado tal
+cual (ver la deuda nº 1 en [`../architecture.md`](../architecture.md)).

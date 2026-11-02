@@ -1,0 +1,51 @@
+#!/bin/sh
+# Register, build and install the patched NVIDIA modules via DKMS.
+set -e
+
+NAME=aorus-nvidia
+# Single source of truth = the packaged dkms.conf's PACKAGE_VERSION. Deriving it
+# here (instead of hardcoding) means a version bump only touches DEBIAN/control +
+# egpu-driver/nvidia-dkms.conf and never desyncs this script. The aorus15->aorus16
+# bump hit exactly that desync: the hardcoded VER pointed at a stale -aorus15
+# source dir that no longer existed and configure failed. sort -V|tail picks the
+# newest if an old source dir lingers; at configure that is the just-unpacked tree.
+VER=$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' /usr/src/${NAME}-*/dkms.conf 2>/dev/null | sort -V | tail -n1)
+if [ -z "$VER" ]; then
+  echo "aorus-egpu-nvidia-dkms: ERROR — no /usr/src/${NAME}-*/dkms.conf found;" >&2
+  echo "  cannot determine module version. Aborting." >&2
+  exit 1
+fi
+
+case "$1" in
+  configure)
+    # Pre-flight guard: self-built modules will not load under Secure Boot, and
+    # the module reports 595.71.05 so the stock userspace/firmware must match.
+    if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -qi 'enabled'; then
+      echo "aorus-egpu-nvidia-dkms: WARNING — Secure Boot is ENABLED. The patched" >&2
+      echo "  modules are not Canonical-signed and will fail to load until you" >&2
+      echo "  enroll a MOK and sign them. Continuing to build anyway." >&2
+    fi
+    if [ ! -d /lib/firmware/nvidia/595.71.05 ]; then
+      echo "aorus-egpu-nvidia-dkms: WARNING — /lib/firmware/nvidia/595.71.05 not" >&2
+      echo "  found. Install nvidia-firmware-595-595.71.05 or GSP init will fail." >&2
+    fi
+
+    # (Re)register the source tree with DKMS and build for all installed kernels.
+    if dkms status -m "$NAME" -v "$VER" 2>/dev/null | grep -q "$NAME"; then
+      dkms remove -m "$NAME" -v "$VER" --all >/dev/null 2>&1 || true
+    fi
+    dkms add -m "$NAME" -v "$VER" || true
+    dkms build -m "$NAME" -v "$VER"
+    dkms install -m "$NAME" -v "$VER" --force
+
+    depmod -a || true
+    if command -v update-initramfs >/dev/null 2>&1; then
+      update-initramfs -u || true
+    fi
+
+    echo "aorus-egpu-nvidia-dkms: installed. Reload the driver (reboot, or unload"
+    echo "  the nvidia stack and modprobe again) to pick up the patched modules."
+    ;;
+esac
+
+exit 0

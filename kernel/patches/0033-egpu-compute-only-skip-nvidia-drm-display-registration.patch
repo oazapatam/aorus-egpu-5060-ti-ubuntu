@@ -1,0 +1,73 @@
+From: squadai-stable <noreply@local>
+Date: 2026-06-26
+Subject: [PATCH] aorus15 (0033) -- eGPU compute-only: skip nvidia-drm display registration
+
+R1/R3 fix. The persistent hard freeze when the AORUS Thunderbolt eGPU is
+unplugged or pushed under load was NOT an R4 gate gap (the internal GPU had
+zero Xid in every documented freeze) -- it was the Wayland compositor: with
+nvidia-drm.modeset=1 nvidia-drm registers a KMS device for the *headless*
+eGPU, KWin (the session compositor AND the SDDM greeter) adopts it as a
+display output, and hangs on a page-flip when the TB link drops -> SDDM
+session down -> hard freeze (nvidia-modeset: GPU progress-wait loop +
+Xid 79 name=kwin_wayland on the eGPU).
+
+Fedora never hits this because it blacklists nvidia_drm + modeset=0 so the
+eGPU is never a DRM device. We do the same thing SELECTIVELY: skip DRM/KMS
+registration only for the eGPU (matched by the existing R4 predicate --
+behind a Thunderbolt/USB4 controller, or device-id 0x2d04), so:
+  * no compositor can ever take the eGPU as a display -> no freeze (R1/R3);
+  * the internal GPU (10de:2c39 @ 01:00.0) is NOT a predicate target, keeps
+    its DRM/KMS device -> external HDMI on the internal still works;
+  * CUDA/nvidia-smi on the eGPU are unaffected (nvidia core char device,
+    not nvidia-drm).
+Reuses tb_egpu_pci_is_egpu_target() (EXPORT_SYMBOL, nvidia.ko, patch 0032);
+nvidia-drm already loads on top of nvidia so the symbol resolves.
+
+--- a/kernel-open/nvidia-drm/nvidia-drm-drv.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+@@ -1963,6 +1963,16 @@
+ 
+ 
+ /*
++ * AORUS aorus15 (R1/R3): predicate EXPORT_SYMBOL'd by nvidia.ko (patches
++ * 0031/0032). Returns 1 for the Thunderbolt eGPU (behind a TB/USB4 controller,
++ * or device-id 0x2d04), 0 for the internal GPU. Used below to keep the eGPU
++ * compute-only (no DRM/KMS display device).
++ */
++#if defined(NV_LINUX)
++extern int tb_egpu_pci_is_egpu_target(struct pci_dev *pdev);
++#endif
++
++/*
+  * Helper function for allocate/register DRM device for given NVIDIA GPU ID.
+  */
+ void nv_drm_register_drm_device(const struct NvKmsKapiGpuInfo *gpu_info)
+@@ -1972,6 +1982,28 @@
+     struct device *device = gpu_info->gpuInfo.os_device_ptr;
+     bool bus_is_pci;
+ 
++    /*
++     * AORUS aorus15 (R1/R3 — kill the unplug/load hard freeze at its root):
++     * the Thunderbolt eGPU is COMPUTE-ONLY (CUDA goes through the nvidia core
++     * char device /dev/nvidiaN, not nvidia-drm). Do NOT register a DRM/KMS
++     * device for it, so no Wayland compositor (the KWin session OR the SDDM
++     * greeter) can ever adopt the headless eGPU as a display output and then
++     * hang on a page-flip when the TB link drops on unplug or under load. The
++     * internal GPU is NOT a target of the predicate, so it keeps its full DRM
++     * device and the external HDMI on 01:00.0 is unaffected. nvidia-smi/CUDA
++     * still see the eGPU (they do not depend on nvidia-drm).
++     */
++#if defined(NV_LINUX)
++    if (device != NULL && device->bus == &pci_bus_type &&
++        tb_egpu_pci_is_egpu_target(to_pci_dev(device))) {
++        NV_DRM_LOG_INFO(
++            "Skipping DRM/KMS device registration for compute-only eGPU "
++            "(NVIDIA GPU ID 0x%08x)",
++            gpu_info->gpuInfo.gpu_id);
++        return;
++    }
++#endif
++
+     DRM_DEBUG(
+         "Registering device for NVIDIA GPU ID 0x08%x",
+         gpu_info->gpuInfo.gpu_id);

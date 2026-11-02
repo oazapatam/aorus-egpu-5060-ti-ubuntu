@@ -1,0 +1,37 @@
+From: squadai-stable <noreply@local>
+Date: 2026-06-27
+Subject: [PATCH] aorus17 (0035) -- quiet the RM-level [CLOSE] path diag (NV_DBG_INFO)
+
+Observability/noise fix, follow-up to aorus16 (0034). 0034 rate-limited the three
+heavy dumpers and demoted the UVM-side "AORUS UVM [CLOSE]" one-liner to pr_debug,
+but it did NOT touch the RM-level per-site [CLOSE] marker emitted by
+tb_egpu_lever_m_close_path_diag() in kernel-open/nvidia/nv-lever-m-recover.c.
+
+Measured in vivo 2026-06-27: a CUDA process exit fires this marker 4x per close
+(close-entry / pre-stop / post-shutdown / close-exit); across several processes a
+single session logged ~312 of these lines. They are pure close-path telemetry for
+the (now-complete) Problem 2/4 diagnosis, not real-time errors.
+
+Fix -- pure logging level change, nothing else:
+  - Demote the per-site [CLOSE] marker from NV_DBG_ERRORS to NV_DBG_INFO so it is
+    silent at the default debug level but still available when NVreg debug is
+    raised (and keeps the NVRM device prefix, unlike pr_debug). Matches the file's
+    own convention for non-error diagnostics (lines ~1004/1125/1436 etc.).
+
+NOT changed: the R4 gate (os_pci_is_egpu_target, line ~1378) still confines this
+to the eGPU; the is_last_close full dump still fires (and is rate-limited by 0034);
+the M-recover state machine is untouched. Pure dmesg-volume throttle.
+---
+diff --git a/kernel-open/nvidia/nv-lever-m-recover.c b/kernel-open/nvidia/nv-lever-m-recover.c
+index 0e1f319..caac9cc 100644
+--- a/kernel-open/nvidia/nv-lever-m-recover.c
++++ b/kernel-open/nvidia/nv-lever-m-recover.c
+@@ -1380,7 +1380,7 @@ void tb_egpu_lever_m_close_path_diag(nv_linux_state_t *nvl,
+ 
+     nv = NV_STATE_PTR(nvl);
+ 
+-    NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
++    NV_DEV_PRINTF(NV_DBG_INFO, nv,
+         "AORUS Lever M-recover [CLOSE]: site=%-15s usage_count=%ld%s\n",
+         site, usage_count, is_last_close ? " (LAST-CLOSE)" : "");
+ 

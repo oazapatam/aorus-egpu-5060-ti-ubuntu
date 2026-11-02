@@ -1,0 +1,15 @@
+# Al aparecer una GPU NVIDIA externa (Thunderbolt/USB4), lanza egpu-tb-fix.service,
+# que reasigna la ventana MMIO del puerto si el kernel no le pudo dar el BAR0,
+# prepara el enlace (Gen3, sin ASPM) y luego se la entrega al driver nvidia.
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x03*", ATTR{removable}=="removable", TAG+="systemd", ENV{SYSTEMD_WANTS}+="egpu-tb-fix.service"
+
+# Sin runtime PM para las funciones de la eGPU: 71-nvidia.rules las deja en "auto" y
+# el D3 a través de Thunderbolt es frágil. Va después de 71-nvidia.rules, así que gana.
+ACTION=="add|bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{removable}=="removable", TEST=="power/control", ATTR{power/control}="on"
+
+# Mientras haya un dispositivo Thunderbolt/USB4 conectado, su controlador host no entra en
+# runtime suspend: al suspenderse, el driver thunderbolt pone a dormir los routers USB4
+# con los túneles PCIe y USB3 activos. Al desconectar el último vuelve a "auto".
+# Al conectar (antes de que bolt lo autorice y se cree el túnel PCIe) apaga el autoprobe
+# del bus PCI, para que nvidia no tome la eGPU antes de que egpu-tb-fix.service la prepare.
+ACTION=="add|remove", SUBSYSTEM=="thunderbolt", ENV{DEVTYPE}=="thunderbolt_device", RUN+="/usr/bin/systemd-cat -t egpu-tb-fix /usr/sbin/egpu-tb-fix tb-event $env{ACTION} %k"

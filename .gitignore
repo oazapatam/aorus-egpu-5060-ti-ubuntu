@@ -1,0 +1,64 @@
+# Editor backups
+*.swp
+*.swo
+*~
+
+# Patch tool backups
+*.orig
+*.rej
+*.patch.new
+
+# Sed/temp leftovers
+*.tmp
+
+# Local-only override (anyone publishing should not require these)
+.envrc
+
+# Build artefacts (the patched-driver build happens in /root/nvidia-open-src
+# external to this repo by default; this guard catches cases where someone
+# builds in-tree).
+nvidia-open-build/
+_out/
+*.o
+*.ko
+*.ko.*
+.tmp_versions/
+
+# Python caches (test scripts use python sometimes)
+__pycache__/
+*.pyc
+
+# Kernel module build artefacts (kernel-modules/*/ build outputs)
+kernel-modules/*/.*.cmd
+kernel-modules/*/*.o
+kernel-modules/*/*.mod
+kernel-modules/*/*.mod.c
+kernel-modules/*/Module.symvers
+kernel-modules/*/modules.order
+
+# Built packages: scripts/build-*.sh emit the .deb here (out="$HERE/dist").
+dist/
+
+# Clone cache of upstream open-gpu-kernel-modules used by scripts/build-dkms.sh
+# (build="$HERE/build", src="$build/ogkm"). Re-cloned/re-fetched on demand.
+build/
+
+# Generated package payload: scripts/lib/bundle.sh (bundle_core) copies src/
+# into the package tree at build time. src/ is the single source of truth; the
+# copies below are disposable output, not versioned files.
+packaging/aorus-egpu-overclock/usr/lib/aorus-egpu/
+packaging/aorus-egpu-overclock/usr/sbin/aorus-egpu-oc
+packaging/aorus-egpu-forensics/usr/lib/aorus-egpu/
+packaging/aorus-egpu-forensics/usr/sbin/aorus-egpu-probe
+packaging/aorus-egpu-forensics/usr/sbin/aorus-egpu-postmortem
+# El medidor de ancho de banda se copia al payload cuando está compilado.
+packaging/aorus-egpu-forensics/usr/lib/aorus-egpu/egpu-bandwidth
+
+# Generated DKMS payload: scripts/build-dkms.sh stages the patched driver tree
+# under packaging/aorus-egpu-nvidia-dkms/usr/src/<name>-<ver>/ before
+# dpkg-deb --build. Reproduced from the upstream tag + patches/.
+packaging/aorus-egpu-nvidia-dkms/usr/
+
+# Compiled CUDA bandwidth probe (binary). The source tools/egpu-bandwidth.cu
+# IS versioned; the nvcc output is not.
+tools/egpu-bandwidth

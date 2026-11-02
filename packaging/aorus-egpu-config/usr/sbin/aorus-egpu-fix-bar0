@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+#
+# aorus-egpu-fix-bar0 — reasigna el BAR0 de la eGPU RTX 5060 Ti (AORUS AI BOX,
+# Thunderbolt 5) cuando el kernel no se lo asignó al enumerarla.
+#
+# Causa: un puerto Thunderbolt VACÍO acapara el MMIO de 32 bits no-prefetchable
+# que necesita el BAR0 (64 MB) de la eGPU; sin BAR0 el driver nvidia la rechaza
+# (NVRM: BAR0 is 0M @ 0x0 / probe failed -1).
+#
+# Qué hace: libera los puertos TB vacíos, quita y reescanea la rama de la GPU
+# (con pci=realloc el kernel recoloca el BAR0 en el hueco liberado) y crea el
+# nodo /dev/nvidiaN. Idempotente: si la eGPU ya tiene driver, solo lo confirma.
+#
+# Es la migración a Ubuntu del script ~/.local/bin/fix-egpu, empaquetada en el
+# .deb aorus-egpu-config y disparada automáticamente por udev al aparecer la
+# eGPU (ver /etc/udev/rules.d/80-aorus-egpu-fix-bar0.rules y la unit
+# aorus-egpu-fix-bar0.service). También se puede ejecutar a mano.
+#
+# Uso:  sudo aorus-egpu-fix-bar0
+set -u
+
+# IDs de la eGPU (RTX 5060 Ti). La dGPU interna es 10de:2c39, así que filtrar
+# por la VGA NVIDIA que cuelga del árbol Thunderbolt la aísla sin tocar la
+# interna.
+EGPU_VID=0x10de
+EGPU_DID=0x2d04
+
+# Root port del PCH que aloja el controlador Thunderbolt. En este ThinkPad es
+# 0000:80:1b.4; si la topología cambia, se autodetecta subiendo desde la eGPU.
+TB_ROOT_DEFAULT=0000:80:1b.4
+
+# --- auto-elevación ---
+if [ "$(id -u)" -ne 0 ]; then
+  exec sudo -- "$0" "$@"
+fi
+
+# --- serialización: udev puede dispararnos varias veces durante el rescan ---
+# NUNCA proceder sin el lock: el ReBAR (unbind/setpci/remove/rescan) re-dispara
+# la unit; correr dos instancias en paralelo sobre el mismo device es peligroso.
+# Si no obtenemos el lock en 120 s (cubre de sobra un ciclo ReBAR), salimos limpio
+# (otra instancia lo está haciendo; somos idempotentes). NO hay deadlock con
+# `udevadm settle`: la unit corre como systemd service, no como RUN síncrono de udev.
+bind_via_sbr=0
+LOCK=/run/aorus-egpu-fix-bar0.lock
+exec 9>"$LOCK" 2>/dev/null || true
+if ! flock -w 120 9 2>/dev/null; then
+  printf '%s\n' "aorus-egpu-fix-bar0: otra instancia tiene el lock; salgo (idempotente)."
+  exit 0
+fi
+
+log() { printf '%s\n' "$*"; }
+
+# Localiza el root port del PCH bajo el cual cuelga la eGPU: sube desde la eGPU
+# hasta el bridge 0000:* más alto (el que cuelga del host bridge). Si la eGPU no
+# está presente todavía, usa el default conocido.
+detect_tb_root() {
+  local d egpu_path cur parent
+  egpu_path=""
+  for d in /sys/bus/pci/devices/*; do
+    [ "$(cat "$d/device" 2>/dev/null)" = "$EGPU_DID" ] || continue
+    egpu_path=$(readlink -f "$d"); break
+  done
+  [ -n "$egpu_path" ] || { echo "$TB_ROOT_DEFAULT"; return 0; }
+  cur="$egpu_path"
+  while parent=$(dirname "$cur"); do
+    case "$(basename "$parent")" in
+      0000:*) cur="$parent" ;;
+      *) break ;;
+    esac
+  done
+  basename "$cur"
+}
+
+TB_ROOT=$(detect_tb_root)
+TB_ROOT_PATH=$(readlink -f "/sys/bus/pci/devices/$TB_ROOT" 2>/dev/null)
+if [ -z "$TB_ROOT_PATH" ] || [ ! -d "$TB_ROOT_PATH" ]; then
+  log "ERROR: no encuentro el root port Thunderbolt ($TB_ROOT). ¿Cambió la topología?"
+  exit 1
+fi
+
+subtree_has_endpoint() { # $1=dir -> 0 si hay algún endpoint REAL (no-bridge) en el subárbol.
+  local f
+  for f in "$1"/0000:*; do
+    [ -e "$f/vendor" ] || continue
+    if [ -e "$f/secondary_bus_number" ]; then
+      subtree_has_endpoint "$f" && return 0
+    else
+      return 0
+    fi
+  done
+  return 1
+}
+is_bridge() { [ -e "$1/secondary_bus_number" ]; }
+driver_of() { basename "$(readlink -f "/sys/bus/pci/devices/$1/driver" 2>/dev/null)" 2>/dev/null; }
+
+find_egpu() { # imprime el addr de la VGA NVIDIA que cuelga del árbol Thunderbolt
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [ -r "$d/vendor" ] && [ "$(cat "$d/vendor")" = "$EGPU_VID" ] || continue
+    case "$(cat "$d/class" 2>/dev/null)" in 0x0300*) ;; *) continue ;; esac
+    case "$(readlink -f "$d")" in "$TB_ROOT_PATH"/*) basename "$d"; return 0 ;; esac
+  done
+  return 1
+}
+
+# Si la eGPU no enumera todavía, un rescan inicial para forzar su aparición.
+egpu=$(find_egpu) || { log "eGPU no presente; rescan inicial…"; echo 1 > /sys/bus/pci/rescan; udevadm settle --timeout=8; egpu=$(find_egpu); }
+if [ -z "${egpu:-}" ]; then
+  log "ERROR: no hay GPU NVIDIA bajo Thunderbolt. ¿Conectada y autorizada? (boltctl list)"
+  exit 1
+fi
+log "eGPU detectada en $egpu (TB root $TB_ROOT)"
+
+# --- HEALTH GATE (v0.4.0) --------------------------------------------------
+# Si el enlace PCIe de la eGPU entrenó mal (típico del cold-boot-attached: el
+# espacio de config se lee todo-Fs y el ancho de enlace es 0), NO intentamos
+# bindear: nvidia fallaría RmInitAdapter en bucle y ENVENENARÍA NVML, tumbando
+# nvidia-smi de la GPU interna (sana). En ese caso EXPULSAMOS la eGPU del bus
+# (su rama desde el puerto TB) para que no quede como fuente de veneno, y
+# salimos avisando. Un enlace sano (width≥1, vendor legible) sigue al fix normal.
+egpu_link_dead() { # $1=addr -> 0 (true) si el enlace está muerto
+  local dev="$1" w vid
+  w=$(cat "/sys/bus/pci/devices/$dev/current_link_width" 2>/dev/null)
+  [ "${w:-0}" = "0" ] && return 0
+  vid=$(cat "/sys/bus/pci/devices/$dev/vendor" 2>/dev/null)
+  [ "$vid" = "0xffff" ] || [ -z "$vid" ] && return 0
+  return 1
+}
+
+if egpu_link_dead "$egpu"; then
+  lw=$(cat "/sys/bus/pci/devices/$egpu/current_link_width" 2>/dev/null)
+  log "❌ Enlace de la eGPU MUERTO (link_width=${lw:-?}, config ilegible) — típico"
+  log "   de conectarla en frío/al encender. NO la bindeo para no envenenar NVML."
+  # Expulsar la rama de la GPU desde su puerto TB (no toca la GPU interna).
+  egpu_path=$(readlink -f "/sys/bus/pci/devices/$egpu")
+  rel=${egpu_path#"$TB_ROOT_PATH"/}
+  gpu_port=$(printf '%s\n' "$rel" | cut -d/ -f2)
+  if [ -n "$gpu_port" ] && [ -e "/sys/bus/pci/devices/$gpu_port/remove" ]; then
+    log "   Expulsando la rama de la eGPU del bus: $gpu_port"
+    echo 1 > "/sys/bus/pci/devices/$gpu_port/remove"
+  elif [ -e "/sys/bus/pci/devices/$egpu/remove" ]; then
+    log "   Expulsando la eGPU del bus: $egpu"
+    echo 1 > "/sys/bus/pci/devices/$egpu/remove"
+  fi
+  log "   La GPU interna queda intacta. Para reintentar: DESCONECTA y reconecta"
+  log "   el cable en el escritorio (hotplug), o reinicia sin el eGPU."
+  exit 1
+fi
+# --- fin HEALTH GATE -------------------------------------------------------
+
+ensure_node() {
+  local info minor major i
+  info="/proc/driver/nvidia/gpus/$egpu/information"
+  for i in 1 2 3 4 5 6 7 8; do [ -r "$info" ] && break; udevadm settle --timeout=2; done
+  minor=$(grep -i 'Device Minor' "$info" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+  if [ -z "$minor" ]; then log "AVISO: no pude leer el Device Minor del RM; nodo no creado."; return 1; fi
+  major=$(grep -E ' nvidia(-frontend)?$' /proc/devices 2>/dev/null | awk '{print $1}' | head -1)
+  major=${major:-195}
+  if [ -e "/dev/nvidia$minor" ]; then
+    log "/dev/nvidia$minor ya existe."
+  else
+    mknod -m 666 "/dev/nvidia$minor" c "$major" "$minor" && log "Creado /dev/nvidia$minor (c $major $minor)."
+  fi
+}
+
+report_bound() { # éxito: (best-effort) sube la BAR1, crea el nodo e imprime nvidia-smi
+  log "✅ Driver nvidia enlazado en $egpu."
+  # ReBAR (v0.5.7): subir la BAR1 al máximo SOLO si el bind fue LIMPIO (no por SBR).
+  # En enlace marginal el rebind del ReBAR necesitaría SBR, que reset­ea el registro
+  # ReBAR -> el resize no pegaría y solo añadiría un ciclo disruptivo. best-effort.
+  if [ "${bind_via_sbr:-0}" != "1" ]; then
+    rebar_bump "$egpu" || true
+    local e; e=$(find_egpu) || e=""   # el BDF puede cambiar tras el rescan del ReBAR
+    [ -n "$e" ] && egpu="$e"          # refrescar SOLO si lo hallamos (no blanquear)
+  fi
+  ensure_node
+  log ""
+  command -v nvidia-smi >/dev/null 2>&1 && \
+    nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total --format=csv 2>&1 || true
+}
+
+# --- SBR LINK RECOVERY (v0.5.6) --------------------------------------------
+# Cuando la eGPU enumera y el enlace NO está muerto (pasa el health gate de
+# arriba) pero entrenó MARGINAL —típico: Gen1 2.5GT/s, lado-GPU LnkSta Active=N—
+# el remove+rescan simple de los pasos 1-3 NO bindea: nvidia falla "Failed to
+# enable MSI-X" -> "RmInitAdapter failed". Lo que SÍ bindea (verificado en vivo
+# 2026-06-27, 2 veces): quitar las funciones de la eGPU (desata nvidia del estado
+# fallido) -> Secondary Bus Reset del puente TB INMEDIATO (reentrena el enlace)
+# -> rescan limpio. El puente inmediato es el PADRE sysfs de la eGPU (BDF dinámico
+# por sesión; el 2026-06-27 fue 8c:00.0). Solo toca la rama Thunderbolt; la GPU
+# interna (10de:2c39, 01:00.0) NUNCA se ve afectada (no cuelga de este puente).
+immediate_bridge_of() { # $1=egpu addr -> BDF del puente inmediato (padre sysfs)
+  local p; p=$(basename "$(dirname "$(readlink -f "/sys/bus/pci/devices/$1")")")
+  case "$p" in 0000:*) printf '%s\n' "$p" ;; *) return 1 ;; esac
+}
+
+sbr_clean_rebind() { # $1=egpu addr -> remove de funciones + SBR del puente + rescan
+  local egpu="$1" bridge fn
+  bridge=$(immediate_bridge_of "$egpu") || { log "  no encuentro el puente inmediato de $egpu"; return 1; }
+  command -v setpci >/dev/null 2>&1 || { log "  setpci no disponible (instala pciutils)"; return 1; }
+  log "  recuperación por SBR: puente inmediato = $bridge"
+  # 1) quitar TODAS las funciones de la eGPU (desata nvidia del estado fallido;
+  #    el SBR pelado NO sirve mientras nvidia retenga el device fallido)
+  for fn in /sys/bus/pci/devices/${egpu%.*}.*; do
+    [ -e "$fn/remove" ] && { log "    remove $(basename "$fn")"; echo 1 > "$fn/remove"; }
+  done
+  sleep 0.4
+  # 2) Secondary Bus Reset del puente inmediato (bit 6 de BRIDGE_CONTROL)
+  log "    SBR $bridge"
+  setpci -s "$bridge" BRIDGE_CONTROL=40:40   # asserta SBR
+  sleep 0.15
+  setpci -s "$bridge" BRIDGE_CONTROL=00:40   # deasserta (solo el bit 6)
+  sleep 0.6
+  # 3) rescan limpio: el kernel re-enumera la eGPU y nvidia prueba en fresco
+  echo 1 > /sys/bus/pci/rescan
+  udevadm settle --timeout=10
+  return 0
+}
+
+# --- ReBAR bump (v0.5.7) ---------------------------------------------------
+# Sube la BAR1 de la eGPU al máximo que soporta (16 GiB en la RTX 5060 Ti) para
+# quitar el limitante de rendimiento CUDA (sin ReBAR la BAR1 cae a 256 MiB).
+# Verificado EN VIVO 2026-06-27. El resize IN-PLACE por kernel (resource1_resize)
+# falla con -ENOSPC —la ventana prefetchable del puente TB inmediato es ~288 MiB—
+# y el kernel REVIERTE el registro al fallar. Lo que SÍ funciona: fijar el tamaño
+# por setpci en el registro ReBAR CTRL (el kernel no lo revierte), QUITAR el puente
+# TB superior constreñido (su ventana se re-asigna desde el root TB, que tiene 64
+# GiB libres) y RESCAN -> el kernel re-enumera con la BAR1 pidiendo 16 GiB y le da
+# la ventana. El device re-bindea solo en el rescan (un SBR reset­earía el ReBAR,
+# por eso aquí NO se usa SBR). BEST-EFFORT con fallback TOTAL: si algo falla, la
+# eGPU queda bindeada igual (cae al binder por SBR). R4-safe: solo rama Thunderbolt.
+
+rebar_max_index() { # $1=egpu -> índice de tamaño máx soportado por la BAR1 (14=16GiB), o vacío
+  local m idx
+  m=$(cat "/sys/bus/pci/devices/$1/resource1_resize" 2>/dev/null) || return 1
+  [ -n "$m" ] || return 1
+  m=$(( m )); idx=-1
+  while [ "$m" -gt 0 ]; do m=$(( m >> 1 )); idx=$(( idx + 1 )); done
+  [ "$idx" -ge 0 ] && printf '%s\n' "$idx"
+}
+
+bar1_size_bytes() { # $1=egpu -> tamaño actual de la BAR1 en bytes (línea 2 de resource), o 0
+  local start end
+  [ -r "/sys/bus/pci/devices/$1/resource" ] || { echo 0; return; }
+  read -r start end _ < <(sed -n '2p' "/sys/bus/pci/devices/$1/resource")
+  [ -n "$start" ] && [ -n "$end" ] || { echo 0; return; }
+  # validar que sean hex (0x...) antes de la aritmética (evita errores bajo set -u)
+  case "$start$end" in *[!0-9a-fA-FxX]*) echo 0; return;; esac
+  echo $(( end - start + 1 )) 2>/dev/null || echo 0
+}
+
+is_hex() { case "${1:-}" in ''|*[!0-9a-fA-F]*) return 1;; *) return 0;; esac; }
+
+rebar_ctrl_offset() { # $1=egpu -> offset hex del registro ReBAR CTRL de la BAR1, o falla
+  local dev="$1" capoff first ctrl nbars baridx off i
+  # offset de la cap "Physical Resizable BAR" vía lspci (sin caminar ext-caps a mano)
+  capoff=$(lspci -vv -s "$dev" 2>/dev/null | awk '/Physical Resizable BAR/{ if (match($0,/\[[0-9a-fA-F]+/)) { print substr($0,RSTART+1,RLENGTH-1); exit } }')
+  is_hex "$capoff" || return 1
+  # nº de BARs redimensionables = bits[7:5] del primer CTRL; validar la salida de setpci
+  first=$(setpci -s "$dev" "$(printf '%x' $((0x$capoff + 8))).l" 2>/dev/null)
+  is_hex "$first" || return 1
+  nbars=$(( (0x$first >> 5) & 0x7 ))
+  [ "$nbars" -ge 1 ] || nbars=1
+  i=0
+  while [ "$i" -lt "$nbars" ]; do
+    off=$(( 0x$capoff + 8 + i*8 ))
+    ctrl=$(setpci -s "$dev" "$(printf '%x' "$off").l" 2>/dev/null)
+    is_hex "$ctrl" || return 1
+    baridx=$(( 0x$ctrl & 0x7 ))
+    [ "$baridx" -eq 1 ] && { printf '%x\n' "$off"; return 0; }
+    i=$(( i + 1 ))
+  done
+  return 1
+}
+
+bridge_pref_window_bytes() { # $1=bridge BDF -> ventana prefetchable en bytes, o 0
+  local line n u
+  line=$(lspci -vv -s "$1" 2>/dev/null | grep -i "Prefetchable memory behind bridge")
+  set -- $(printf '%s' "$line" | sed -n 's/.*size=\([0-9]\+\)\([KMGT]\?\).*/\1 \2/p')
+  n="${1:-0}"; u="${2:-}"
+  case "$u" in
+    K) echo $(( n * 1024 ));; M) echo $(( n * 1024*1024 ));;
+    G) echo $(( n * 1024*1024*1024 ));; T) echo $(( n * 1024*1024*1024*1024 ));;
+    *) echo "$n";;
+  esac
+}
+
+constrained_bridge_to_remove() { # $1=egpu $2=target_bytes -> BDF del puente TB superior constreñido
+  local egpu="$1" target="$2" path rel comp win
+  path=$(readlink -f "/sys/bus/pci/devices/$egpu") || return 1
+  rel=${path#"$TB_ROOT_PATH"/}
+  local IFS=/; set -- $rel; unset IFS
+  for comp in "$@"; do
+    case "$comp" in 0000:*) ;; *) continue ;; esac
+    [ -e "/sys/bus/pci/devices/$comp/secondary_bus_number" ] || continue   # solo puentes
+    win=$(bridge_pref_window_bytes "$comp")
+    if [ "${win:-0}" -gt 0 ] && [ "$win" -lt "$target" ]; then printf '%s\n' "$comp"; return 0; fi
+  done
+  return 1
+}
+
+rebar_ensure_bound() { # garantiza que la eGPU acabe bindeada tras el ReBAR; 1 si se perdió
+  local egpu i
+  for i in 1 2 3; do
+    egpu=$(find_egpu) || egpu=""
+    [ -n "$egpu" ] && break
+    log "  ReBAR: la eGPU no aparece tras el rescan (intento $i/3); reescaneo…"
+    echo 1 > /sys/bus/pci/rescan; udevadm settle --timeout=10
+  done
+  if [ -z "${egpu:-}" ]; then
+    log "  ReBAR: ⚠️ la eGPU NO reapareció tras el ReBAR — re-enchufa la caja AORUS o reinicia."
+    return 1
+  fi
+  [ "$(driver_of "$egpu")" = "nvidia" ] && return 0
+  log "  ReBAR: el rescan no rebindeó; cae al binder por SBR (acepta que resetee el ReBAR)…"
+  sbr_clean_rebind "$egpu" || true
+}
+
+rebar_bump() { # $1=egpu addr -> sube BAR1 al máx (best-effort, idempotente, fallback total)
+  local egpu="$1" maxidx target cur ctrloff val newval bridge fn
+  [ -n "${egpu:-}" ] || return 0   # sin BDF no hacemos nada (evita glob vacío)
+  command -v setpci >/dev/null 2>&1 || { log "  ReBAR: setpci no disponible (pciutils); omito."; return 0; }
+  command -v lspci  >/dev/null 2>&1 || { log "  ReBAR: lspci no disponible (pciutils); omito."; return 0; }
+  maxidx=$(rebar_max_index "$egpu") || { log "  ReBAR: BAR1 no redimensionable; omito."; return 0; }
+  target=$(( (1 << maxidx) * 1024 * 1024 ))
+  cur=$(bar1_size_bytes "$egpu")
+  if [ "${cur:-0}" -ge "$target" ]; then
+    log "  ReBAR: BAR1 ya en $(( cur/1024/1024 )) MiB (máx); nada que hacer."
+    return 0
+  fi
+  ctrloff=$(rebar_ctrl_offset "$egpu") || { log "  ReBAR: no encuentro el registro CTRL; omito."; return 0; }
+  log "  ReBAR: subiendo BAR1 de $(( cur/1024/1024 )) MiB a $(( target/1024/1024 )) MiB (índice $maxidx, ctrl@0x$ctrloff)…"
+  # 1) desbindear AMBAS funciones (memory decoding off para cambiar el tamaño)
+  for fn in /sys/bus/pci/devices/${egpu%.*}.*; do
+    [ -e "$fn/driver/unbind" ] && echo "$(basename "$fn")" > "$fn/driver/unbind" 2>/dev/null || true
+  done
+  sleep 0.3
+  # 2) fijar el tamaño en el registro ReBAR CTRL (bits[13:8]); el kernel no lo revierte
+  val=$(setpci -s "$egpu" "${ctrloff}.l" 2>/dev/null)
+  if is_hex "$val"; then
+    # limpiar bits[13:8] (máscara 32-bit 0xFFFFC0FF) y meter el índice de tamaño
+    newval=$(printf '%08x' $(( (0x$val & 0xFFFFC0FF) | (maxidx << 8) )))
+    setpci -s "$egpu" "${ctrloff}.l=0x${newval}" 2>/dev/null \
+      || log "  ReBAR: AVISO no pude escribir el registro CTRL; sigo (fallback)."
+  else
+    log "  ReBAR: AVISO no pude leer el registro CTRL; sigo (fallback)."
+  fi
+  # 3) quitar el puente TB superior constreñido (su ventana se re-asigna desde el
+  #    root TB de 64 GiB) y RESCAN -> el kernel da la ventana de $target a la cascada
+  bridge=$(constrained_bridge_to_remove "$egpu" "$target")
+  if [ -n "$bridge" ] && [ -e "/sys/bus/pci/devices/$bridge/remove" ]; then
+    log "  ReBAR: remove del puente constreñido $bridge + rescan…"
+    echo 1 > "/sys/bus/pci/devices/$bridge/remove"
+    sleep 0.4
+  else
+    log "  ReBAR: no hallé puente constreñido superior; rescan simple."
+  fi
+  echo 1 > /sys/bus/pci/rescan
+  udevadm settle --timeout=10
+  # 4) garantizar bind y reportar resultado
+  rebar_ensure_bound
+  local e2; e2=$(find_egpu) || e2="$egpu"
+  cur=$(bar1_size_bytes "${e2:-$egpu}")
+  if [ "${cur:-0}" -ge "$target" ]; then
+    log "  ReBAR: ✅ BAR1 ahora $(( cur/1024/1024 )) MiB."
+  else
+    log "  ReBAR: BAR1 quedó en $(( cur/1024/1024 )) MiB (no alcanzó el máx: enlace marginal/ventana). eGPU sigue bindeada."
+  fi
+  return 0
+}
+
+if [ "$(driver_of "$egpu")" = "nvidia" ]; then
+  log "La eGPU ya tiene el driver nvidia enlazado. Nada que reparar."
+  ensure_node
+  exit 0
+fi
+
+log "La eGPU NO tiene driver (BAR0 sin asignar). Aplicando reparación…"
+
+# 1) Liberar TODOS los puertos TB vacíos (bridges sin endpoints) del árbol TB.
+log "Liberando puertos Thunderbolt vacíos…"
+mapfile -t _bridges < <(find "$TB_ROOT_PATH" -mindepth 1 -type d -name '0000:*' 2>/dev/null)
+for br in "${_bridges[@]}"; do
+  is_bridge "$br" || continue
+  subtree_has_endpoint "$br" && continue
+  [ -e "$br/remove" ] && { log "  - $(basename "$br") (vacío) → remove"; echo 1 > "$br/remove"; }
+done
+
+# 2) Quitar la rama de la GPU para que el kernel la re-dimensione en el rescan.
+egpu_path=$(readlink -f "/sys/bus/pci/devices/$egpu")
+rel=${egpu_path#"$TB_ROOT_PATH"/}
+gpu_port=$(printf '%s\n' "$rel" | cut -d/ -f2)
+if [ -n "$gpu_port" ] && [ -e "/sys/bus/pci/devices/$gpu_port/remove" ]; then
+  log "Quitando rama de la GPU: $gpu_port"
+  echo 1 > "/sys/bus/pci/devices/$gpu_port/remove"
+fi
+
+# 3) Rescan: con pci=realloc el kernel reasigna el BAR0 en el hueco liberado.
+log "Reescaneando el bus PCI…"
+echo 1 > /sys/bus/pci/rescan
+udevadm settle --timeout=10
+
+# 4) Re-detectar y crear el nodo.
+egpu=$(find_egpu) || true
+if [ -z "${egpu:-}" ]; then log "ERROR: la eGPU no reapareció tras el rescan."; exit 1; fi
+if [ "$(driver_of "$egpu")" = "nvidia" ]; then report_bound; exit 0; fi
+
+# 5) ESCALADA SBR (v0.5.6): el remove+rescan no bindeó -> enlace marginal (Gen1,
+#    MSI-X fail). Reintenta con SBR del puente inmediato, hasta 2 veces, re-chequeando
+#    el bind. Sustituye al force-load manual (remove+SBR+rescan) que antes había que
+#    correr a mano. NO toca la GPU interna (solo la rama Thunderbolt).
+log "El bind no entró con remove+rescan (enlace marginal). Escalando a SBR…"
+for attempt in 1 2; do
+  log "Escalada SBR, intento $attempt/2…"
+  sbr_clean_rebind "$egpu" || break
+  egpu=$(find_egpu) || true
+  if [ -z "${egpu:-}" ]; then log "ERROR: la eGPU no reapareció tras el SBR."; exit 1; fi
+  if [ "$(driver_of "$egpu")" = "nvidia" ]; then bind_via_sbr=1; report_bound; exit 0; fi
+done
+
+log "❌ El bind sigue sin entrar tras la escalada SBR — el enlace TB está demasiado"
+log "   marginal. Re-enchufa la caja AORUS o reinicia. Diag: journalctl -k | grep -iE 'NVRM|RmInit|MSI|BAR 0'"
+exit 1

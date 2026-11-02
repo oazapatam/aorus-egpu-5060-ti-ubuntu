@@ -1,0 +1,7 @@
+# Saca los nodos DRM de la eGPU NVIDIA del seat0 para que KWin (y el resto del
+# escritorio) no la abran: si el enlace Thunderbolt se cae con el compositor usándola,
+# el escritorio se congela. CUDA usa /dev/nvidiaN y no se ve afectado.
+# Va después de 71-seat.rules (que marca las tarjetas DRM como master-of-seat) y antes
+# de 73-seat-late.rules (que aplica ID_SEAT). Sin master-of-seat, logind no crea un seat
+# nuevo para ella.
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*|renderD[0-9]*", ATTRS{vendor}=="0x10de", ATTRS{removable}=="removable", ENV{ID_SEAT}="seat-egpu", TAG-="master-of-seat"

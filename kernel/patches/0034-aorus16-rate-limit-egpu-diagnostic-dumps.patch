@@ -1,0 +1,131 @@
+From: squadai-stable <noreply@local>
+Date: 2026-06-27
+Subject: [PATCH] aorus16 (0034) -- rate-limit the eGPU diagnostic dumps (kill dmesg flood)
+
+Observability/noise fix. With the eGPU present but its Thunderbolt link down
+(PMC_BOOT_0=0xffffffff, AER permanent failure -> RmInitAdapter fails), the
+patched driver floods dmesg: 323 AORUS lines in a single 5-minute boot
+(2026-06-27). The lines are all correctly confined to the eGPU 8d:00.0 (the R4
+gate from 0031/0032 holds -- the internal dGPU 01:00.0 had ZERO Xid), but the
+volume buries the one diagnostic that matters and pokes MMIO (ioremap) on every
+UVM open/close.
+
+Three heavy dumpers fire per UVM open/close and per RmInit retry:
+  - tb_egpu_dump_aer_trigger_event()  -> "AORUS Mode-B Trigger" blocks
+  - tb_egpu_lever_m_diag_dump()       -> "[DIAG]" / "[DIAG-AER]" / "[DIAG-AER2]"
+  - tb_egpu_lever_m_diag_dump_pdev()  -> "[UVM-DIAG]" blocks
+plus the per-site "AORUS UVM [CLOSE]" one-liner in nvidia-uvm/uvm.c, emitted on
+all five close-path sites every open/close.
+
+Fix -- pure logging throttle, no gate / recovery / state-machine change:
+  - Add three DEFINE_RATELIMIT_STATE (30s window) and an __ratelimit() guard at
+    the top of each dumper. The first occurrence of a real fault is still logged
+    in full; repeats collapse to a "N callbacks suppressed" note. Skipping the
+    dump also skips its ioremap, so a dead-link eGPU no longer touches MMIO on
+    every UVM close.
+  - The AER dumper's guard is gated on out==NULL so the Q-watchdog snapshot path
+    (out!=NULL) always runs and keeps its AER data.
+  - uvm.c: the [CLOSE] marker was P-probe telemetry to locate the (now found)
+    UVM close hang -> demote to pr_debug (off by default, dynamic-debug
+    available).
+
+Net: a healthy eGPU session is near-silent; a real fault still leaves a full
+first dump. The R4 device gate, the M-recover state machine, and the watchdog
+are untouched. Authored against the post-0033 tree (build/ogkm) so context and
+hunk counters are exact (no --recount needed, unlike 0032).
+
+diff --git a/kernel-open/nvidia-uvm/uvm.c b/kernel-open/nvidia-uvm/uvm.c
+index d87cde6..570d934 100644
+--- a/kernel-open/nvidia-uvm/uvm.c
++++ b/kernel-open/nvidia-uvm/uvm.c
+@@ -83,8 +83,14 @@ static void aorus_uvm_close_path_diag(const char *site, int fd_count, bool is_la
+     if (!pdev)
+         return;   /* no eGPU -> no UVM instrumentation at all */
+ 
+-    pr_info("AORUS UVM [CLOSE]: site=%-18s fd_count=%d%s\n",
+-            site, fd_count, is_last_close ? " (LAST-CLOSE)" : "");
++    /* AORUS aorus16 (Patch 0034): the per-site [CLOSE] marker was P-probe
++     * telemetry to locate the UVM close hang; that investigation is closed, so
++     * demote it to pr_debug (off by default, available via dynamic debug). It
++     * fired on all five close-path sites on every UVM open/close and was the
++     * bulk of the dmesg flood. The heavy fault dumps below stay (now rate
++     * limited inside their functions) so a real eGPU fault is still captured. */
++    pr_debug("AORUS UVM [CLOSE]: site=%-18s fd_count=%d%s\n",
++             site, fd_count, is_last_close ? " (LAST-CLOSE)" : "");
+ 
+     if (is_last_close) {
+         tb_egpu_lever_m_diag_dump_pdev(pdev, site);
+diff --git a/kernel-open/nvidia/nv-lever-m-recover.c b/kernel-open/nvidia/nv-lever-m-recover.c
+index 29bb314..0e1f319 100644
+--- a/kernel-open/nvidia/nv-lever-m-recover.c
++++ b/kernel-open/nvidia/nv-lever-m-recover.c
+@@ -63,6 +63,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/delay.h>   /* msleep */
+ #include <linux/kobject.h> /* kobject_uevent_env */
++#include <linux/ratelimit.h> /* AORUS aorus16 (Patch 0034): throttle diag spam */
+ 
+ /* WPR2 status register: NV_HUBMMU0_PRI_BASE + NV_HUBMMU_PRI_MMU_WPR2_ADDR_HI
+  * for Blackwell GB100/GB202 (per published headers
+@@ -512,6 +513,23 @@ static void aorus_read_aer_full(struct pci_dev *pdev, int *pos_out,
+     if (errsrc)  (void)pci_read_config_dword(pdev, *pos_out + PCI_ERR_ROOT_ERR_SRC, errsrc);
+ }
+ 
++/*
++ * AORUS aorus16 (Patch 0034, 2026-06-27): throttle the heavy diagnostic dumps.
++ * tb_egpu_dump_aer_trigger_event / tb_egpu_lever_m_diag_dump{,_pdev} fire on
++ * every UVM open/close and on every RmInit retry. When the eGPU is present but
++ * its Thunderbolt link is down (PMC_BOOT_0=0xffffffff), that floods dmesg with
++ * hundreds of identical multi-line blocks (323 lines in a 5-min boot, observed
++ * 2026-06-27). Rate-limit each dumper so the first occurrence of a real fault
++ * is still logged in full, but repeats collapse to a "N callbacks suppressed"
++ * note. Pure logging throttle: gates printk only, never the R4 device gate, the
++ * recovery state machine, or the watchdog AER snapshot path (out != NULL still
++ * runs). Skipping the dump also skips its ioremap, so a dead-link eGPU no
++ * longer pokes MMIO on every UVM close.
++ */
++static DEFINE_RATELIMIT_STATE(tb_egpu_aer_diag_rs, 30 * HZ, 4);
++static DEFINE_RATELIMIT_STATE(tb_egpu_diag_rs,     30 * HZ, 6);
++static DEFINE_RATELIMIT_STATE(tb_egpu_uvmdiag_rs,  30 * HZ, 3);
++
+ /* AORUS Mode B telemetry S1 (2026-05-08): trigger-event AER capture.
+  * Walks GPU -> immediate bridge -> true root port (via walker), reads
+  * full AER + DPC + link state, emits one printk block. */
+@@ -537,6 +555,13 @@ void tb_egpu_dump_aer_trigger_event(struct pci_dev *gpu_pdev,
+         return;
+     }
+ 
++    /* AORUS aorus16 (Patch 0034): throttle logging-only callers (UVM close
++     * path and M-recover close path both pass out=NULL). The watchdog snapshot
++     * path (out != NULL) must always run to keep its AER data, so it bypasses
++     * the rate limiter. */
++    if (out == NULL && !__ratelimit(&tb_egpu_aer_diag_rs))
++        return;
++
+     bridge = pci_upstream_bridge(gpu_pdev);
+     /* Walk to TRUE host root port, not just immediate grandparent. */
+     root   = aorus_walk_to_root_port(gpu_pdev);
+@@ -615,6 +640,11 @@ void tb_egpu_lever_m_diag_dump(nv_linux_state_t *nvl, const char *site)
+     u32           wpr2_raw   = 0xdeadbeefu;
+     bool          pmc_ok = false, wpr2_ok = false;
+ 
++    /* AORUS aorus16 (Patch 0034): throttle this [DIAG] dump (fires per RmInit
++     * retry: startdev-entry/pre-rmInit/post-rmInit-FAIL). Logging only. */
++    if (!__ratelimit(&tb_egpu_diag_rs))
++        return;
++
+     if (!nvl)
+     {
+         nv_printf(NV_DBG_ERRORS,
+@@ -839,6 +869,11 @@ void tb_egpu_lever_m_diag_dump_pdev(struct pci_dev *pdev, const char *site)
+     u32 br_aer_unc = 0, br_aer_cor = 0;
+     int gpu_aer_pos = 0, br_aer_pos = 0;
+ 
++    /* AORUS aorus16 (Patch 0034): throttle this [UVM-DIAG] dump (fires on every
++     * UVM last-close). Logging only; skipping it also skips the ioremap. */
++    if (!__ratelimit(&tb_egpu_uvmdiag_rs))
++        return;
++
+     if (!pdev) {
+         nv_printf(NV_DBG_ERRORS,
+             "AORUS Lever M-recover [UVM-DIAG]: site=%s pdev=NULL — cannot read\n",

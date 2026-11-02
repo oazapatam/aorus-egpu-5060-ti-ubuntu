@@ -1,0 +1,14 @@
+# ci/baselines/lintian-known.txt — hallazgos de lintian YA CONOCIDOS.
+#
+# Formato: <paquete> <etiqueta> <nº de apariciones>.
+# ci/60-lintian.sh falla si aparece un par (paquete, etiqueta) que no
+# esté aquí, y avisa si una etiqueta conocida aparece MÁS veces. No
+# bendice nada: es la deuda medida, para que no crezca sin que se vea.
+#
+# Regenerar:  CI_LINTIAN_UPDATE_BASELINE=1 ci/60-lintian.sh
+# El motivo de cada línea está en docs/ci-package-policy.md.
+aorus-egpu-config systemd-service-in-odd-location 3
+aorus-egpu-config udev-rule-in-etc 5
+aorus-egpu-forensics script-not-executable 16
+aorus-egpu-overclock command-with-path-in-maintainer-script 2
+aorus-egpu-overclock script-not-executable 16

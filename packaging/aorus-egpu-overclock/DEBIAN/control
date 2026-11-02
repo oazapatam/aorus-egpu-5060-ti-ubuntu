@@ -1,0 +1,34 @@
+Package: aorus-egpu-overclock
+Version: 0.1.0
+Architecture: all
+Maintainer: Omar Zapata <omar.zapata@arus.com.co>
+Section: admin
+Priority: optional
+Depends: bash, coreutils, pciutils, systemd, udev
+Recommends: nvidia-utils-595 | nvidia-utils-580 | nvidia-utils
+Description: Perfiles de potencia y reloj para la eGPU AORUS RTX 5060 Ti
+ Aplica perfiles de power limit y de bloqueo de relojes a la eGPU externa
+ (10de:2d04) y SOLO a ella, vía nvidia-smi dirigido por PCI bus-id. La GPU
+ NVIDIA interna nunca se toca: es la regla R4 del proyecto, y hay un gate que
+ aborta si el target resuelto no es la eGPU o no cuelga de un controlador
+ Thunderbolt/USB4.
+ .
+ Perfiles incluidos (aorus-egpu-oc list): stock (fábrica), efficient (150 W,
+ reloj limitado — el recomendado para esta caja), balanced (165 W) y
+ performance (180 W, reloj anclado alto). Se editan en
+ /etc/aorus-egpu/profiles/ y el que se aplica al conectar la eGPU se elige en
+ /etc/aorus-egpu/overclock.conf.
+ .
+ ALCANCE: ajusta límite de potencia y BLOQUEOS de reloj (nvidia-smi -pl/-lgc/
+ -lmc), que funcionan headless y bajo Wayland. Los offsets de +MHz por encima
+ de stock NO se aplican en este sistema porque requieren Xorg con Coolbits o
+ las llamadas NVML de VF offset; un perfil que los pida se RECHAZA en vez de
+ fingir que se aplicó.
+ .
+ GATE DE SEGURIDAD: no aplica nada si el enlace PCIe de la eGPU está degradado
+ (por debajo de Gen3). Apretar la tarjeta con el enlace Thunderbolt entrenado a
+ Gen1 congeló el host entero el 2026-06-27. --force lo salta y lo deja
+ registrado. Si nvidia-smi se cuelga, aborta sin reintentar.
+ .
+ Reversible: parar el servicio o desinstalar el paquete devuelve la tarjeta a
+ valores de fábrica (apt remove aorus-egpu-overclock).

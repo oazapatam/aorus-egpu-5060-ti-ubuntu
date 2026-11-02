@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ]; then
+	systemctl daemon-reload || true
+	udevadm control --reload-rules || true
+	# Añade thunderbolt.host_reset=0 thunderbolt.clx=0 a la línea de comandos del kernel
+	# (/etc/default/grub.d/egpu-tb-fix.cfg). Si falla, grub.cfg queda como estaba.
+	if command -v update-grub >/dev/null 2>&1; then
+		update-grub || echo "egpu-tb-fix: AVISO: update-grub falló; los parámetros de thunderbolt no se aplicarán." >&2
+	fi
+	echo "egpu-tb-fix: los parámetros del módulo thunderbolt (host_reset=0 clx=0) se aplican en el próximo arranque."
+fi

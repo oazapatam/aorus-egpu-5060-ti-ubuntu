@@ -1,0 +1,28 @@
+# aorus-egpu-config: deja la eGPU AORUS como dispositivo SOLO-CÓMPUTO, fuera del
+# compositor Wayland — evita el FREEZE al desconectarla en caliente (requisito R1).
+#
+# Síntoma (verificado en vivo 2026-06-20, boot -1): al quitar la eGPU el kernel
+# la removió limpiamente (nvidia-drm [GPU ID 0x0000b400] Removing device, SIN Xid
+# en la interna 01:00.0 — el gate de device del driver aorus13 hizo su trabajo),
+# pero nvidia-modeset se quedó colgado en bucle, cada 5 s:
+#   nvidia-modeset: ERROR: GPU:1: Error while waiting for GPU progress
+# → KWin bloqueado esperando un flip a una GPU que ya no existe → escritorio
+# congelado → reinicio forzado. "GPU:1" era la eGPU (0x0000b400).
+#
+# Causa: con nvidia-drm.modeset=1 cada GPU NVIDIA expone un nodo KMS (cardN) que
+# udev marca para seat0, y el compositor Wayland (KWin) lo toma como salida de
+# display AUNQUE la eGPU no tenga monitor (aquí se usa solo para IA/CUDA). Al
+# desconectarla, el head de modeset queda esperando para siempre.
+#
+# Fix: sacar el cardN de la eGPU de seat0 reasignándolo a un seat fantasma
+# ("seat-egpu-compute"), que no tiene sesión. KWin solo enumera dispositivos DRM
+# de SU seat (seat0), así que deja de usar la eGPU como pantalla y nunca le envía
+# un flip → al desconectarla no queda ningún head colgado. El cómputo NO se ve
+# afectado: CUDA va por /dev/nvidia* + el render node (renderDN), que no dependen
+# del seat. (KERNEL=="card*" matchea SOLO el nodo KMS, no el render node.)
+#
+# Acotado por device id 2d04 (eGPU RTX 5060 Ti); la dGPU interna (2c39) y la
+# Intel nunca entran aquí (requisito R4). El cambio toma efecto tras reiniciar /
+# re-login de la sesión Wayland.
+
+SUBSYSTEM=="drm", KERNEL=="card*", ATTRS{vendor}=="0x10de", ATTRS{device}=="0x2d04", TAG+="seat", ENV{ID_SEAT}="seat-egpu-compute"

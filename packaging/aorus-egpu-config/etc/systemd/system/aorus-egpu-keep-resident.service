@@ -1,0 +1,23 @@
+# aorus-egpu-config: mantiene la eGPU RESIDENTE (persistence mode) al aparecer.
+#
+# Disparada por udev (83-aorus-egpu-keep-resident.rules) vía SYSTEMD_WANTS al
+# enumerar/bindear la AORUS RTX 5060 Ti (10de:2d04). Corre DESPUÉS del fix-BAR0
+# (que es quien bindea el driver) y espera a que el RM publique la GPU, luego
+# activa persistence SOLO en la eGPU. Así el último `close` ya no tira el adapter
+# y el enlace TB no cae a Gen1 en la ventana idle (root cause del GSP-init fail).
+#
+# No se habilita en ningún target: solo corre bajo demanda en el hotplug. El
+# helper es idempotente, serializado con flock y gateado por device-id 2d04.
+[Unit]
+Description=AORUS eGPU keep-resident (NVIDIA persistence, kill last-close teardown)
+After=systemd-udevd.service aorus-egpu-fix-bar0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/aorus-egpu-keep-resident on
+# Al parar la unit (apt remove / systemctl stop) se revierte persistence.
+ExecStop=/usr/sbin/aorus-egpu-keep-resident off
+# La eGPU puede estar ausente (no-op exit 0) o aún no publicada (exit 1 benigno
+# en reintentos); no marcamos la unit como failed por eso.
+SuccessExitStatus=0 1

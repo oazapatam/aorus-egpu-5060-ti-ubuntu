@@ -1,0 +1,12 @@
+[Unit]
+Description=Preparar eGPU NVIDIA en Thunderbolt (ventana MMIO, enlace y energía)
+
+[Service]
+Type=oneshot
+# El script espera solo a que el enlace de la caja esté estable antes de tocarla.
+ExecStart=/usr/sbin/egpu-tb-fix
+# Red de seguridad: si el script falla o muere a medias, el autoprobe del bus PCI queda
+# encendido y se enlaza lo que quedó sin driver detrás de Thunderbolt.
+ExecStopPost=-/bin/sh -c '[ "$SERVICE_RESULT" = success ] || /usr/sbin/egpu-tb-fix open-gate'
+ExecStopPost=/bin/sh -c '[ "$SERVICE_RESULT" = success ] || echo 1 > /sys/bus/pci/drivers_autoprobe'
+TimeoutStartSec=180

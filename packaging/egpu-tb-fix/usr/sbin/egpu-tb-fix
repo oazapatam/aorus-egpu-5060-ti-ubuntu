@@ -1,0 +1,728 @@
+#!/bin/bash
+# egpu-tb-fix — prepara una eGPU NVIDIA conectada por Thunderbolt/USB4.
+#
+# BAR0: al conectar en caliente, el kernel ya repartió la ventana MMIO de 32 bits del
+# controlador Thunderbolt a partes iguales entre sus puertos, y al puerto de la eGPU no
+# le alcanza para el BAR0 (el driver nvidia falla con "BAR0 is 0M @ 0x0"). Este script
+# quita del árbol PCI la caja eGPU y los puertos hermanos vacíos que acaparan esa
+# ventana, re-enumera la caja con redimensionado de la ventana del puerto y vuelve a
+# añadir los puertos vacíos con lo que sobre.
+#
+# Enlace: si el enlace Thunderbolt se cae con el driver nvidia usando la GPU, el driver
+# se queda colgado quitándola (o congela el equipo). Antes de que nvidia la tome, la caja
+# debe llevar un rato conectada sin caerse, y el enlace interno caja↔GPU se limita a Gen3,
+# sin ASPM ni runtime PM; es lo que estabilizó otras cajas Barlow Ridge en Linux.
+#
+# Runtime PM del controlador Thunderbolt: cuando el controlador host (NHI) entra en
+# runtime suspend, el driver thunderbolt pone a dormir los routers USB4 aunque haya
+# túneles PCIe/USB3 activos. Mientras haya un dispositivo conectado, "tb-pm" lo mantiene
+# despierto (lo lanza una regla udev al conectar y desconectar).
+#
+# Retención ("hold"): deja la eGPU sin driver para probar la estabilidad del enlace. Sin
+# nvidia, una caída del enlace solo quita la GPU del árbol PCI, sin colgar el equipo.
+#
+# Compuerta: al conectar un dispositivo Thunderbolt, antes de que bolt lo autorice y se
+# cree el túnel PCIe, "tb-event" apaga el autoprobe del bus PCI. Así la eGPU aparece sin
+# driver en cualquier puerto (también donde el BAR0 cabe y nvidia la tomaría al instante)
+# y se prepara antes de entregársela a nvidia. El script nunca desenlaza nvidia de una
+# GPU: al hacerlo nvidia quita la GPU de nvidia-modeset/nvidia-drm en caliente y, en una
+# eGPU, no espera a que nadie la suelte (con la caja en el puerto izquierdo, el equipo se
+# congeló al hacerlo). Si en GATE_SECS no aparece ninguna eGPU, "ungate" vuelve a encender
+# el autoprobe y enlaza lo que quedó sin driver.
+#
+# Todo se hace en caliente vía sysfs: un reinicio deja el PCI como estaba.
+
+set -euo pipefail
+
+PCI=/sys/bus/pci/devices
+TBT=/sys/bus/thunderbolt/devices
+AUTOPROBE=/sys/bus/pci/drivers_autoprobe
+DYNDBG=/sys/kernel/debug/dynamic_debug/control
+STATE_DIR=/run/egpu-tb-fix
+HOLD_FILE=$STATE_DIR/hold
+GATE_FILE=$STATE_DIR/gate	# existe mientras la compuerta (autoprobe PCI apagado) está cerrada
+GATE_SECS=15	# si en este tiempo no aparece ninguna eGPU, se abre la compuerta
+HOLD_DRIVER=none	# driver_override que no coincide con ningún driver
+COOLDOWN_SECS=30
+STABLE_SECS=15	# la caja debe llevar este tiempo enumerada antes de tocarla
+WAIT_SECS=120	# máximo que se espera a que se estabilice
+LINK_GEN=3	# generación PCIe máxima del enlace interno de la caja (caja ↔ GPU)
+DRY_RUN=0
+PM_FILE="" PM_SAVED=""
+
+log() { echo "egpu-tb-fix: $*"; }
+
+usage() {
+	cat <<-EOF
+	Uso: egpu-tb-fix [--dry-run]   reasigna la eGPU si no tiene BAR0 y prepara su enlace
+	     egpu-tb-fix status        muestra el estado de las GPUs NVIDIA y del enlace
+	     egpu-tb-fix hold          deja la eGPU sin driver (prueba del enlace sin nvidia)
+	     egpu-tb-fix release       quita la retención y deja que nvidia tome la eGPU
+	     egpu-tb-fix debug on|off  mensajes de depuración del módulo thunderbolt
+	     egpu-tb-fix tb-pm         ajusta el runtime PM de los controladores Thunderbolt
+	     egpu-tb-fix tb-event add|remove <router>   (regla udev) runtime PM y compuerta
+	     egpu-tb-fix ungate        abre la compuerta si no apareció ninguna eGPU
+	     egpu-tb-fix open-gate     enciende el autoprobe PCI y enlaza lo que quedó sin driver
+	EOF
+}
+
+is_pci_addr() { [[ $1 =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]]; }
+
+is_nvidia_display() {
+	[[ $(<"$PCI/$1/vendor") == 0x10de && $(<"$PCI/$1/class") == 0x03* ]]
+}
+
+is_removable() { [[ $(cat "$PCI/$1/removable" 2>/dev/null) == removable ]]; }
+
+bar0_unassigned() {
+	local start _end flags
+	read -r start _end flags < "$PCI/$1/resource"
+	[[ $start == 0x0000000000000000 && $flags == 0x0000000000000000 ]]
+}
+
+driver_of() {
+	local link
+	link=$(readlink "$PCI/$1/driver" 2>/dev/null) || true
+	echo "${link##*/}"
+}
+
+parent_of() {
+	local path
+	path=$(readlink -f "$PCI/$1")
+	path=${path%/*}
+	echo "${path##*/}"
+}
+
+# Dispositivos PCI directamente debajo de un puente.
+pci_children() {
+	local c
+	for c in "$PCI/$1"/*; do
+		if is_pci_addr "${c##*/}"; then echo "${c##*/}"; fi
+	done
+	return 0
+}
+
+# Dispositivos PCI bajo un puente, de arriba abajo (primero los puentes superiores).
+devices_under() {
+	local dev path
+	for dev in "$PCI"/*; do
+		path=$(readlink -f "$dev")
+		if [[ $path == */"$1"/* ]]; then echo "$path"; fi
+	done | awk -F/ '{ print NF, $NF }' | sort -n | cut -d' ' -f2
+}
+
+secondary_bus() {
+	local b=("$PCI/$1"/pci_bus/*)
+	[[ -e ${b[0]} ]] || return 1
+	echo "${b[0]##*/}"
+}
+
+is_hotplug_slot() {
+	local bus addr
+	bus=$(secondary_bus "$1") || return 1
+	for addr in /sys/bus/pci/slots/*/address; do
+		[[ -e $addr ]] || continue
+		if [[ $(<"$addr") == "$bus:00" ]]; then return 0; fi
+	done
+	return 1
+}
+
+# Ruta tipo pci0000:80/0000:80:1b.4/0000:88:00.0/0000:89:03.0/0000:b2:00.0/.../GPU:
+# el primer dispositivo removible es la caja eGPU y el anterior es el puerto Thunderbolt.
+# Imprime "padre puerto caja". En el USB4 integrado de la CPU el puerto es un root port
+# (pci0000:00/0000:00:07.0/caja/...) y el padre es el host bridge (pci0000:00).
+locate_box() {
+	local -a parts
+	local i
+	IFS=/ read -ra parts <<< "$(readlink -f "$PCI/$1")"
+	for (( i = 2; i < ${#parts[@]}; i++ )); do
+		if is_pci_addr "${parts[i]}" && is_removable "${parts[i]}"; then
+			is_pci_addr "${parts[i-1]}" || return 1
+			is_pci_addr "${parts[i-2]}" || [[ ${parts[i-2]} == pci* ]] || return 1
+			echo "${parts[i-2]} ${parts[i-1]} ${parts[i]}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Segundos desde que se enumeró un dispositivo (ctime de su directorio en sysfs). Si el
+# inodo se recrea la cuenta vuelve a empezar, lo que solo alarga la espera.
+age_of() {
+	local t
+	t=$(stat -L -c %Z "$PCI/$1" 2>/dev/null) || { echo 0; return 0; }
+	echo $(( $(date +%s) - t ))
+}
+
+# GPUs NVIDIA removibles (detrás de Thunderbolt).
+egpus() {
+	local dev name
+	for dev in "$PCI"/*; do
+		name=${dev##*/}
+		if is_nvidia_display "$name" && is_removable "$name"; then echo "$name"; fi
+	done
+	return 0
+}
+
+# eGPUs a las que no se les pudo asignar el BAR0.
+broken_egpus() {
+	local g
+	for g in $(egpus); do
+		if bar0_unassigned "$g"; then echo "$g"; fi
+	done
+	return 0
+}
+
+gpus_under() {
+	local dev
+	for dev in "$PCI"/*; do
+		[[ $(readlink -f "$dev") == */"$1"/* ]] || continue
+		if is_nvidia_display "${dev##*/}"; then echo "${dev##*/}"; fi
+	done
+	return 0
+}
+
+sysfs_write() {
+	if (( DRY_RUN )); then
+		log "[dry-run] echo $1 > $2"
+	else
+		log "echo $1 > $2"
+		echo "$1" > "$2"
+	fi
+}
+
+# Como sysfs_write, sin registrar el éxito; si el kernel rechaza la escritura, solo avisa.
+try_write() {
+	if (( DRY_RUN )); then
+		log "[dry-run] echo $1 > $2"
+	elif ! { echo "$1" > "$2"; } 2>/dev/null; then
+		log "aviso: el kernel rechazó 'echo $1 > $2'"
+	fi
+	return 0
+}
+
+# Dispositivos detrás de Thunderbolt/USB4, de arriba abajo (primero los puentes superiores).
+removable_devices() {
+	local dev
+	for dev in "$PCI"/*; do
+		if is_removable "${dev##*/}"; then readlink -f "$dev"; fi
+	done | awk -F/ '{ print NF, $NF }' | sort -n | cut -d' ' -f2
+}
+
+# Abre la compuerta: enciende el autoprobe del bus PCI y enlaza lo que quedó sin driver
+# detrás de Thunderbolt, salvo las eGPUs retenidas.
+open_gate() {
+	local name
+	if (( DRY_RUN )); then
+		log "[dry-run] echo 1 > $AUTOPROBE y enlazar lo que quedó sin driver detrás de Thunderbolt"
+		return 0
+	fi
+	{ echo 1 > "$AUTOPROBE"; } 2>/dev/null || true
+	rm -f "$GATE_FILE"
+	for name in $(removable_devices); do
+		[[ -e $PCI/$name && -z $(driver_of "$name") ]] || continue
+		is_held "$name" && continue
+		{ echo "$name" > /sys/bus/pci/drivers_probe; } 2>/dev/null || true
+	done
+	return 0
+}
+
+# Deja el autoprobe del bus PCI encendido y el puerto Thunderbolt con su runtime PM
+# original, también si el script termina a medias.
+cleanup() {
+	open_gate
+	if [[ -n $PM_FILE ]]; then
+		{ echo "$PM_SAVED" > "$PM_FILE"; } 2>/dev/null || true
+		PM_FILE=""
+	fi
+}
+
+# Evita bucles: no vuelve a tocar el mismo puerto antes de COOLDOWN_SECS.
+cooldown_ok() {
+	local now
+	now=$(date +%s)
+	if [[ -f $STATE_DIR/$1 ]] && (( now - $(<"$STATE_DIR/$1") < COOLDOWN_SECS )); then
+		return 1
+	fi
+	if (( ! DRY_RUN )); then
+		mkdir -p "$STATE_DIR"
+		echo "$now" > "$STATE_DIR/$1"
+	fi
+}
+
+# Espera a que la caja de cada eGPU lleve STABLE_SECS enumerada. Si el enlace se cae y
+# vuelve, la caja se re-enumera y la cuenta empieza de nuevo.
+wait_stable() {
+	local deadline g box waiting
+	deadline=$(( $(date +%s) + WAIT_SECS ))
+	while :; do
+		waiting=""
+		for g in $(egpus); do
+			read -r _ _ box < <(locate_box "$g") || continue
+			if (( $(age_of "$box") < STABLE_SECS )); then waiting=$box; fi
+		done
+		[[ -n $waiting ]] || return 0
+		if (( $(date +%s) >= deadline )); then
+			log "la caja $waiting no lleva ${STABLE_SECS}s estable tras ${WAIT_SECS}s; no la toco."
+			return 1
+		fi
+		sleep 1
+	done
+}
+
+# Control de velocidad del enlace de un puerto PCIe (bwctrl, kernel ≥ 6.13).
+cooling_dev_of() {
+	local t
+	for t in /sys/class/thermal/cooling_device*/type; do
+		if [[ $(<"$t") == "PCIe_Port_Link_Speed_$1" ]]; then
+			echo "${t%/type}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Generación máxima a la que un puente deja subir su enlace (Target Link Speed, LnkCtl2).
+target_gen() {
+	local v
+	v=$(setpci -s "$1" CAP_EXP+30.w 2>/dev/null) || return 1
+	[[ $v != ffff ]] || return 1
+	echo $(( 0x$v & 0xf ))
+}
+
+# Sin runtime PM ni ASPM en la eGPU y en la caja (se puede hacer con el driver activo).
+prep_power() {
+	local f
+	for f in "$PCI/${1%.*}".*/power/control; do try_write on "$f"; done
+	for f in "$PCI/$1"/link/{l0s_aspm,l1_aspm,clkpm} "$PCI/$2"/link/{l0s_aspm,l1_aspm,clkpm}; do
+		if [[ -e $f ]]; then try_write 0 "$f"; fi
+	done
+	return 0
+}
+
+# Deja el enlace de la eGPU listo antes de que un driver la use (la GPU no debe tener
+# driver): sin runtime PM, sin ASPM y con el enlace interno de la caja a Gen${LINK_GEN}.
+prep_link() {
+	local gpu=$1 box=$2 bridge cdev want
+	bridge=$(parent_of "$gpu")
+	prep_power "$gpu" "$box"
+	if cdev=$(cooling_dev_of "$bridge"); then
+		# Estado 0 = velocidad máxima; cada estado baja una generación.
+		want=$(( $(<"$cdev/max_state") - (LINK_GEN - 1) ))
+		if (( want > 0 )); then try_write "$want" "$cdev/cur_state"; fi
+	else
+		log "aviso: $bridge no expone control de velocidad; el enlace interno queda como está."
+	fi
+	(( DRY_RUN )) && return 0
+	log "$gpu: enlace $(cat "$PCI/$gpu/current_link_speed" 2>/dev/null) x$(cat "$PCI/$gpu/current_link_width" 2>/dev/null)," \
+		"tope Gen$(target_gen "$bridge" || echo '?'), sin ASPM ni runtime PM"
+}
+
+# Con el autoprobe apagado, enlaza los dispositivos sin driver bajo un puente.
+# $2: "bridges" para enlazar solo los puentes, "all" para todos.
+probe_under() {
+	local name
+	for name in $(devices_under "$1"); do
+		[[ -e $PCI/$name && -z $(driver_of "$name") ]] || continue
+		if [[ $2 == bridges && $(<"$PCI/$name/class") != 0x0604* ]]; then continue; fi
+		try_write "$name" /sys/bus/pci/drivers_probe
+	done
+	return 0
+}
+
+fix_egpu() {
+	local gpu=$1 parent port top secbus scope s try g ok=0
+	local -a idle=()
+
+	if ! read -r parent port top < <(locate_box "$gpu") || ! is_hotplug_slot "$port"; then
+		log "$gpu: no encuentro el puerto Thunderbolt hotplug; no hago nada."
+		return 1
+	fi
+	secbus=$(secondary_bus "$port")
+	# Bajo un host bridge (root port) no hay hermanos que compartan la ventana, y no se
+	# tocan los demás dispositivos del host bridge (ahí está la GPU interna).
+	scope=$parent
+	is_pci_addr "$parent" || scope=$port
+
+	# Puertos hotplug hermanos sin nada conectado: son los que acaparan la ventana.
+	for s in $(pci_children "$scope"); do
+		[[ $s != "$port" && $(<"$PCI/$s/class") == 0x0604* ]] || continue
+		if is_hotplug_slot "$s" && [[ -z $(pci_children "$s") ]]; then idle+=("$s"); fi
+	done
+
+	if ! cooldown_ok "$port"; then
+		log "$gpu: ya se intentó hace menos de ${COOLDOWN_SECS}s; no reintento."
+		return 1
+	fi
+
+	log "$gpu sin BAR0: puerto $port (bus $secbus), caja $top, puertos vacíos: ${idle[*]:-ninguno}"
+	if (( DRY_RUN )); then
+		sysfs_write 1 "$PCI/$top/remove"
+		for s in "${idle[@]}"; do sysfs_write 1 "$PCI/$s/remove"; done
+		sysfs_write 0 "$AUTOPROBE"
+		sysfs_write 1 "/sys/class/pci_bus/$secbus/rescan"
+		if (( ${#idle[@]} )); then sysfs_write 1 "$PCI/$port/rescan"; fi
+		log "[dry-run] enlazar los puentes, preparar el enlace de $gpu (Gen$LINK_GEN, sin ASPM ni runtime PM)"
+		if holding; then sysfs_write "$HOLD_DRIVER" "$PCI/$gpu/driver_override"; fi
+		sysfs_write 1 "$AUTOPROBE"
+		log "[dry-run] enlazar $gpu ($(holding && echo 'sin driver: retenida' || echo nvidia)) y el resto de la caja"
+		return 0
+	fi
+
+	# Mantiene el puerto en D0 mientras su bus está vacío; si no, el rescan no ve la caja.
+	PM_FILE=$PCI/$port/power/control
+	PM_SAVED=$(<"$PM_FILE")
+	echo on > "$PM_FILE"
+
+	sysfs_write 1 "$PCI/$top/remove"
+	for s in "${idle[@]}"; do sysfs_write 1 "$PCI/$s/remove"; done
+	sleep 1
+	# Sin autoprobe, todo vuelve sin drivers: así se prepara el enlace antes de que
+	# nvidia tome la GPU.
+	sysfs_write 0 "$AUTOPROBE"
+	# Con el bus vacío, este rescan redimensiona la ventana del puerto
+	# (pci_rescan_bus_bridge_resize). Si la caja aún no responde, el bus sigue
+	# vacío y se puede reintentar.
+	for (( try = 1; try <= 5; try++ )); do
+		sysfs_write 1 "/sys/class/pci_bus/$secbus/rescan"
+		if [[ -e $PCI/$top ]]; then break; fi
+		log "la caja $top no respondió (intento $try); reintento."
+		sleep 1
+	done
+	# Devuelve los puertos vacíos y, si la caja nunca apareció, la vuelve a añadir sin redimensionar.
+	if (( ${#idle[@]} )) || [[ ! -e $PCI/$top ]]; then sysfs_write 1 "$PCI/$port/rescan"; fi
+	probe_under "$scope" bridges
+	for g in $(gpus_under "$port"); do
+		prep_link "$g" "$top"
+		if holding; then sysfs_write "$HOLD_DRIVER" "$PCI/$g/driver_override"; fi
+	done
+	sysfs_write 1 "$AUTOPROBE"
+	probe_under "$port" all
+	cleanup
+	udevadm settle --timeout=15 || true
+
+	for g in $(gpus_under "$port"); do
+		if bar0_unassigned "$g"; then
+			log "$g: el BAR0 sigue sin asignar; la ventana del puerto no alcanzó."
+		else
+			log "$g: BAR0 asignado, driver: $(driver_of "$g" | grep . || echo ninguno)"
+			ok=1
+		fi
+	done
+	(( ok ))
+}
+
+# eGPUs con BAR0 que aún no tienen driver: llegaron con la compuerta cerrada (o están
+# retenidas) y se preparan antes de entregarlas a nvidia.
+pending_egpus() {
+	local g
+	for g in $(egpus); do
+		if ! bar0_unassigned "$g" && [[ -z $(driver_of "$g") ]]; then echo "$g"; fi
+	done
+	return 0
+}
+
+# eGPUs que nvidia tomó sin pasar por prep_link (la caja conectada desde el arranque, o
+# con la compuerta ya abierta): su enlace interno aún puede subir por encima de Gen${LINK_GEN}.
+fast_egpus() {
+	local g gen
+	for g in $(egpus); do
+		[[ $(driver_of "$g") == nvidia ]] || continue
+		gen=$(target_gen "$(parent_of "$g")") || continue
+		if (( gen > LINK_GEN )); then echo "$g"; fi
+	done
+	return 0
+}
+
+# Prepara una eGPU sin driver: enlaza los puentes de la caja (pcieport expone el control
+# de velocidad), limita el enlace y, si hay retención, la deja sin driver.
+prepare_egpu() {
+	local gpu=$1 port box
+	read -r _ port box < <(locate_box "$gpu") || { log "$gpu: no encuentro su caja; no la preparo."; return 1; }
+	probe_under "$port" bridges
+	prep_link "$gpu" "$box"
+	if holding; then
+		log "$gpu: retenida sin driver ('egpu-tb-fix release' para usarla)."
+		sysfs_write "$HOLD_DRIVER" "$PCI/$gpu/driver_override"
+	fi
+}
+
+# nvidia ya tiene la eGPU sin preparar: no se desenlaza (nvidia la quitaría de
+# nvidia-modeset en caliente y en una eGPU no espera a que nadie la suelte; así se congeló
+# el equipo). Solo se aplica lo que es seguro con el driver activo.
+unprepared_egpu() {
+	local gpu=$1 box gen
+	read -r _ _ box < <(locate_box "$gpu") || return 1
+	gen=$(target_gen "$(parent_of "$gpu")" || echo '?')
+	prep_power "$gpu" "$box"
+	log "$gpu: nvidia la tomó sin preparar (enlace interno hasta Gen$gen); no la desenlazo." \
+		"Para limitarlo a Gen$LINK_GEN (o retenerla), desconecta la caja y vuelve a conectarla."
+	return 0
+}
+
+holding() { [[ -e $HOLD_FILE ]]; }
+
+is_held() { [[ $(cat "$PCI/$1/driver_override" 2>/dev/null) == "$HOLD_DRIVER" ]]; }
+
+# Quita la retención y enlaza las eGPUs retenidas (ya preparadas por prepare_egpu o fix_egpu).
+release_egpus() {
+	local g
+	for g in $(egpus); do
+		is_held "$g" || continue
+		log "$g: sin retención; la enlazo."
+		sysfs_write "" "$PCI/$g/driver_override"
+		try_write "$g" /sys/bus/pci/drivers_probe
+	done
+	if (( ! DRY_RUN )); then udevadm settle --timeout=15 || true; fi
+}
+
+# Routers USB4/Thunderbolt de dispositivo: "1-3", "1-303"... El host es "1-0" y los
+# retimers llevan ":" ("1-0:3.1").
+is_device_router() { [[ $1 =~ ^[0-9]+-[0-9a-f]+$ && $1 != *-0 ]]; }
+
+# Mantiene despierto (power/control=on) el controlador host (NHI) de cada dominio
+# Thunderbolt con algún dispositivo conectado, y lo devuelve a "auto" cuando no queda
+# ninguno. Con el NHI en runtime suspend, el driver thunderbolt pone a dormir los routers
+# con los túneles activos. $1 $2: acción y dispositivo del evento udev (en "remove" el
+# dispositivo puede seguir en sysfs).
+tb_pm() {
+	local action=${1:-} gone=${2:-} dom nhi want d name
+	for dom in "$TBT"/domain*; do
+		[[ -e $dom ]] || continue
+		nhi=$(readlink -f "$dom")
+		nhi=${nhi%/*}
+		[[ -e $nhi/power/control ]] || continue
+		want=auto
+		for d in "$TBT/${dom##*domain}"-*; do
+			name=${d##*/}
+			if [[ $action == remove && $name == "$gone" ]]; then continue; fi
+			if is_device_router "$name"; then want=on; fi
+		done
+		if [[ $(<"$nhi/power/control") != "$want" ]]; then
+			log "controlador Thunderbolt ${nhi##*/} (${dom##*/}): runtime PM $(<"$nhi/power/control") → $want"
+			try_write "$want" "$nhi/power/control"
+		fi
+	done
+	return 0
+}
+
+# Cierra la compuerta al conectar un router USB4 que aún no está autorizado: bolt lo
+# autoriza (y crea el túnel PCIe) después de esta regla udev, porque recibe el evento
+# cuando udev termina con ella; así la eGPU llega con el autoprobe PCI apagado. No se
+# cierra durante el arranque (los drivers que cargan entonces no se enlazarían a sus
+# dispositivos) ni sin el módulo nvidia cargado. Si no aparece ninguna eGPU, un temporizador
+# de systemd ejecuta "ungate" a los GATE_SECS.
+gate() {
+	local dev=$1 state
+	is_device_router "$dev" || return 0
+	[[ $(cat "$TBT/$dev/authorized" 2>/dev/null) == 0 ]] || return 0
+	[[ -d /sys/module/nvidia ]] || return 0
+	state=$(systemctl is-system-running 2>/dev/null) || true
+	if [[ $state != running && $state != degraded ]]; then
+		log "$dev: el sistema está en estado '$state'; no apago el autoprobe PCI."
+		return 0
+	fi
+	mkdir -p "$STATE_DIR"
+	date +%s > "$GATE_FILE"
+	log "$dev: autoprobe PCI apagado hasta preparar la eGPU (${GATE_SECS}s si no aparece ninguna)."
+	echo 0 > "$AUTOPROBE"
+	if ! systemd-run --quiet --no-block --collect --on-active="$GATE_SECS" \
+		--unit="egpu-tb-fix-ungate-$(date +%s%N)" /usr/sbin/egpu-tb-fix ungate; then
+		log "no pude programar la reapertura; vuelvo a encender el autoprobe PCI."
+		open_gate
+	fi
+}
+
+# Reapertura programada por gate(). Si hay una eGPU sin driver, la prepara el servicio, que
+# abre la compuerta al terminar; si no (otro tipo de dispositivo, o el túnel PCIe no se
+# creó), se abre aquí.
+ungate() {
+	[[ -e $GATE_FILE ]] || return 0
+	if [[ -n $(pending_egpus)$(broken_egpus) ]]; then
+		systemctl start --no-block egpu-tb-fix.service
+		return 0
+	fi
+	log "no apareció ninguna eGPU en ${GATE_SECS}s; vuelvo a encender el autoprobe PCI."
+	open_gate
+}
+
+# Mensajes de depuración del módulo thunderbolt en el log del kernel (hasta reiniciar).
+tb_debug() {
+	local flag
+	case ${1:-} in
+		on) flag=+p ;;
+		off) flag=-p ;;
+		*) usage >&2; return 2 ;;
+	esac
+	if [[ ! -w $DYNDBG ]]; then
+		log "no puedo escribir en $DYNDBG (¿debugfs montado?)."
+		return 1
+	fi
+	sysfs_write "module thunderbolt $flag" "$DYNDBG"
+}
+
+# Una GPU que llega en caliente no recibe /dev/nvidiaN: ub-device-create (de
+# nvidia-kernel-common) solo se ejecuta cuando se carga el módulo nvidia.
+ensure_device_nodes() {
+	local dev name minor
+	local -a missing=()
+	for dev in "$PCI"/*; do
+		name=${dev##*/}
+		is_nvidia_display "$name" && is_removable "$name" || continue
+		[[ $(driver_of "$name") == nvidia ]] || continue
+		minor=$(awk '/^Device Minor:/ {print $3}' "/proc/driver/nvidia/gpus/$name/information" 2>/dev/null) || true
+		if [[ -n $minor && ! -e /dev/nvidia$minor ]]; then missing+=("$minor"); fi
+	done
+	(( ${#missing[@]} )) || return 0
+
+	if (( DRY_RUN )); then
+		log "[dry-run] crear /dev/nvidia{${missing[*]}}"
+		return 0
+	fi
+	if [[ -x /sbin/ub-device-create ]]; then
+		log "creando /dev/nvidia{${missing[*]}} con ub-device-create"
+		/sbin/ub-device-create || true
+	fi
+	for minor in "${missing[@]}"; do
+		if [[ ! -e /dev/nvidia$minor ]]; then
+			log "creando /dev/nvidia$minor con mknod"
+			mknod -m 0666 "/dev/nvidia$minor" c 195 "$minor"
+		fi
+	done
+}
+
+status() {
+	local dev name start end link p
+	for dev in "$PCI"/*; do
+		name=${dev##*/}
+		is_nvidia_display "$name" || continue
+		read -r start end _ < "$dev/resource"
+		if bar0_unassigned "$name"; then start="SIN ASIGNAR"; else start="$start-$end"; fi
+		printf '%s  %-10s  BAR0 %-40s driver: %s%s\n' "$name" \
+			"$(cat "$dev/removable" 2>/dev/null || echo '?')" "$start" "$(driver_of "$name" | grep . || echo ninguno)" \
+			"$(is_held "$name" && echo ' (retenida)')"
+		if is_removable "$name"; then
+			link="$(cat "$dev/current_link_speed" 2>/dev/null || echo '?') x$(cat "$dev/current_link_width" 2>/dev/null || echo '?')"
+			printf '    enlace %s, tope Gen%s, runtime PM %s\n' "$link" \
+				"$(target_gen "$(parent_of "$name")" || echo '?')" "$(<"$dev/power/control")"
+		fi
+	done
+	for dev in "$TBT"/*; do
+		name=${dev##*/}
+		if [[ $name == domain* ]]; then
+			p=$(readlink -f "$dev")
+			p=${p%/*}
+			printf 'thunderbolt %s: controlador %s, runtime PM %s (%s)\n' "$name" "${p##*/}" \
+				"$(cat "$p/power/control" 2>/dev/null || echo '?')" "$(cat "$p/power/runtime_status" 2>/dev/null || echo '?')"
+		elif is_device_router "$name"; then
+			printf 'thunderbolt %s: %s, USB4 Gen%s, %s x%s, NVM %s\n' "$name" \
+				"$(cat "$dev/device_name" 2>/dev/null || echo '?')" "$(cat "$dev/generation" 2>/dev/null || echo '?')" \
+				"$(cat "$dev/rx_speed" 2>/dev/null || echo '?')" "$(cat "$dev/rx_lanes" 2>/dev/null || echo '?')" \
+				"$(cat "$dev/nvm_version" 2>/dev/null || echo '?')"
+		fi
+	done
+	for p in host_reset clx; do
+		printf 'thunderbolt.%s=%s  ' "$p" "$(cat "/sys/module/thunderbolt/parameters/$p" 2>/dev/null || echo '?')"
+	done
+	echo
+	if holding; then echo "retención activa: nvidia no toma la eGPU ('egpu-tb-fix release')"; fi
+	if [[ -e $GATE_FILE ]]; then
+		echo "autoprobe PCI apagado hace $(( $(date +%s) - $(<"$GATE_FILE") ))s: esperando a preparar la eGPU"
+	elif [[ $(<"$AUTOPROBE") != 1 ]]; then
+		echo "AVISO: autoprobe PCI apagado ('sudo egpu-tb-fix open-gate' lo enciende)"
+	fi
+}
+
+main() {
+	local cmd=${1:-}
+	case $cmd in
+		""|hold|release|debug|tb-pm|tb-event|ungate|open-gate) ;;
+		--dry-run) DRY_RUN=1 ;;
+		status) status; return ;;
+		-h|--help) usage; return ;;
+		*) usage >&2; return 2 ;;
+	esac
+	if (( ! DRY_RUN && EUID != 0 )); then
+		log "requiere root (usa sudo)."
+		return 1
+	fi
+	case $cmd in
+		tb-pm) tb_pm "${2:-}" "${3:-}"; return ;;
+		tb-event)
+			tb_pm "${2:-}" "${3:-}"
+			if [[ ${2:-} == add ]]; then gate "${3:-}"; fi
+			return
+			;;
+		open-gate) open_gate; return ;;
+		debug) tb_debug "${2:-}"; return ;;
+	esac
+
+	if (( ! DRY_RUN )); then
+		# Una sola instancia a la vez (el servicio de udev y las órdenes a mano).
+		mkdir -p "$STATE_DIR"
+		exec 9> "$STATE_DIR/lock"
+		if [[ $cmd == ungate ]]; then
+			# Si otra instancia está trabajando, ella abre la compuerta al terminar.
+			flock -n 9 || return 0
+			ungate
+			return
+		fi
+		if ! flock -n 9; then
+			log "otra instancia está trabajando; espero (hasta $(( WAIT_SECS + 60 ))s)."
+			flock -w $(( WAIT_SECS + 60 )) 9 || { log "sigue ocupado; no hago nada."; return 1; }
+		fi
+	fi
+	case $cmd in
+		hold)
+			touch "$HOLD_FILE"
+			log "retención activada: nvidia no tomará la eGPU hasta 'egpu-tb-fix release' o el próximo reinicio."
+			;;
+		release)
+			rm -f "$HOLD_FILE"
+			release_egpus
+			;;
+	esac
+
+	local pending g box rc=0
+	if (( DRY_RUN )); then
+		for g in $(egpus); do
+			read -r _ _ box < <(locate_box "$g") || continue
+			log "[dry-run] $g: caja $box enumerada hace $(age_of "$box")s (se espera a ${STABLE_SECS}s)"
+		done
+	else
+		trap cleanup EXIT
+		trap 'exit 143' TERM INT
+		if ! wait_stable; then
+			# Con el enlace inestable no se entrega a nvidia: una caída con el driver activo cuelga el equipo.
+			for g in $(pending_egpus); do
+				log "$g: queda sin driver ('egpu-tb-fix release' para usarla igualmente)."
+				sysfs_write "$HOLD_DRIVER" "$PCI/$g/driver_override"
+			done
+			return 1
+		fi
+	fi
+
+	if [[ -z $(egpus) ]]; then log "no hay ninguna eGPU NVIDIA conectada."; fi
+	pending=$(pending_egpus)
+	for g in $(broken_egpus); do fix_egpu "$g" || rc=1; done
+	for g in $pending; do prepare_egpu "$g" || rc=1; done
+	for g in $(fast_egpus); do unprepared_egpu "$g" || rc=1; done
+	if [[ $cmd == hold ]]; then
+		for g in $(egpus); do
+			if [[ -n $(driver_of "$g") ]]; then
+				log "$g: ya tiene driver ($(driver_of "$g")); la retención se aplica al reconectar la caja."
+			fi
+		done
+	fi
+	open_gate
+	if (( ! DRY_RUN )); then
+		udevadm settle --timeout=15 || true
+		for g in $pending; do
+			log "$g: driver: $(driver_of "$g" | grep . || echo ninguno)$(is_held "$g" && echo ' (retenida)')"
+		done
+	fi
+	ensure_device_nodes
+	return $rc
+}
+
+main "$@"

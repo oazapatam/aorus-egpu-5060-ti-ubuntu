@@ -1,0 +1,14 @@
+#!/bin/sh
+# Recarga de udev/systemd tras quitar las reglas y la unit. El estado de runtime
+# se limpia aquí porque /run no lo gestiona dpkg.
+set -e
+
+case "$1" in
+  remove|purge)
+    rm -f /run/aorus-egpu/overclock.state 2>/dev/null || true
+    rmdir /run/aorus-egpu 2>/dev/null || true
+    udevadm control --reload-rules 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    ;;
+esac
+exit 0

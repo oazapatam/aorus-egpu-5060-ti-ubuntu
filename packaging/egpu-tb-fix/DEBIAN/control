@@ -1,0 +1,31 @@
+Package: egpu-tb-fix
+Version: 1.5.0
+Section: admin
+Priority: optional
+Architecture: all
+Depends: bash, coreutils, findutils, pciutils, procps, systemd, udev, util-linux
+Maintainer: Omar Zapata <omar.zapata@arus.com.co>
+Description: Prepara una eGPU NVIDIA en Thunderbolt/USB4 (ventana MMIO y enlace)
+ Cuando una eGPU NVIDIA conectada en caliente no recibe su BAR0 porque la
+ ventana MMIO de 32 bits del controlador Thunderbolt está repartida entre
+ sus puertos, re-enumera la caja liberando los puertos vacíos para que el
+ kernel agrande la ventana del puerto de la eGPU.
+ .
+ Para que el enlace no se caiga con el driver nvidia activo: al conectar
+ la caja (en cualquier puerto Thunderbolt/USB4) apaga el autoprobe PCI hasta
+ prepararla; espera a que la caja esté estable, limita el enlace interno
+ caja-GPU a Gen3 y quita ASPM y runtime PM antes de que nvidia tome la GPU.
+ Nunca desenlaza nvidia de una GPU; mantiene a KWin fuera de la eGPU
+ y arranca el módulo thunderbolt con host_reset=0 y clx=0 (línea de comandos
+ del kernel vía GRUB). Mientras haya un dispositivo Thunderbolt conectado,
+ mantiene despierto el controlador host (sin runtime suspend), para que el
+ driver no ponga a dormir los routers USB4 con los túneles activos.
+ .
+ "egpu-tb-fix hold" deja la eGPU sin driver para probar el enlace sin
+ riesgo de cuelgue; "egpu-tb-fix release" la entrega a nvidia.
+ .
+ Si al reiniciar la eGPU sigue en el árbol PCI, reinicia por la vía de
+ emergencia (SysRq b): con el enlace caído, el driver nvidia bloquea el
+ reinicio normal.
+ .
+ Desinstalar el paquete y reiniciar deja el sistema como estaba.

@@ -1,0 +1,96 @@
+[Unit]
+Description=Archivar el volcado de pstore del cuelgue anterior (ramoops)
+Documentation=man:systemd-pstore(8)
+Documentation=https://docs.kernel.org/admin-guide/ramoops.html
+
+# pstore es MINÚSCULO y es un anillo: si no se vacía, el siguiente cuelgue puede
+# no tener sitio donde escribir. Así que esta unit COPIA lo que haya en
+# /sys/fs/pstore a /var/log/aorus-egpu/pstore/<fecha>/ y BORRA el original
+# (borrar un fichero de pstorefs es la forma documentada de liberar el registro
+# en el backend). Y lo hace lo antes posible en el arranque, antes de que algo
+# lo pise o lo consuma.
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+
+# ramoops se carga en systemd-modules-load.service (ver
+# /usr/lib/modules-load.d/aorus-egpu-ramoops.conf). Hasta que no se carga, los
+# registros del arranque anterior NO son visibles en /sys/fs/pstore, así que
+# esperar a esa unit es obligatorio, no cosmético.
+After=systemd-modules-load.service
+
+# /var tiene que estar montado y escribible: el archivo va a /var/log.
+After=local-fs.target
+RequiresMountsFor=/var/log
+
+# Nos ponemos DELANTE de systemd-pstore.service a propósito. Esa unit de systemd
+# también archiva pstore (a /var/lib/systemd/pstore) y por defecto BORRA los
+# ficheros. Si corriera antes, se llevaría nuestros registros. Yendo nosotros
+# primero, además, systemd-pstore sigue ahí como red de seguridad por si esta
+# unit fallara. También nos colocamos antes de sysinit.target para quedar en el
+# arranque temprano, como la propia systemd-pstore.service.
+Before=systemd-pstore.service sysinit.target
+
+# Si el kernel no tiene pstore montado (o alguien quitó la capa 3), la unit se
+# salta sin error en vez de fallar. No se usa ConditionDirectoryNotEmpty: se
+# prefiere que la unit corra siempre y DEJE DICHO en el journal que no había
+# nada, para que "no hay volcado" sea un dato explícito del postmortem y no un
+# silencio ambiguo.
+ConditionPathIsDirectory=/sys/fs/pstore
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=120
+
+# Los volcados llevan direcciones del kernel y estado interno: no son para todo
+# el mundo. 0750 en el árbol, 0640 en los ficheros.
+UMask=0027
+
+# El `-` delante del comando hace que un fallo aquí NO rompa el arranque: esta
+# unit es un instrumento de diagnóstico, nunca una dependencia del sistema.
+# El script es idempotente: copia-y-borra fichero a fichero, así que si se corta
+# a medias, la siguiente ejecución recoge lo que quedó.
+# Ojo al escribir aquí: en una unit de systemd los '%' van duplicados ('%%').
+ExecStart=-/bin/sh -c ' \
+    set -u; \
+    src=/sys/fs/pstore; \
+    arch=/var/log/aorus-egpu/pstore; \
+    n=0; \
+    for f in "$src"/*; do [ -e "$f" ] && n=$((n+1)); done; \
+    if [ "$n" -eq 0 ]; then \
+      echo "pstore vacio: el arranque anterior no dejo volcado (sin panic, o ramoops sin configurar)"; \
+      exit 0; \
+    fi; \
+    dst="$arch/$(date -u +%%Y%%m%%dT%%H%%M%%SZ)"; \
+    mkdir -p "$dst" || exit 0; \
+    copiados=0; \
+    for f in "$src"/*; do \
+      [ -f "$f" ] || continue; \
+      b=$(basename "$f"); \
+      if cp -- "$f" "$dst/$b"; then \
+        copiados=$((copiados+1)); \
+        rm -f -- "$f"; \
+      else \
+        echo "aviso: no pude copiar $f; lo dejo en pstore"; \
+      fi; \
+    done; \
+    { \
+      echo "archivado:   $(date -Is)"; \
+      echo "kernel:      $(uname -r)"; \
+      echo "boot_id:     $(cat /proc/sys/kernel/random/boot_id)"; \
+      echo "registros:   $copiados"; \
+      echo "cmdline:     $(cat /proc/cmdline)"; \
+      echo; \
+      echo "Estos ficheros son el dmesg del kernel en el instante del panic del"; \
+      echo "arranque ANTERIOR, preservado en RAM por ramoops. Empieza por el"; \
+      echo "dmesg-ramoops-* de numero mas bajo y lee el FINAL del fichero."; \
+      echo "Contexto y guia: docs/freeze-forensics.md"; \
+    } > "$dst/00-meta.txt"; \
+    chmod 0750 "$dst"; \
+    sync; \
+    echo "archivados $copiados registro(s) de pstore en $dst"; \
+    exit 0'
+
+[Install]
+WantedBy=sysinit.target

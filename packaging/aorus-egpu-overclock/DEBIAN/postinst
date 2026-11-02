@@ -1,0 +1,26 @@
+#!/bin/sh
+# postinst de aorus-egpu-overclock. Idempotente y conservador: NO aplica ningún
+# perfil al instalar. El perfil por defecto es 'stock' (= no tocar nada), así
+# que instalar el paquete nunca cambia el comportamiento de la GPU por sorpresa.
+set -e
+
+case "$1" in
+  configure)
+    udevadm control --reload-rules 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    # Habilitado para que udev pueda tirar de él vía SYSTEMD_WANTS, pero como
+    # es oneshot con PROFILE=stock, no hace nada hasta que se elija un perfil.
+    systemctl enable aorus-egpu-overclock.service >/dev/null 2>&1 || true
+    cat <<'MSG'
+aorus-egpu-overclock instalado (sin aplicar nada todavía).
+
+  aorus-egpu-oc status          ver estado y límites de la eGPU
+  aorus-egpu-oc list            ver perfiles
+  aorus-egpu-oc apply efficient probar el perfil recomendado
+  sudo nano /etc/aorus-egpu/overclock.conf   fijar el perfil permanente
+
+Revertir todo:  sudo apt remove aorus-egpu-overclock
+MSG
+    ;;
+esac
+exit 0

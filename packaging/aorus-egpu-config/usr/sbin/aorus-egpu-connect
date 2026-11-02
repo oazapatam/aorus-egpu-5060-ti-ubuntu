@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+#
+# aorus-egpu-connect — activa la eGPU AORUS RTX 5060 Ti a mano, end-to-end.
+#
+# Hace en un comando lo que el stack hace automáticamente al conectar:
+#   1. autoriza la box Thunderbolt (authorized=1) si está sin autorizar,
+#   2. espera a que la GPU enumere en el bus PCI,
+#   3. lanza aorus-egpu-fix-bar0 (reasigna BAR0, bindea nvidia, crea /dev/nvidiaN),
+#   4. resume el estado.
+#
+# Úsalo cuando la box quedó conectada pero sin autorizar (p.ej. boltd con
+# policy "iommu"), o simplemente para forzar la activación sin esperar a udev.
+# Es idempotente: si ya está autorizada y con driver, solo lo confirma.
+#
+# La automatización equivalente vive en las reglas udev 79 (autorizar TB) y 80
+# (fix-bar0); este script es el camino manual desde la terminal.
+#
+# Uso:  sudo aorus-egpu-connect
+set -u
+
+# Id del controlador Thunderbolt de la box AORUS (vendor GIGABYTE / device).
+TB_VID=0xed
+TB_DID=0x41cd
+# Id PCI de la eGPU (RTX 5060 Ti). La dGPU interna es 10de:2c39.
+EGPU_PCI=10de:2d04
+
+if [ "$(id -u)" -ne 0 ]; then
+  exec sudo -- "$0" "$@"
+fi
+
+log() { printf '%s\n' "$*"; }
+err() { printf '%s\n' "$*" >&2; }
+
+# --- 1) localizar y autorizar la box Thunderbolt ---------------------------
+find_tb() { # imprime el sysfs path del device TB de la box AORUS, si existe
+  local d
+  for d in /sys/bus/thunderbolt/devices/*-*; do
+    [ -r "$d/vendor" ] && [ -r "$d/device" ] || continue
+    [ "$(cat "$d/vendor")" = "$TB_VID" ] && [ "$(cat "$d/device")" = "$TB_DID" ] || continue
+    printf '%s\n' "$d"; return 0
+  done
+  return 1
+}
+
+tb=$(find_tb) || true
+if [ -z "${tb:-}" ]; then
+  err "La box AORUS no aparece en el bus Thunderbolt."
+  err "¿Cable conectado? Revisa:  boltctl list"
+  exit 1
+fi
+
+if [ "$(cat "$tb/authorized" 2>/dev/null)" = "0" ]; then
+  name=$(cat "$tb/device_name" 2>/dev/null || echo "AORUS eGPU")
+  log "Autorizando Thunderbolt: $name ($(basename "$tb"))…"
+  if ! echo 1 > "$tb/authorized" 2>/dev/null; then
+    err "No pude escribir authorized=1 (¿security level 'secure'?)."
+    err "Enrola con key:  sudo boltctl enroll --policy auto $(cat "$tb/unique_id" 2>/dev/null)"
+    exit 1
+  fi
+else
+  log "Thunderbolt ya autorizado."
+fi
+
+# --- 2) esperar la enumeración PCI -----------------------------------------
+log "Esperando a que la GPU enumere en PCI…"
+udevadm settle --timeout=10 2>/dev/null || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  lspci -d "$EGPU_PCI" 2>/dev/null | grep -q . && break
+  sleep 1
+done
+if ! lspci -d "$EGPU_PCI" 2>/dev/null | grep -q .; then
+  err "La GPU no apareció en el bus PCI tras autorizar."
+  err "Revisa:  journalctl -k | grep -iE 'thunderbolt|b4:00|tunnel'"
+  exit 1
+fi
+
+# --- 3) reasignar BAR0 / bindear nvidia (idempotente) ----------------------
+if command -v aorus-egpu-fix-bar0 >/dev/null 2>&1; then
+  log "Ejecutando aorus-egpu-fix-bar0…"
+  aorus-egpu-fix-bar0 || true
+else
+  err "AVISO: aorus-egpu-fix-bar0 no está en PATH; saltando el fix de BAR0."
+fi
+
+# --- 4) resumen -------------------------------------------------------------
+log ""
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -qi '5060 Ti'; then
+  log "✅ eGPU activa:"
+  nvidia-smi -L 2>/dev/null | sed 's/^/   /'
+  exit 0
+fi
+err "La eGPU aún no es visible para nvidia-smi. Diagnóstico:  aorus-egpu-status"
+exit 1

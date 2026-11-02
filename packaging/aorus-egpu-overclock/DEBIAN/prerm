@@ -1,0 +1,14 @@
+#!/bin/sh
+# Antes de retirar los ficheros: devolver la tarjeta a fábrica MIENTRAS el
+# binario todavía existe. Hacerlo en postrm sería tarde (ya está borrado).
+set -e
+
+case "$1" in
+  remove|deconfigure)
+    if [ -x /usr/sbin/aorus-egpu-oc ]; then
+      /usr/sbin/aorus-egpu-oc reset >/dev/null 2>&1 || true
+    fi
+    systemctl disable --now aorus-egpu-overclock.service >/dev/null 2>&1 || true
+    ;;
+esac
+exit 0

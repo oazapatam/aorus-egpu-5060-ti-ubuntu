@@ -1,0 +1,29 @@
+# aorus-egpu-config: marca cuándo es seguro auto-activar la eGPU.
+#
+# Crea el flag /run/aorus-egpu/hotplug-ready una vez el sistema ya arrancó
+# (After=multi-user.target, mucho después del coldplug de udev). La regla udev
+# 79 (autorizar la box Thunderbolt) está GATEADA tras este flag: solo autoriza
+# en un hotplug REAL del escritorio, nunca durante el coldplug de arranque.
+#
+# Por qué: en arranque en frío con el cable puesto, un enlace Thunderbolt que
+# entrena mal deja la eGPU "muerta"; si se autoriza y enumera, nvidia la bindea,
+# falla RmInitAdapter en bucle y ENVENENA NVML → nvidia-smi de la GPU interna
+# (sana) deja de responder. Manteniendo la eGPU DORMIDA en arranque (este gate +
+# boltd policy=manual) la interna queda 100% a salvo, de forma determinista.
+#
+# El flag vive en /run (volátil): cada arranque empieza "no listo" hasta que se
+# alcanza multi-user.target. RuntimeDirectory lo crea/limpia con permisos sanos.
+[Unit]
+Description=AORUS eGPU hotplug-ready gate (auto-activación solo tras arrancar)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+RuntimeDirectory=aorus-egpu
+RuntimeDirectoryPreserve=yes
+ExecStart=/bin/sh -c 'touch /run/aorus-egpu/hotplug-ready'
+ExecStop=/bin/sh -c 'rm -f /run/aorus-egpu/hotplug-ready'
+
+[Install]
+WantedBy=multi-user.target

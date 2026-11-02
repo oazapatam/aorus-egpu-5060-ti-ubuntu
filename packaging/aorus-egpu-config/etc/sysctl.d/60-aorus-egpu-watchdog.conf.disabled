@@ -1,0 +1,25 @@
+# aorus-egpu-config — capa FORENSE / watchdog (OPT-IN, desactivada por defecto).
+#
+# Port de etc/sysctl.d/aorus-egpu-watchdog.conf del repo de Fedora. Convierte un
+# cuelgue silencioso (Mode B) en un panic + vmcore de kdump, en vez de quedar el
+# equipo congelado sin diagnóstico.
+#
+# OPT-IN porque es host-wide: con esto un hardlockup/oops del kernel reinicia el
+# equipo (kernel.panic=30). Útil para diagnosticar el freeze; molesto si
+# prefieres que el equipo se quede congelado para inspección. Activa con:
+#
+#     sudo aorus-egpu-escalation enable watchdog
+#
+# Revertir:   sudo aorus-egpu-escalation disable watchdog   (o apt remove)
+#
+# Requiere crashkernel reservado y kdump-tools instalado para capturar el vmcore:
+#     sudo apt install kdump-tools
+
+kernel.hardlockup_panic = 1
+kernel.softlockup_panic = 1
+kernel.hardlockup_all_cpu_backtrace = 1
+kernel.softlockup_all_cpu_backtrace = 1
+kernel.panic_on_oops = 1
+kernel.panic_on_rcu_stall = 1
+kernel.panic_on_io_nmi = 1
+kernel.panic = 30

@@ -1,0 +1,42 @@
+Package: aorus-egpu-forensics
+Version: 0.1.0
+Architecture: all
+Maintainer: Omar Zapata <omar.zapata@arus.com.co>
+Section: admin
+Priority: optional
+Depends: bash, coreutils, findutils, systemd, kmod
+Recommends: pciutils
+Description: Forense de cuelgues al probar la eGPU AORUS por Thunderbolt
+ Probar una eGPU por Thunderbolt congela el host de vez en cuando, y sin Xid,
+ sin panic y sin oops. Al reiniciar no queda rastro: el buffer de journald vivía
+ en RAM y el kernel nunca llegó a volcarlo, así que es imposible saber qué paso
+ lo mató. Este paquete arregla eso, por capas.
+ .
+ Capa 1 - migas de pan en disco (funciona ya, sin reiniciar):
+ aorus-egpu-probe envuelve la prueba y escribe cada paso en disco con fsync
+ ANTES de ejecutarlo. Si la máquina muere, la ÚLTIMA línea del log es el paso
+ culpable. No depende de que el kernel sobreviva ni de que journald sincronice.
+ .
+ Capa 2 - muestreador de hardware:
+ durante la prueba, un bucle graba el estado de enlace PCIe, driver y runtime PM
+ de cada GPU NVIDIA cada N segundos, también con fsync. Tras el cuelgue queda la
+ foto del hardware en el último instante vivo.
+ .
+ Capa 3 - ramoops/pstore (requiere reiniciar):
+ reserva RAM para que el dmesg del kernel SOBREVIVA al reinicio, y convierte los
+ lockups en panic (hardlockup_panic / softlockup_panic) para que el volcado se
+ dispare. Sin esto, un cuelgue sin panic no graba nada en pstore, porque este
+ kernel no trae CONFIG_PSTORE_CONSOLE.
+ .
+ Tras un cuelgue, aorus-egpu-postmortem junta en un solo directorio la última
+ traza, el volcado de pstore y el journal del arranque anterior, con un
+ 00-RESUMEN.txt por el que empezar.
+ .
+ Limitación declarada: si el cuelgue es tan duro que el detector de lockups
+ tampoco corre, no habrá panic ni volcado del kernel; en ese caso las capas 1 y
+ 2 (disco con fsync) son lo único que queda, y por eso son las que no dependen
+ de nada instalado. Ver docs/freeze-forensics.md.
+ .
+ Reversible: apt remove quita los args de kernel, los sysctl y las units, y
+ devuelve el sistema a su comportamiento original (requiere reiniciar). Las
+ trazas y los volcados ya recogidos se conservan en /var/log/aorus-egpu/.

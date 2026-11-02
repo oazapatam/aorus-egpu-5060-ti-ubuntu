@@ -1,0 +1,20 @@
+#!/bin/sh
+# Remove the DKMS-built patched modules before the source tree is deleted, so
+# the stock signed nvidia modules in /lib/modules/<kver>/kernel take over again.
+set -e
+
+NAME=aorus-nvidia
+# Derive the version from the on-disk source tree (see postinst — avoids the
+# hardcoded-version desync). At prerm time (remove/upgrade) the current version's
+# source dir is still present, so this resolves to the version being removed.
+VER=$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' /usr/src/${NAME}-*/dkms.conf 2>/dev/null | sort -V | tail -n1)
+
+case "$1" in
+  remove|upgrade|deconfigure)
+    if [ -n "$VER" ] && dkms status -m "$NAME" -v "$VER" 2>/dev/null | grep -q "$NAME"; then
+      dkms remove -m "$NAME" -v "$VER" --all || true
+    fi
+    ;;
+esac
+
+exit 0

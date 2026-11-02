@@ -1,0 +1,43 @@
+#!/bin/sh
+# postinst de aorus-egpu-forensics.
+set -e
+
+case "$1" in
+  configure)
+    mkdir -p /var/log/aorus-egpu/traces /var/log/aorus-egpu/pstore \
+             /var/log/aorus-egpu/postmortem
+    chmod 0750 /var/log/aorus-egpu
+
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable aorus-egpu-pstore-archive.service >/dev/null 2>&1 || true
+
+    # Los sysctl de lockup->panic se aplican ya; no necesitan reinicio.
+    if [ -f /etc/sysctl.d/60-aorus-egpu-lockup.conf ]; then
+      sysctl -p /etc/sysctl.d/60-aorus-egpu-lockup.conf >/dev/null 2>&1 || true
+    fi
+
+    # Los args de kernel (reserva de RAM para ramoops) SÍ necesitan reinicio.
+    if [ -f /etc/default/grub.d/97-aorus-egpu-forensics.cfg ]; then
+      update-grub >/dev/null 2>&1 || update-grub2 >/dev/null 2>&1 || \
+        echo "aviso: no pude ejecutar update-grub; hazlo a mano." >&2
+      cat <<'MSG'
+
+aorus-egpu-forensics instalado.
+
+FUNCIONA YA (sin reiniciar) — migas de pan en disco:
+  sudo aorus-egpu-probe bandwidth     prueba con traza forense completa
+  sudo aorus-egpu-probe load 120      carga sostenida de 120 s
+  sudo aorus-egpu-probe run -- <cmd>  envuelve cualquier comando
+
+REQUIERE REINICIAR — volcado del kernel a través del reinicio (ramoops):
+  sudo reboot
+
+Tras un cuelgue, al volver a arrancar:
+  sudo aorus-egpu-postmortem
+
+Revertir todo:  sudo apt remove aorus-egpu-forensics && sudo reboot
+MSG
+    fi
+    ;;
+esac
+exit 0

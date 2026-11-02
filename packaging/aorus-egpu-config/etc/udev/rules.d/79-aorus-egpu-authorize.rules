@@ -1,0 +1,28 @@
+# aorus-egpu-config: autoriza la box Thunderbolt de la eGPU al conectarse.
+#
+# La AORUS RTX506T AI BOX llega como peripheral Thunderbolt SIN autorizar
+# (authorized=0) cuando boltd la tiene con policy "iommu" o no enrolada. Sin
+# autorizar, el túnel PCI NO se crea, la GPU nunca enumera en el bus y la regla
+# 80 (fix-bar0) no tiene device PCI que reparar. Esta regla la autoriza en el
+# acto, lo que dispara la enumeración PCI y, en cadena, el resto del stack.
+#
+# Matchea SOLO la box AORUS por su id de controlador Thunderbolt (vendor 0xed
+# GIGABYTE, device 0x41cd); ningún otro periférico TB entra aquí. El guard
+# authorized=="0" la hace idempotente y evita pelear con boltd: si boltd ya la
+# autorizó (policy auto), el match falla y no se reescribe.
+#
+# Nota de seguridad: en este dominio el security level es "user" (SL1), donde
+# basta escribir authorized=1 (lo mismo que `boltctl authorize`). Si algún día
+# el nivel pasa a "secure" (SL2), haría falta una key — entonces enrola con
+# `sudo boltctl enroll --policy auto <uuid>` en vez de depender de esta regla.
+#
+# GATE DE ARRANQUE (v0.4.0): la regla SOLO autoriza si existe el flag
+# /run/aorus-egpu/hotplug-ready, que crea aorus-egpu-hotplug-ready.service una
+# vez alcanzado multi-user.target. Durante el coldplug de arranque el flag NO
+# existe → la box NO se autoriza → la eGPU NO enumera → la GPU interna nunca se
+# envenena. En un hotplug REAL del escritorio el flag ya está → autoriza normal
+# (plug-and-play en caliente). Complementa a boltd policy=manual (que fija el
+# postinst): juntos garantizan que la eGPU quede DORMIDA en arranque, no a medias.
+# Para la box que quedó conectada desde el arranque (dormida): sudo aorus-egpu-connect.
+
+ACTION=="add", SUBSYSTEM=="thunderbolt", ENV{DEVTYPE}=="thunderbolt_device", ATTR{vendor}=="0xed", ATTR{device}=="0x41cd", ATTR{authorized}=="0", TEST=="/run/aorus-egpu/hotplug-ready", ATTR{authorized}="1"

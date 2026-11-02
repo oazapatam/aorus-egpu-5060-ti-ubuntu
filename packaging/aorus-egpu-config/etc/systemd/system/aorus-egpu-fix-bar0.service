@@ -1,0 +1,15 @@
+# aorus-egpu-config: reasigna el BAR0 de la eGPU al aparecer por Thunderbolt.
+#
+# Disparada por udev (80-aorus-egpu-fix-bar0.rules) vía SYSTEMD_WANTS cuando
+# enumera la AORUS RTX 5060 Ti. No se habilita en ningún target: solo corre
+# bajo demanda. El helper es idempotente y serializado con flock.
+[Unit]
+Description=AORUS eGPU BAR0 reassignment (Thunderbolt)
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/aorus-egpu-fix-bar0
+# El rescan re-enumera dispositivos; no propagamos el fallo para no marcar la
+# unit como failed en reintentos benignos.
+SuccessExitStatus=0 1

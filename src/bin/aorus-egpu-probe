@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# aorus-egpu-probe — ejecuta una prueba de la eGPU dejando RASTRO EN DISCO, para
+# que un cuelgue del host se pueda depurar después de reiniciar.
+#
+# Úsalo en lugar de lanzar la prueba a pelo. La diferencia: cada paso se escribe
+# en disco con fsync ANTES de ejecutarse, así que si la máquina muere, la última
+# línea del log es el paso que la mató.
+set -uo pipefail
+
+for _root in "$(dirname "$(readlink -f "$0")")/.." /usr/lib/aorus-egpu; do
+  if [ -r "$_root/bootstrap.sh" ]; then . "$_root/bootstrap.sh"; break; fi
+done
+if ! declare -F aorus_use >/dev/null; then
+  printf 'aorus-egpu-probe: no encuentro bootstrap.sh\n' >&2; exit 70
+fi
+aorus_use app/forensics
+
+usage() {
+  cat <<-USAGE
+	aorus-egpu-probe — prueba la eGPU con traza forense que sobrevive a un cuelgue
+
+	Uso:
+	  aorus-egpu-probe bandwidth            mide ancho de banda (carga PCIe real)
+	  aorus-egpu-probe load [segundos]      carga sostenida (por defecto 60 s)
+	  aorus-egpu-probe status               solo captura el estado, sin carga
+	  aorus-egpu-probe run -- <comando>     envuelve cualquier comando
+
+	Opciones:
+	  --interval <s>   cada cuánto muestrea el hardware (por defecto 2 s)
+	  -h, --help
+
+	Tras un cuelgue, al reiniciar:  aorus-egpu-postmortem
+
+	Las trazas quedan en /var/log/aorus-egpu/traces/<fecha>-<nombre>/
+	  10-breadcrumbs.log  <- la ÚLTIMA línea es el paso sospechoso
+	  30-watch.log        <- estado del hardware hasta el último instante vivo
+	USAGE
+}
+
+cmd="" rest=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --interval) shift; export AORUS_WATCH_INTERVAL="${1:-2}" ;;
+    -h|--help)  usage; exit 0 ;;
+    --)         shift; rest+=("$@"); break ;;
+    -*)         printf 'opción desconocida: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    *)          if [ -z "$cmd" ]; then cmd="$1"; else rest+=("$1"); fi ;;
+  esac
+  shift
+done
+
+# Las trazas van a /var/log, así que necesitamos root. Se eleva antes de abrir
+# la traza para que todo el directorio tenga un dueño coherente.
+if [ "$(id -u)" -ne 0 ]; then
+  # `sudo -E` falla en sudoers que no permiten preservar el entorno completo
+  # (aqui es el caso: avisa y lo ignora). Se reenvian solo las variables del
+  # proyecto, con `env`, y los argumentos como array -> sin word splitting.
+  declare -a fwd=()
+  for v in AORUS_LIB_ROOT AORUS_TRACE_ROOT AORUS_WATCH_INTERVAL AORUS_DEBUG; do
+    [ -n "${!v:-}" ] && fwd+=("$v=${!v}")
+  done
+  declare -a argv=("$cmd")
+  [ "${#rest[@]}" -gt 0 ] && argv+=(-- "${rest[@]}")
+  exec sudo -- env "${fwd[@]}" "$0" "${argv[@]}"
+fi
+
+REPO_BW="$(dirname "$(readlink -f "$0")")/../../tools/egpu-bandwidth"
+
+case "$cmd" in
+  bandwidth)
+    bw=""
+    for c in /usr/local/bin/egpu-bandwidth "$REPO_BW" "$(command -v egpu-bandwidth 2>/dev/null)"; do
+      [ -n "$c" ] && [ -x "$c" ] && { bw="$c"; break; }
+    done
+    if [ -z "$bw" ]; then
+      log_err "no encuentro el binario egpu-bandwidth."
+      # El paquete instala el FUENTE (no un ELF: es Architecture: all), así que
+      # se indica la orden exacta según de dónde venga.
+      if [ -r /usr/share/aorus-egpu/egpu-bandwidth.cu ]; then
+        log_err "Compílalo:  nvcc -O2 -o /usr/local/bin/egpu-bandwidth \\"
+        log_err "              /usr/share/aorus-egpu/egpu-bandwidth.cu"
+      else
+        log_err "Compílalo:  nvcc -O2 -o tools/egpu-bandwidth tools/egpu-bandwidth.cu"
+      fi
+      exit 69
+    fi
+    forensics_probe "bandwidth" "$bw"
+    ;;
+  load)
+    secs="${rest[0]:-60}"
+    # Carga sostenida sin dependencias de compilación: nvidia-smi en bucle no
+    # genera tráfico PCIe suficiente, así que se usa el propio medidor de ancho
+    # de banda repetido, que sí ejercita el enlace (el caso que cuelga).
+    bw=""
+    for c in /usr/local/bin/egpu-bandwidth "$REPO_BW"; do
+      [ -x "$c" ] && { bw="$c"; break; }
+    done
+    [ -n "$bw" ] || { log_err "necesito tools/egpu-bandwidth compilado para la carga."; exit 69; }
+    # El bucle sale 0 al cumplirse el plazo. `timeout` lleva holgura (+60 s)
+    # para que solo dispare si una iteracion se CUELGA de verdad -> rc 124
+    # sigue significando "colgado", no "termino bien".
+    #
+    # Las comillas SIMPLES son intencionadas: `$(date +%s)` y `$end` tienen que
+    # expandirse en el `sh` INTERNO en cada iteracion, no una sola vez aqui.
+    # Solo $secs y $bw se interpolan desde fuera, cerrando y reabriendo la cita.
+    # shellcheck disable=SC2016
+    forensics_probe "load-${secs}s" timeout "$((secs + 60))" \
+      sh -c 'end=$(( $(date +%s) + '"$secs"' )); while [ "$(date +%s)" -lt "$end" ]; do '"$bw"' >/dev/null 2>&1 || exit 1; done; exit 0' 
+    ;;
+  status|'')
+    forensics_probe "status" true
+    ;;
+  run)
+    [ "${#rest[@]}" -gt 0 ] || { log_err "falta el comando tras --"; usage >&2; exit 2; }
+    forensics_probe "run" "${rest[@]}"
+    ;;
+  *)
+    printf 'comando desconocido: %s\n' "$cmd" >&2; usage >&2; exit 2 ;;
+esac

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# aorus-egpu-postmortem — recoge, DESPUÉS de reiniciar tras un cuelgue, todo lo
+# que sobrevivió: la última traza de aorus-egpu-probe, el volcado de pstore
+# (dmesg del kernel preservado por ramoops) y el journal del arranque anterior.
+#
+# Deja un único directorio con un 00-RESUMEN.txt por el que empezar a mirar.
+set -uo pipefail
+
+for _root in "$(dirname "$(readlink -f "$0")")/.." /usr/lib/aorus-egpu; do
+  if [ -r "$_root/bootstrap.sh" ]; then . "$_root/bootstrap.sh"; break; fi
+done
+if ! declare -F aorus_use >/dev/null; then
+  printf 'aorus-egpu-postmortem: no encuentro bootstrap.sh\n' >&2; exit 70
+fi
+aorus_use app/forensics
+
+# Validacion de argumentos ANTES de escalar a root: la version anterior
+# ignoraba cualquier opcion desconocida y ejecutaba el postmortem de todas
+# formas, escalando privilegios. Una opcion que no se entiende es un error de
+# uso (rc 2), no una invitacion a actuar.
+case "${1:-}" in
+  '') : ;;                       # sin argumentos: comportamiento normal
+  -h|--help)
+    cat <<-USAGE
+	aorus-egpu-postmortem — recoge las pruebas tras un cuelgue del host
+
+	Uso:  sudo aorus-egpu-postmortem
+
+	Junta en /var/log/aorus-egpu/postmortem/<fecha>/:
+	  00-RESUMEN.txt   las últimas migas de pan y muestras (empieza aquí)
+	  ultima-traza/    la traza completa de la última prueba
+	  pstore-*/        dmesg del kernel preservado a través del reinicio
+	  10-journal-boot-anterior.log
+	USAGE
+    exit 0 ;;
+  *)
+    printf 'aorus-egpu-postmortem: argumento no reconocido: %s\n' "$1" >&2
+    printf 'Uso: sudo aorus-egpu-postmortem   (--help para mas detalle)\n' >&2
+    exit 2 ;;
+esac
+
+if [ "$(id -u)" -ne 0 ]; then
+  # Igual que en aorus-egpu-probe: `sudo -E` no esta permitido aqui, asi que se
+  # reenvian solo las variables del proyecto.
+  declare -a fwd=()
+  for v in AORUS_LIB_ROOT AORUS_TRACE_ROOT AORUS_PSTORE_ARCHIVE AORUS_DEBUG; do
+    [ -n "${!v:-}" ] && fwd+=("$v=${!v}")
+  done
+  exec sudo -- env "${fwd[@]}" "$0" "$@"
+fi
+forensics_postmortem

@@ -1,0 +1,96 @@
+#!/bin/sh
+# postinst — apply baseline kernel args, load udev rules + units, and put the
+# eGPU in BOOT-SAFE "hotplug-only" mode (v0.4.0):
+#   * boltd policy de la box AORUS → manual: deja de auto-autorizarse en arranque.
+#   * aorus-egpu-hotplug-ready.service: crea el flag que gatea la regla 79, así
+#     la autorización solo ocurre en un hotplug REAL del escritorio.
+# Resultado: en arranque (con o sin cable) la eGPU queda DORMIDA y la GPU interna
+# nunca se envenena; se activa sola al reconectar el cable (plug-and-play).
+set -e
+
+regen_grub() {
+	if command -v update-grub >/dev/null 2>&1; then
+		update-grub
+	elif command -v grub-mkconfig >/dev/null 2>&1; then
+		grub-mkconfig -o /boot/grub/grub.cfg
+	fi
+}
+
+# Fija la política de boltd de la box AORUS a "manual" (reversible en postrm).
+# Sin esto, boltd la auto-autoriza en cada arranque por su cuenta y el gate udev
+# no bastaría. Se localiza por nombre para no hardcodear el uuid.
+set_bolt_manual() {
+	command -v boltctl >/dev/null 2>&1 || return 0
+	uuid=$(boltctl list 2>/dev/null | awk '/AORUS|RTX506T AI BOX/{f=1} f&&/uuid:/{print $NF; exit}')
+	if [ -z "$uuid" ]; then
+		echo "  AVISO: box AORUS no vista por boltd; el gate udev + service igual protege el arranque."
+		return 0
+	fi
+	if boltctl config device.policy "$uuid" manual >/dev/null 2>&1; then
+		echo "  boltd: policy de la eGPU ($uuid) -> manual (no se auto-autoriza en arranque)"
+	else
+		echo "  AVISO: no pude fijar boltd policy=manual; hazlo a mano:"
+		echo "         sudo boltctl config device.policy $uuid manual"
+	fi
+}
+
+case "$1" in
+	configure)
+		regen_grub
+		set_bolt_manual
+		# Cargar units + reglas sin reboot. Arrancamos hotplug-ready ANTES del
+		# udev trigger para que el flag exista y, si la eGPU ya está conectada y
+		# sana en el escritorio, se autorice y se bindee como un hotplug normal.
+		systemctl daemon-reload >/dev/null 2>&1 || true
+		systemctl enable --now aorus-egpu-hotplug-ready.service >/dev/null 2>&1 || true
+		if command -v udevadm >/dev/null 2>&1; then
+			udevadm control --reload-rules >/dev/null 2>&1 || true
+			# Trigger both subsystems: thunderbolt (authorize an already-
+			# connected box, now gated by the flag) and pci (power rule / fix-bar0).
+			udevadm trigger --subsystem-match=thunderbolt >/dev/null 2>&1 || true
+			udevadm trigger --subsystem-match=pci >/dev/null 2>&1 || true
+		fi
+		cat <<'EOF'
+
+aorus-egpu-config 0.5.4 installed (boot-safe hotplug-only mode).
+
+  En arranque (con o sin el cable puesto):
+    - la eGPU queda DORMIDA (boltd policy=manual + gate udev hotplug-ready)
+    - la GPU interna y nvidia-smi NUNCA se envenenan, de forma determinista
+    - kernel args baseline:
+        pci=realloc,hpmmioprefsize=16G
+      (v0.5.1: reservan 16 GiB prefetchable en el puente TB hotplug para que la
+       BAR1 del eGPU quepa al enchufarla; el puente intermedio recibía solo 2 MiB
+       y la GPU no enumeraba. resource_alignment RETIRADO en 0.5.1: inflaba BAR0
+       a 16 GiB y nvidia fallaba el probe. host_reset=false sigue RETIRADO)
+    - REQUIERE REINICIAR para que los nuevos kernel args tomen efecto.
+
+  Plug-and-play en caliente (escritorio ya arrancado):
+    - conecta/reconecta el cable -> se autoriza, fix-BAR0 corre y se bindea sola
+    - si el enlace sale muerto, se EXPULSA del bus (no envenena); reconecta otra vez
+    - la box que quedó puesta desde el arranque: actívala con  sudo aorus-egpu-connect
+    - verifica:  aorus-egpu-status ; nvidia-smi -L
+
+  KEEP-RESIDENT (v0.5.3): al conectar la eGPU se activa NVIDIA persistence mode
+  SOLO en ella (10de:2d04) -> el adapter no se descarga al quedar idle, así el
+  enlace Thunderbolt no cae a Gen1 y el GSP no falla la re-inicialización (era
+  la causa de que la eGPU desapareciera de nvidia-smi tras un rato). La GPU
+  interna NUNCA se toca. Verifica:  nvidia-smi -i <bus-id-eGPU> -q | grep Persistence
+
+  SOLO-CÓMPUTO (v0.5.2): la eGPU se saca de seat0 (regla 82) para que el
+  compositor Wayland NO la use como pantalla -> al desconectarla en caliente ya
+  no congela el escritorio. Toma efecto tras REINICIAR / re-login de la sesión.
+  CUDA/IA no se ve afectado (va por el render node). Si algún día quieres
+  conectarle un MONITOR, retira 82-aorus-egpu-no-display.rules.
+
+  NOTA: el firmware puede COLGAR EL POST si el cable está puesto AL ENCENDER.
+  Eso es de la BIOS, no del SO: si pasa, arranca sin el cable y conéctalo luego.
+
+  Revertir TODO (restaura boltd policy=auto):  sudo apt remove aorus-egpu-config
+
+EOF
+		;;
+	abort-upgrade | abort-remove | abort-deconfigure) ;;
+esac
+
+exit 0
