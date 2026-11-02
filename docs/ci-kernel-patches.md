@@ -153,6 +153,71 @@ culpa del parche cuando el problema es el árbol base.
 **Nunca se clona nada.**
 Sin cache, la sección se omite con la instrucción de cómo generarlo.
 
+### 7b. Aplicación de la mitad `kernel-open` sobre el driver instalado
+
+La sección 7 es la buena, y vive en `skip` **permanente**:
+casi nadie tiene el clon de ~1 GB cacheado.
+Un `skip` permanente es un agujero —
+la serie puede dejar de aplicar y el CI sigue en verde —
+y el agujero se hizo visible cuando una revisión externa reportó
+*"`0032` no aplica, el paquete no se puede construir"*
+y el CI no tenía forma ni de confirmarlo ni de desmentirlo.
+
+Esta sección cierra la mayor parte de ese hueco **sin descargar nada**.
+El paquete `nvidia-kernel-source-NNN-open` de Canonical ya deja en
+`/usr/src/nvidia-<ver>/` el árbol `kernel-open` **aplanado**
+(su contenido en la raíz, sin el prefijo `kernel-open/`), unos 29 MB que ya
+están en disco.
+
+El truco está en no hacerle cirugía al diff.
+El árbol se copia dentro de `<tmp>/kernel-open/`, que reproduce el layout
+upstream, y el parche se aplica **entero** con `-p1` y
+`--include='kernel-open/*'`.
+Filtrar con `--include` es trabajo de git, que entiende cabeceras
+`diff --git`, diffs desnudos, `new file mode` y creaciones con
+`--- /dev/null`.
+
+Extraer la mitad `kernel-open` a mano con `awk` o `filterdiff` parece
+equivalente y **no lo es**:
+pierde las líneas de metadatos y produce fallos fantasma indistinguibles de un
+defecto del parche.
+Aplicar con `-p2` sobre el árbol plano tiene el mismo problema por otra vía:
+`/dev/null` no se puede despojar de dos componentes, así que toda creación de
+fichero falla.
+Las dos trampas se recorrieron antes de dar con `--include`, y las dos
+producían un "`0032` no aplica" que no era real.
+
+Cobertura actual, sobre `595.99.02` instalado:
+
+| Resultado | Parches |
+|---|---|
+| aplican en orden | 23 |
+| fallan solo por la cadena de versión (`0005`, `0025`) | 2 |
+| sin mitad `kernel-open` (solo RM, `src/nvidia/**`) | 9 |
+
+Lo que **no** cubre, y no lo disimula:
+
+- La mitad RM (`src/nvidia/**`).
+  Ningún paquete de Canonical entrega ese árbol, así que esos 9 parches aquí
+  solo se cuentan.
+- `version.mk`, que upstream vive en la raíz del repo y no dentro de
+  `kernel-open/`.
+- El árbol instalado puede no ser del tag de la serie.
+  Por eso la sección **clasifica** los fallos en vez de tratarlos todos igual.
+
+La clasificación es la pieza que le da valor:
+
+- `VERSION_DRIFT_OK="0005 0025"` son los parches cuyo único ancla es
+  `NV_VERSION_STRING` hardcodeado en `Kbuild`.
+  Si el árbol no es el del tag, fallan **por diseño** y se degradan a `WARN`.
+- Cualquier otro fallo es `FAIL`, porque un parche cuyo contexto lo añade un
+  parche **anterior** de la serie no depende de la versión del árbol:
+  falla contra cualquier tag.
+
+Variables:
+`CI_PATCH_APPLY_LOCAL=0` la desactiva;
+`CI_LOCAL_TREE=<ruta>` apunta a otro árbol.
+
 ### 8. `tools/lint-identifiers.sh`: por qué no se invoca
 
 El script existe y comprueba justo lo que interesa
@@ -433,10 +498,13 @@ no lleva comentario de C ni cabecera `Subject:`.
 - **Que los parches compilen.**
   Requiere el árbol upstream y un build de DKMS;
   queda para `scripts/build-dkms.sh`, no para el CI.
-- **Que el contexto de los diffs case**, salvo que exista el cache
-  `build/ogkm`.
-  Sin árbol, `git apply --numstat` valida la *forma* del diff, no que las
-  líneas de contexto existan en el fichero destino.
+- **Que el contexto de la mitad RM (`src/nvidia/**`) case.**
+  La mitad `kernel-open` sí se comprueba contra el driver instalado
+  (sección 7b), y la serie completa contra el cache `build/ogkm`
+  (sección 7) cuando existe.
+  Pero el árbol RM no lo entrega ningún paquete, así que para 9 parches
+  `git apply --numstat` sigue validando la *forma* del diff y no que las
+  líneas de contexto existan.
   Un parche puede estar perfectamente formado y no aplicar.
 - **El rebase pendiente de 595.71.05 a 595.99.02.**
   [`docs/what-actually-works.md`](./what-actually-works.md) marca

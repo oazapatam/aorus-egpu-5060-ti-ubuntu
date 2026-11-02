@@ -639,6 +639,131 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 6b. Aplicación de la mitad kernel-open sobre el driver INSTALADO
+# ---------------------------------------------------------------------------
+ci_section "aplicación de la mitad kernel-open sobre el driver instalado"
+
+# POR QUÉ EXISTE ESTA SECCIÓN SI YA HAY UNA 6:
+# la sección 6 es la buena -serie completa, árbol del tag exacto-, pero vive en
+# skip PERMANENTE porque exige un clon de ~1 GB que nadie tiene cacheado. Un
+# skip permanente es un agujero: la serie puede dejar de aplicar y el CI sigue
+# en verde, sin que nadie se entere. Eso ya pasó: una revisión externa reportó
+# "0032 no aplica, el paquete no se puede construir" y el CI no tenía forma de
+# confirmarlo ni de desmentirlo.
+#
+# El paquete nvidia-kernel-source-NNN-open de Canonical ya deja en
+# /usr/src/nvidia-<ver>/ el árbol kernel-open APLANADO (su contenido en la
+# raíz, sin el prefijo kernel-open/). Son ~29 MB que ya están en disco.
+#
+# CÓMO SE USA SIN HACER CIRUGÍA AL DIFF:
+# se copia el árbol DENTRO de <tmp>/kernel-open/, que reproduce el layout
+# upstream, y se aplica el parche entero con -p1 y `--include='kernel-open/*'`.
+# Filtrar con --include es de git: entiende cabeceras `diff --git`, diffs
+# desnudos, `new file mode` y creaciones con `--- /dev/null`. Extraer la mitad
+# kernel-open a mano con awk/filterdiff parece equivalente y NO lo es: pierde
+# las líneas de metadatos y produce fallos fantasma que se confunden con
+# defectos del parche. (Aplicar con -p2 sobre el árbol plano tiene el mismo
+# problema: /dev/null no se puede despojar de dos componentes.)
+#
+# LO QUE NO CUBRE, dicho claro:
+#   - la mitad RM (src/nvidia/**): ningún paquete de Canonical entrega ese
+#     árbol, así que esos parches aquí solo se cuentan, no se prueban.
+#   - version.mk: upstream vive en la raíz del repo, no dentro de kernel-open.
+#   - si el árbol instalado no es del tag de la serie, un fallo por contexto de
+#     NVIDIA es deuda de REBASE, no un defecto del parche. Los dos casos se
+#     informan distinto: deuda -> WARN, defecto -> FAIL.
+#
+# Un fallo cuyo contexto lo añade un parche ANTERIOR de la serie no depende de
+# la versión: es un defecto del parche y falla contra cualquier tag. Por eso
+# solo los parches de VERSION_DRIFT_OK pueden degradarse a WARN.
+
+# Parches cuyo único ancla es la cadena de versión hardcodeada en Kbuild. Si el
+# árbol instalado no es $NV_VERSION, fallan POR DISEÑO y no dicen nada del
+# estado de la serie.
+VERSION_DRIFT_OK="0005 0025"
+
+LOCAL_TREE="${CI_LOCAL_TREE:-}"
+if [ -z "$LOCAL_TREE" ]; then
+  for _cand in "/usr/src/nvidia-$NV_VERSION" /usr/src/nvidia-*; do
+    [ -f "$_cand/Kbuild" ] && [ -f "$_cand/nvidia-uvm/uvm.c" ] || continue
+    LOCAL_TREE="$_cand"; break
+  done
+fi
+
+if [ "${CI_PATCH_APPLY_LOCAL:-1}" = "0" ]; then
+  ci_skip "desactivado con CI_PATCH_APPLY_LOCAL=0"
+elif [ "$have_git" -eq 0 ]; then
+  ci_skip "falta 'git'"
+elif [ -z "$LOCAL_TREE" ]; then
+  ci_skip "sin árbol kernel-open en /usr/src/nvidia-* — instálalo con: sudo apt install nvidia-kernel-source-595-open (o apunta CI_LOCAL_TREE a uno)"
+else
+  # La línea es:  ccflags-y += -DNV_VERSION_STRING=\"595.99.02\"
+  # Partir por '"' deja la barra invertida del escape pegada al campo, así que
+  # hay que quitarla; sin esto la versión se imprime como "595.99.02\".
+  tree_ver="$(awk -F'"' '/NV_VERSION_STRING/{gsub(/\\/,"",$2); print $2; exit}' \
+              "$LOCAL_TREE/Kbuild" 2>/dev/null)"
+  tree_ver="${tree_ver:-desconocida}"
+  if [ "$tree_ver" = "$NV_VERSION" ]; then
+    ci_ok "árbol local $LOCAL_TREE en $tree_ver (= el tag de la serie)"
+  else
+    ci_warn_with "el árbol local está en $tree_ver y la serie apunta a $NV_VERSION" \
+      "$LOCAL_TREE" \
+      "Los fallos por contexto de NVIDIA son deuda de rebase, no defectos de los" \
+      "parches. Los fallos por contexto que añaden parches ANTERIORES sí son" \
+      "defectos, y esos siguen saliendo en rojo."
+  fi
+
+  work="$(mktemp -d "${TMPDIR:-/tmp}/ci-ogkm-local.XXXXXX")"
+  mkdir -p "$work/kernel-open"
+  if ! cp -a "$LOCAL_TREE/." "$work/kernel-open/" 2>/dev/null; then
+    ci_fail "no pude copiar $LOCAL_TREE a $work"
+  elif ! git -C "$work" init -q . 2>/dev/null \
+     || ! git -C "$work" add -A >/dev/null 2>&1 \
+     || ! git -C "$work" -c user.email=ci@local -c user.name=ci commit -qm base >/dev/null 2>&1; then
+    ci_fail "no pude preparar el árbol de trabajo en $work"
+  else
+    applied_local=0; norm=0; drift=(); broken=()
+    for p in "${ACTIVE[@]}"; do
+      num="$(basename "$p" | cut -c1-4)"
+      # ¿Tiene este parche alguna ruta bajo kernel-open/? Si no, aquí no hay
+      # nada que probar y `git apply --include` devolvería 0 sin aplicar nada:
+      # un "ok" falso que inflaría la cobertura.
+      if ! grep -qE '^(\+\+\+ b/|diff --git a/)kernel-open/' "$p"; then
+        norm=$((norm + 1)); continue
+      fi
+      rc_flag=()
+      case " $RECOUNT_EXPECTED " in *" $num "*) rc_flag=(--recount) ;; esac
+      if out="$(git -C "$work" apply "${rc_flag[@]}" --include='kernel-open/*' \
+                  --whitespace=nowarn "$(pwd)/$p" 2>&1)"; then
+        applied_local=$((applied_local + 1))
+      else
+        case " $VERSION_DRIFT_OK " in
+          *" $num "*) [ "$tree_ver" != "$NV_VERSION" ] && drift+=("$num") || broken+=("$num: $out") ;;
+          *) broken+=("$(basename "$p"): $(printf '%s' "$out" | grep -v '^Skipped' | head -3 | tr '\n' ' ')") ;;
+        esac
+      fi
+    done
+
+    if [ "${#broken[@]}" -gt 0 ]; then
+      ci_fail "la mitad kernel-open de la serie se rompe en ${#broken[@]} parche(s)" \
+        "${broken[@]}" "" \
+        "Los $applied_local anteriores sí aplicaron en orden. Un fallo aquí NO es" \
+        "deuda de versión salvo que el ancla sea la cadena NV_VERSION_STRING:" \
+        "es este parche contra el estado que dejan los previos. Rebásalo."
+    else
+      ci_ok "$applied_local parches aplican en orden sobre la mitad kernel-open de $tree_ver"
+    fi
+    if [ "${#drift[@]}" -gt 0 ]; then
+      ci_warn_with "${#drift[@]} parche(s) fallan solo por la cadena de versión: ${drift[*]}" \
+        "Anclan en Kbuild con NV_VERSION_STRING=\"$NV_VERSION\" y el árbol dice \"$tree_ver\"." \
+        "Es deuda de rebase conocida y acotada; no dice nada del resto de la serie."
+    fi
+    ci_ok "$norm parches sin mitad kernel-open (solo RM, src/nvidia/**): no cubiertos aquí"
+  fi
+  rm -rf "$work"
+fi
+
+# ---------------------------------------------------------------------------
 # 7. tools/lint-identifiers.sh
 # ---------------------------------------------------------------------------
 ci_section "tools/lint-identifiers.sh"
