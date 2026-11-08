@@ -1,0 +1,1340 @@
+#!/usr/bin/env python3
+"""egpu-oc-edge — mide el offset de reloj MÁXIMO que la eGPU sostiene sin
+corromper un solo bit.
+
+PARA QUÉ EXISTE
+--------------
+`aorus-egpu-oc` sabe APLICAR un offset y sabe NEGARSE a aplicarlo sin
+evidencia, pero no sabe BUSCAR el límite: su gate es una pregunta de sí/no
+sobre un valor que alguien ya eligió. Esta herramienta responde la otra
+pregunta —¿cuál es el valor más alto que esta tarjeta aguanta calculando
+bien?— y lo hace midiendo, no leyendo registros ni creyéndose a `nvidia-smi`.
+
+No se empaqueta (vive en tools/, como el resto de la instrumentación) por dos
+motivos: escribe relojes POR ENCIMA de stock de forma deliberada y repetida, y
+su salida es una medición de laboratorio, no una capacidad del sistema.
+
+QUÉ SIGNIFICA "SIN DAÑAR LA INTEGRIDAD DE LOS BITS"
+--------------------------------------------------
+Esta tarjeta NO tiene ECC (`ecc.mode.current=[N/A]`). Un offset demasiado
+agresivo no se cae: CALCULA MAL. El kernel CUDA termina, nadie ve un error, y
+el resultado trae bits distintos de los que debía. Así que el criterio de esta
+herramienta no es "no se colgó" sino "ni un bit distinto", comprobado
+BIT A BIT contra resultados analíticamente conocidos.
+
+Y con una honestidad que hay que leer antes de usar el número que imprime:
+hay un caso documentado en Blackwell con GDDR7 donde un GEMM de entradas fijas
+devolvió un resultado distinto en la iteración 274.400 mientras un memtest de
+VRAM pasaba 1.252 pasadas limpias
+(<https://forums.developer.nvidia.com/t/silent-cuda-compute-corruption-on-rtx-pro-6000-blackwell/381759>).
+Ninguna ventana de minutos puede descartar eso. Por tanto el resultado de esta
+herramienta se enuncia SIEMPRE con su cobertura —"cero errores en N
+iteraciones sobre T segundos, n=K"— y nunca como "este offset es seguro".
+Lo que mide es el BORDE GRUESO: dónde la tarjeta empieza a fallar de forma
+detectable en minutos. El margen que hay que dejar por debajo de ese borde es
+una decisión de riesgo, no un dato, y por eso se imprime aparte.
+
+MÉTODO (la disciplina de CLAUDE.md, aplicada)
+---------------------------------------------
+  1. CONTROL a offset 0. Si la tarjeta no calcula bien SIN tocar nada, todo lo
+     que venga después no mide el offset: mide otra cosa. Sin control que pase,
+     se aborta.
+  2. UNA VARIABLE POR PRUEBA. Primero el núcleo con la memoria a 0, luego la
+     memoria con el núcleo a 0. La combinación de los dos es una TERCERA
+     variable y se mide al final, por separado.
+  3. BARATO PRIMERO. Escalera gruesa hasta el primer fallo, y solo entonces
+     bisección fina entre el último paso bueno y el primero malo.
+  4. n>=3 PARA RESOLVER. El candidato que sale de la bisección se confirma con
+     repeticiones largas; si una sola falla, el borde está más abajo y se baja
+     un escalón.
+  5. EFECTO MEDIDO, NO SUPUESTO. Cada paso muestrea reloj, potencia,
+     temperatura y flags de throttle bajo carga. Un offset que pasa SIN mover
+     el reloj no es margen: es un offset que el driver se ha comido, y se
+     marca como tal (`efecto=ninguno`). Confundir las dos cosas daría un
+     "+6000 MHz estable" que no significa nada.
+
+SEGURIDAD (invariantes, no sugerencias)
+---------------------------------------
+  - Gate R4: toda escritura va por `src/adapters/gpu/nvml-offsets.py`, que
+    reconfirma el device-id 0x2d04 por el handle que NVML resuelve del bus-id y
+    aborta si resuelve a la interna (0x2c39). Esta herramienta no escribe NVML
+    por su cuenta: pasa por el mismo sitio que el paquete.
+  - Gate de enlace: por capacidad negociada (`pcie.link.gen.max`), nunca por
+    `current_link_speed` —en reposo siempre dice Gen1—. Se revalida ANTES de
+    cada paso, no solo al arrancar: H23 dice que el túnel se cae en reposo, y
+    escribir justo después de una caída es exactamente el escenario que
+    congeló el host. No hay `--force`: en esta herramienta el enlace degradado
+    no es un riesgo asumible, es el fin de la medición.
+  - Reversibilidad: los offsets vuelven a 0 al salir —final normal, excepción,
+    Ctrl-C o SIGTERM— y la vuelta se CONFIRMA releyendo. Un offset NVML no
+    sobrevive a un reinicio, pero sí a esta herramienta si no se limpia.
+  - Cuelgue: si el hijo que mide no vuelve, se ABORTA sin reintentar. Martillear
+    un eGPU semi-roto lo deja wedged en estado-D (CLAUDE.md).
+  - Cada paso se escribe en disco con fsync ANTES de ejecutarse, así que si el
+    host se congela la última línea de `10-breadcrumbs.log` es el paso culpable.
+    Aun así, lánzala envuelta:
+        sudo src/bin/aorus-egpu-probe run -- <python> tools/egpu-oc-edge
+  - El offset se RELEE después de cada paso. Si cambió a mitad (un reset de GPU
+    los borra), el paso NO cuenta como "pasa": cuenta como inválido, porque
+    habría medido la tarjeta sin el offset puesto.
+  - Un `Xid 79` / "fallen off the bus" no se achaca al offset: es la firma de
+    H23 (el túnel entero se cae). La medición queda contaminada y se aborta en
+    vez de apuntar un fallo que no es del reloj. El veredicto formal lo da
+    `aorus-egpu-health`.
+
+ARQUITECTURA (padre/hijo, y por qué)
+------------------------------------
+El padre orquesta y es el ÚNICO que escribe en el hardware. Cada medición corre
+en un proceso HIJO que importa torch y no escribe nada. Tres razones:
+  - Un offset agresivo envenena el contexto CUDA (un `unspecified launch
+    failure` no se "limpia"): en el mismo proceso, el paso siguiente mediría un
+    contexto roto. Un hijo por paso aísla eso por construcción.
+  - Si el hijo muere —Xid, SIGKILL, segfault— el padre lo registra como fallo
+    duro y sigue vivo para dejar la tarjeta a 0.
+  - Cada paso es independiente: ninguna medición hereda estado de la anterior,
+    que es lo que exige "una variable por prueba".
+El precio es la inicialización de CUDA por paso (varios segundos sobre el túnel
+Thunderbolt). Se paga: la alternativa es un número medido sobre un contexto ya
+corrupto.
+
+Las dos piezas que reutiliza, a propósito, en vez de reimplementarlas:
+  - `src/adapters/gpu/nvml-offsets.py`  -> escribir el offset (con el gate R4 y
+    la reconfirmación por relectura).
+  - `src/adapters/verify/gemm-integrity.py` -> las fases bit-exactas (GEMM y
+    patrón en VRAM). Tienen que ser LAS MISMAS que usa el gate del paquete: si
+    el borde se midiera con otro verificador, el número no autorizaría nada.
+
+Uso:
+    tools/egpu-oc-edge --dry-run                 # el plan, sin tocar nada
+    sudo <venv>/bin/python -I tools/egpu-oc-edge # la medición completa
+    ... --domains gpu --gpu-max 300              # solo núcleo, hasta +300
+"""
+# Antes de cualquier import propio: este programa importa el verificador del
+# paquete POR RUTA (src/adapters/verify/gemm-integrity.py), y python escribiría
+# el .pyc junto al fuente. Ese __pycache__ se colaba en el payload de los .deb
+# al copiar src/adapters/ y lo marcaba lintian. Lo cortamos en el origen.
+import sys
+
+sys.dont_write_bytecode = True
+
+import argparse
+import atexit
+import importlib.util
+import json
+import os
+import signal
+import statistics
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+NVML_HELPER = REPO / "src" / "adapters" / "gpu" / "nvml-offsets.py"
+VERIFY_HELPER = REPO / "src" / "adapters" / "verify" / "gemm-integrity.py"
+BOOTSTRAP = REPO / "src" / "bootstrap.sh"
+
+EGPU_DEVICE_ID = 0x2D04
+INTERNAL_DEVICE_ID = 0x2C39
+
+SMI_TIMEOUT = 12          # igual que AORUS_SMI_TIMEOUT del adaptador
+NVML_TIMEOUT = 20         # igual que AORUS_NVML_TIMEOUT
+RC_HUNG = 124
+CHILD_MARKER = "OCEDGE_JSON "
+# Procesos que ni SIGKILL pudo cerrar: se ABANDONAN y se nombran en el informe.
+# Ver run_cmd() para el por qué.
+ABANDONED = []
+# Margen sobre el presupuesto del hijo: importar torch, inicializar CUDA sobre
+# el túnel y llenar la VRAM pasa antes de que cuente el primer kernel.
+CHILD_MARGIN_S = 180
+
+# Estados de un paso. "invalido" NUNCA se lee como "pasa": es falta de
+# evidencia, y sin evidencia no se sube el offset.
+PASS, FAIL_NUM, FAIL_HARD, FAIL_TUNNEL, INVALID = (
+    "pasa", "falla-numerica", "falla-dura", "falla-tunel", "invalido")
+
+
+# ---------------------------------------------------------------------------
+# utilidades comunes
+# ---------------------------------------------------------------------------
+def grid_floor(value, res):
+    """Baja `value` al múltiplo de `res` inmediatamente inferior o igual."""
+    return (int(value) // int(res)) * int(res)
+
+
+def kill_grace(budget):
+    """Gracia entre SIGTERM y SIGKILL. Espejo de domain_proc_kill_grace().
+
+    La regla vive en src/domain/proc.sh, que es su única fuente y la que lleva
+    test. Aquí está duplicada porque esto es python y aquello es bash; si una
+    cambia, cambian las dos.
+    """
+    try:
+        budget = int(budget)
+    except (TypeError, ValueError):
+        return 2
+    return max(2, min(10, budget // 4))
+
+
+def run_cmd(argv, timeout):
+    """(rc, stdout, stderr). rc 124 si agotó el tiempo, como el resto del repo.
+
+    NO USA subprocess.run(timeout=...), Y ESO ES EL ARREGLO DE UN DEFECTO REAL.
+    El 2026-11-07, buscando el borde del reloj, el hijo que medía quedó ZOMBI
+    IRREAPEABLE tras un `Xid 175` + `Xid 154` (`GPU Reset Required`): su líder
+    había salido pero un hilo suyo seguía atascado dentro del driver, así que
+    el núcleo no podía cerrarlo. `subprocess.run` mata al hijo cuando expira el
+    plazo y DESPUÉS lo espera —sin plazo—, de modo que el padre se quedó en
+    `wait4()` para siempre. Consecuencia: no se registró el ABORTO, los offsets
+    NO volvieron a 0, no hubo informe y el barrido pareció "vivo" indefinidamente.
+    El cuelgue de la tarjeta era lo que se estaba buscando; perder la reacción
+    al cuelgue no.
+
+    Garantía de aquí, y es un tope duro: esta función vuelve en
+    `timeout + 2*gracia` como máximo, pase lo que pase.
+      1. SIGTERM al agotar el presupuesto, y una gracia para que el hijo vacíe
+         su salida —puede traer su resumen JSON ya calculado—;
+      2. SIGKILL al GRUPO si sigue vivo (sesión propia, así que el grupo es
+         suyo y no arrastra al padre);
+      3. si NI ASÍ se puede reapear, se ABANDONA: se apunta en ABANDONED, se
+         devuelve 124 y se sigue. Ningún programa de usuario saca a un hilo del
+         estado-D; insistir es el martilleo que CLAUDE.md prohíbe, y esperarlo
+         es el cuelgue que acabamos de arreglar. El proceso se lo lleva el
+         reset del dispositivo.
+
+    La salida va a FICHEROS TEMPORALES, no a tuberías: de un hijo abandonado no
+    se puede leer una tubería sin volver a bloquearse, que es el mismo fallo por
+    otra puerta. Con ficheros, lo que alcanzó a escribir se lee igual.
+    """
+    grace = kill_grace(timeout)
+    try:
+        out_f = tempfile.TemporaryFile(mode="w+", errors="replace")
+        err_f = tempfile.TemporaryFile(mode="w+", errors="replace")
+    except OSError as exc:
+        return 1, "", f"{type(exc).__name__}: {exc}"
+
+    def drain():
+        texts = []
+        for handle in (out_f, err_f):
+            try:
+                handle.seek(0)
+                texts.append(handle.read())
+            except (OSError, ValueError):
+                texts.append("")
+        return texts[0], texts[1]
+
+    def wait_until(proc, limit):
+        while proc.poll() is None and time.time() < limit:
+            time.sleep(0.05)
+        return proc.poll()
+
+    try:
+        try:
+            proc = subprocess.Popen(argv, stdout=out_f, stderr=err_f,
+                                    stdin=subprocess.DEVNULL,
+                                    start_new_session=True)
+        except OSError as exc:
+            return 1, "", f"{type(exc).__name__}: {exc}"
+
+        if wait_until(proc, time.time() + timeout) is not None:
+            out, err = drain()
+            return proc.returncode, out, err
+
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(os.getpgid(proc.pid), sig)
+            except (OSError, ProcessLookupError):
+                try:
+                    proc.send_signal(sig)
+                except OSError:
+                    pass
+            if wait_until(proc, time.time() + grace) is not None:
+                out, err = drain()
+                return RC_HUNG, out, err or f"timeout ({sig.name} lo cerró)"
+
+        ABANDONED.append(proc.pid)
+        out, err = drain()
+        return RC_HUNG, out, (
+            f"{err}[pid {proc.pid} IRREAPEABLE: ni SIGKILL lo cerró, "
+            f"seguramente con un hilo en estado-D dentro del driver. "
+            f"LO ABANDONO para no bloquearme esperándolo; se lo llevará el "
+            f"reset del dispositivo]")
+    finally:
+        for handle in (out_f, err_f):
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
+def smi_query(bus, fields, timeout=SMI_TIMEOUT):
+    """Una fila de nvidia-smi para la GPU en `bus`. None si no se pudo leer.
+
+    Direccionado por BUS-ID, nunca por índice: los índices se reordenan entre
+    arranques y en esta máquina el 0 es la GPU INTERNA.
+    """
+    rc, out, _ = run_cmd(["nvidia-smi", "-i", bus,
+                          f"--query-gpu={','.join(fields)}",
+                          "--format=csv,noheader,nounits"], timeout)
+    if rc == RC_HUNG:
+        return RC_HUNG
+    if rc != 0 or not out.strip():
+        return None
+    return [c.strip() for c in out.strip().splitlines()[0].split(",")]
+
+
+def as_float(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# MODO HIJO: una medición, cero escrituras en el hardware
+# ---------------------------------------------------------------------------
+def load_verifier():
+    """Importa el helper del puerto `verify` por ruta (lleva guion en el nombre).
+
+    Se importa en vez de copiarse para que el borde se mida con EL MISMO
+    verificador que usa el gate de `aorus-egpu-oc`.
+    """
+    spec = importlib.util.spec_from_file_location("aorus_gemm_integrity",
+                                                  VERIFY_HELPER)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class Sampler(threading.Thread):
+    """Muestrea reloj/potencia/temperatura/throttle BAJO CARGA.
+
+    Existe para distinguir "el offset dio margen" de "el offset no hizo nada".
+    Un paso que pasa sin mover el reloj no aporta margen, y decir lo contrario
+    sería el mismo engaño por el que se retiró el perfil `performance`.
+    """
+
+    FIELDS = ("clocks.sm", "clocks.mem", "power.draw", "temperature.gpu",
+              "clocks_throttle_reasons.active")
+
+    def __init__(self, bus, interval=1.0):
+        super().__init__(daemon=True)
+        self.bus = bus
+        self.interval = interval
+        self._stop = threading.Event()
+        self.sm = []
+        self.mem = []
+        self.power = []
+        self.temp = []
+        self.throttle = 0
+        self.read_failures = 0
+        self.hung = False
+
+    def run(self):
+        while not self._stop.is_set():
+            row = smi_query(self.bus, self.FIELDS)
+            if row == RC_HUNG:
+                # nvidia-smi colgado: se deja de muestrear en el acto. Insistir
+                # es martillear la tarjeta, y el muestreo es accesorio.
+                self.hung = True
+                return
+            if row is None or len(row) < 5:
+                self.read_failures += 1
+            else:
+                for dest, raw in ((self.sm, row[0]), (self.mem, row[1]),
+                                  (self.power, row[2]), (self.temp, row[3])):
+                    value = as_float(raw)
+                    if value is not None:
+                        dest.append(value)
+                try:
+                    self.throttle |= int(row[4], 0)
+                except (TypeError, ValueError):
+                    pass
+            self._stop.wait(self.interval)
+
+    def stop(self):
+        self._stop.set()
+        # Tope coherente con el peor caso de run_cmd (presupuesto + 2*gracia):
+        # con el anterior (SMI_TIMEOUT + 5) el join podía rendirse ANTES de que
+        # el muestreador terminara su última lectura y dejar un hilo escribiendo
+        # mientras el paso siguiente ya estaba en marcha.
+        self.join(timeout=SMI_TIMEOUT + 2 * kill_grace(SMI_TIMEOUT) + 2)
+
+    def stats(self):
+        def summarize(series):
+            if not series:
+                return None
+            return {"med": round(statistics.median(series), 1),
+                    "max": round(max(series), 1),
+                    "n": len(series)}
+        return {"sm_mhz": summarize(self.sm),
+                "mem_mhz": summarize(self.mem),
+                "power_w": summarize(self.power),
+                "temp_c": summarize(self.temp),
+                "throttle": f"0x{self.throttle:x}",
+                "sample_failures": self.read_failures,
+                "smi_hung": self.hung}
+
+
+def child_measure(bus, seconds, split):
+    """Una medición completa. Imprime una línea CHILD_MARKER + JSON y sale.
+
+    Códigos de salida: 0 pasa, 1 falla numérica, 2 sin evidencia, 3 fallo duro
+    (excepción del runtime CUDA: offset demasiado agresivo o tarjeta ida).
+    """
+    result = {"status": INVALID, "detail": "", "errors": None,
+              "gemm_errors": None, "gemm_iters": 0,
+              "vram_errors": None, "vram_chunks": 0,
+              "elapsed_s": 0.0, "samples": {}}
+
+    def emit(rc):
+        print(CHILD_MARKER + json.dumps(result), flush=True)
+        return rc
+
+    verifier = load_verifier()
+    if verifier is None:
+        result["detail"] = f"no puedo importar {VERIFY_HELPER}"
+        return emit(2)
+
+    torch = verifier.load_torch()
+    if torch is None:
+        result["detail"] = "sin torch"
+        return emit(2)
+    try:
+        if not torch.cuda.is_available():
+            result["detail"] = "cuda no disponible"
+            return emit(2)
+        ordinal = verifier.pick_ordinal(torch, bus)
+    except Exception as exc:                                # noqa: BLE001
+        result["detail"] = f"cuda_init {type(exc).__name__}: {exc}"
+        return emit(2)
+    if ordinal is None:
+        # NO es "pasa": es que no hemos encontrado la eGPU. Un `cuda:0` aquí
+        # mediría la GPU INTERNA y daría un pass sin haber tocado la externa.
+        result["detail"] = f"ninguna GPU de torch está en {bus}"
+        return emit(2)
+
+    # set_device explícito: las fases llaman a torch.cuda.synchronize() sin
+    # argumento, que sincroniza el dispositivo ACTUAL. Sin esto el actual es el
+    # ordinal 0 —la GPU interna— y los sync no sincronizan lo que se mide.
+    torch.cuda.set_device(ordinal)
+    device = torch.device(f"cuda:{ordinal}")
+    result["ordinal"] = ordinal
+    result["device_name"] = torch.cuda.get_device_name(ordinal)
+
+    sampler = Sampler(bus)
+    sampler.start()
+    start = time.monotonic()
+    try:
+        vram_errors, chunks = verifier.vram_phase(
+            torch, device, ordinal, start + seconds * split)
+        gemm_errors, iters = verifier.gemm_phase(torch, device, start + seconds)
+    except Exception as exc:                                # noqa: BLE001
+        # Un fallo del runtime a mitad es un FALLO DURO del offset, no falta de
+        # evidencia: el offset estaba puesto y la tarjeta no completó el
+        # trabajo. Se distingue del fallo numérico porque es ruidoso.
+        result["status"] = FAIL_HARD
+        result["detail"] = f"{type(exc).__name__}: {exc}"
+        result["elapsed_s"] = round(time.monotonic() - start, 1)
+        sampler.stop()
+        result["samples"] = sampler.stats()
+        return emit(3)
+    finally:
+        if sampler.is_alive():
+            sampler.stop()
+
+    result["samples"] = sampler.stats()
+    result["elapsed_s"] = round(time.monotonic() - start, 1)
+    result["vram_errors"] = vram_errors
+    result["vram_chunks"] = chunks
+    result["gemm_errors"] = gemm_errors
+    result["gemm_iters"] = iters
+    result["errors"] = vram_errors + gemm_errors
+    if iters + chunks == 0:
+        result["status"] = INVALID
+        result["detail"] = "no se midió ni una iteración"
+        return emit(2)
+    if result["errors"]:
+        result["status"] = FAIL_NUM
+        return emit(1)
+    result["status"] = PASS
+    return emit(0)
+
+
+# ---------------------------------------------------------------------------
+# MODO PADRE: el único que escribe en el hardware
+# ---------------------------------------------------------------------------
+class Journal:
+    """Migas de pan con fsync. La última línea es el paso sospechoso."""
+
+    def __init__(self, directory, dry_run=False):
+        self.dir = Path(directory)
+        self.dry_run = dry_run
+        if not dry_run:
+            self.dir.mkdir(parents=True, exist_ok=True)
+        self.crumbs = self.dir / "10-breadcrumbs.log"
+        self.steps = self.dir / "20-steps.jsonl"
+
+    def _append(self, path, text):
+        if self.dry_run:
+            return
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def crumb(self, text):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        line = f"{stamp}\t{text}\n"
+        self._append(self.crumbs, line)
+        print(f"  · {text}", flush=True)
+
+    def step(self, record):
+        self._append(self.steps, json.dumps(record, ensure_ascii=False) + "\n")
+
+
+class Hardware:
+    """Lo único que toca el hardware. Escribe SIEMPRE por el helper NVML."""
+
+    def __init__(self, bus, python, dry_run=False):
+        self.bus = bus
+        self.python = python
+        self.dry_run = dry_run
+        self.applied = {"gpu": 0, "mem": 0}
+        self._restored = False
+
+    def _nvml(self, *args):
+        return run_cmd([self.python, "-I", str(NVML_HELPER), *args],
+                       NVML_TIMEOUT)
+
+    def caps(self):
+        """((gmin, gmax), (mmin, mmax)) o None si no se puede afirmar."""
+        rc, out, err = self._nvml("caps", self.bus)
+        if rc != 0:
+            return None, f"rc={rc} {err.strip() or out.strip()}"
+        window = None
+        for line in out.splitlines():
+            if line.startswith("window="):
+                parts = line.split("=", 1)[1].split()
+                if len(parts) == 4:
+                    try:
+                        values = [int(p) for p in parts]
+                    except ValueError:
+                        return None, f"ventana ilegible: {line}"
+                    window = ((values[0], values[1]), (values[2], values[3]))
+        if window is None:
+            return None, "el helper no declaró ventana"
+        return window, ""
+
+    def get(self):
+        """(gpu_offset, mem_offset) tal como los lee NVML ahora mismo."""
+        rc, out, err = self._nvml("get", self.bus)
+        if rc != 0:
+            return None, f"rc={rc} {err.strip() or out.strip()}"
+        values = {}
+        for token in out.split():
+            if "=" in token:
+                key, _, raw = token.partition("=")
+                try:
+                    values[key] = int(raw)
+                except ValueError:
+                    pass
+        if "gpu_offset" not in values or "mem_offset" not in values:
+            return None, f"lectura ilegible: {out.strip()}"
+        return (values["gpu_offset"], values["mem_offset"]), ""
+
+    def set(self, which, mhz):
+        """rc 0 ok, 124 colgado (ABORTAR sin reintentar), otro = no aplicado."""
+        if self.dry_run:
+            self.applied[which] = mhz
+            return 0, "dry-run"
+        rc, out, err = self._nvml("set", self.bus, which, str(mhz))
+        if rc == 0:
+            self.applied[which] = mhz
+        return rc, (err.strip() or out.strip())
+
+    def apply(self, gpu_mhz, mem_mhz):
+        """Pone los dos offsets. Devuelve (ok, detalle)."""
+        for which, mhz in (("gpu", gpu_mhz), ("mem", mem_mhz)):
+            if self.applied.get(which) == mhz and not self.dry_run:
+                continue
+            rc, detail = self.set(which, mhz)
+            if rc == RC_HUNG:
+                return False, f"NVML COLGADO escribiendo {which}={mhz}"
+            if rc != 0:
+                return False, f"no se aplicó {which}={mhz} ({detail})"
+        return True, ""
+
+    def restore(self):
+        """Offsets a 0 y CONFIRMADO releyendo. Idempotente."""
+        if self._restored or self.dry_run:
+            self._restored = True
+            return True
+        self._restored = True
+        ok = True
+        for which in ("gpu", "mem"):
+            rc, detail = self.set(which, 0)
+            if rc != 0:
+                ok = False
+                print(f"  !! no pude devolver el offset de {which} a 0 "
+                      f"(rc={rc} {detail})", file=sys.stderr, flush=True)
+        read, err = self.get()
+        if read is None:
+            print(f"  !! no pude releer los offsets tras el reset ({err})",
+                  file=sys.stderr, flush=True)
+            self._restore_advice()
+            return False
+        if read != (0, 0):
+            print(f"  !! los offsets NO están a 0: {read}",
+                  file=sys.stderr, flush=True)
+            self._restore_advice()
+            return False
+        print(f"  · offsets devueltos a 0 y confirmados {read}", flush=True)
+        return ok
+
+    @staticmethod
+    def _restore_advice():
+        """Qué hacer cuando la vuelta a 0 no se pudo confirmar.
+
+        Antes esto solo imprimía "no pude", y "no pude" invita a asumir lo peor
+        —que la tarjeta se quedó overclockeada— y a ir a arreglarlo a mano, que
+        es justo la secuencia que cuelga el host. Lo que de verdad pasa está
+        escrito aquí para que no haya que deducirlo con la tarjeta caída.
+        """
+        for line in (
+            "",
+            "  QUÉ SIGNIFICA ESTO",
+            "  Si NVML no responde, lo más probable es que la tarjeta pida un",
+            "  full-chip reset (`Xid 154`: GPU Reset Required). En ese estado no",
+            "  se puede escribir el 0, pero TAMPOCO queda overclockeada: un",
+            "  offset NVML no sobrevive a la re-enumeración del dispositivo, así",
+            "  que la reconexión que lo recupera es la que lo deja a 0.",
+            "",
+            "  QUÉ HACER",
+            "    1. Reconecta el cable Thunderbolt (quita y pon).",
+            "    2. Comprueba:  aorus-egpu-oc status   -> offsets (0, 0)",
+            "    3. Clasifica:  sudo aorus-egpu-health",
+            "    4. Si el host se congeló: sudo aorus-egpu-postmortem",
+            "",
+            "  QUÉ NO HACER",
+            "  NO intentes `remove`/`rescan`/FLR por sysfs para forzar el reset:",
+            "  H2 documenta que esa secuencia con descriptores abiertos cuelga el",
+            "  host entero. El cable es el camino.",
+        ):
+            print(line, file=sys.stderr, flush=True)
+
+
+def link_verdict(bus):
+    """Veredicto del enlace con LA REGLA DEL DOMINIO, no una copia de ella.
+
+    Se delega en domain/link.sh a propósito: duplicar aquí el umbral de Gen/
+    width sería una segunda fuente de verdad que podría divergir del gate que
+    usa el paquete.
+    """
+    row = smi_query(bus, ("pcie.link.gen.max",))
+    if row == RC_HUNG:
+        return "hung", "nvidia-smi colgado leyendo la capacidad del enlace"
+    gen_max = row[0] if row else ""
+    try:
+        width = (Path("/sys/bus/pci/devices") / bus.lower() /
+                 "current_link_width").read_text().strip()
+    except OSError:
+        width = ""
+    rc, out, err = run_cmd(
+        ["bash", "-c",
+         '. "$1" || exit 70; aorus_use domain/link || exit 70; '
+         'domain_link_cap_verdict "$2" "$3"',
+         "egpu-oc-edge", str(BOOTSTRAP), gen_max, width], 20)
+    verdict = out.strip() or "unknown"
+    if rc == 70:
+        return "unknown", f"no pude cargar domain/link ({err.strip()})"
+    return verdict, f"Gen{gen_max or '?'} negociado x{width or '?'}"
+
+
+def nvrm_since(epoch):
+    """Líneas NVRM/Xid del kernel desde `epoch`. Evidencia, no veredicto."""
+    rc, out, _ = run_cmd(["journalctl", "-k", "-S", f"@{int(epoch)}",
+                          "-o", "cat", "--no-pager"], 30)
+    if rc != 0:
+        return []
+    return [line for line in out.splitlines()
+            if "NVRM" in line or "Xid" in line]
+
+
+def is_tunnel_loss(lines):
+    """La firma de H23: lo que se cae es el DISPOSITIVO, no el reloj."""
+    needles = ("fallen off the bus", "device disconnected", "Link Down",
+               "Card not present")
+    return any(needle in line for line in lines for needle in (needles))
+
+
+class Sweep:
+    def __init__(self, args, hw, journal, control):
+        self.args = args
+        self.hw = hw
+        self.journal = journal
+        self.control = control
+        self.records = []
+        self.aborted = None
+
+    # -- un paso -------------------------------------------------------------
+    def step(self, gpu_off, mem_off, seconds, split, label):
+        """Aplica, mide, relee y clasifica. Devuelve el registro del paso."""
+        record = {"label": label, "gpu_offset": gpu_off, "mem_offset": mem_off,
+                  "seconds": seconds, "split": split,
+                  "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+
+        # Gate de enlace ANTES de cada escritura: H23 dice que el túnel se cae
+        # en reposo, y el paso anterior pudo dejar minutos de reposo por medio.
+        verdict, info = link_verdict(self.hw.bus)
+        record["link"] = f"{verdict} ({info})"
+        if verdict != "healthy":
+            record["status"] = INVALID
+            record["detail"] = f"GATE de enlace: {verdict} ({info})"
+            self.abort(f"enlace {verdict}: {info}")
+            return self._finish(record)
+
+        self.journal.crumb(f"APLICANDO {label}: gpu={gpu_off:+d} "
+                           f"mem={mem_off:+d} ({seconds}s)")
+        ok, detail = self.hw.apply(gpu_off, mem_off)
+        if not ok:
+            record["status"] = INVALID
+            record["detail"] = detail
+            if "COLGADO" in detail:
+                self.abort(detail)
+            return self._finish(record)
+
+        if self.args.dry_run:
+            record["status"] = "dry-run"
+            return self._finish(record)
+
+        t0 = time.time()
+        self.journal.crumb(f"MIDIENDO  {label}: gpu={gpu_off:+d} "
+                           f"mem={mem_off:+d} ({seconds}s) <- paso en curso")
+        child = [self.args.python, "-I", str(Path(__file__).resolve()),
+                 "step", "--bus", self.hw.bus, "--seconds", str(seconds),
+                 "--split", str(split)]
+        rc, out, err = run_cmd(child, seconds + CHILD_MARGIN_S)
+
+        payload = None
+        for line in out.splitlines():
+            if line.startswith(CHILD_MARKER):
+                payload = json.loads(line[len(CHILD_MARKER):])
+        if payload:
+            record.update(payload)
+        else:
+            record["status"] = FAIL_HARD
+            record["detail"] = (f"el hijo no emitió resumen (rc={rc}) "
+                                f"{err.strip()[:300]}")
+        record["child_rc"] = rc
+
+        if rc == RC_HUNG:
+            # El hijo no volvió. No se reintenta y no se sigue midiendo: la
+            # tarjeta puede estar wedged y insistir la deja peor.
+            record["status"] = FAIL_HARD
+            record["detail"] = "el hijo se COLGÓ (rc=124); abortando sin reintentar"
+            self.abort(record["detail"])
+            return self._finish(record)
+
+        # Evidencia del kernel en la ventana del paso.
+        nvrm = nvrm_since(t0 - 2)
+        record["nvrm_lines"] = len(nvrm)
+        if nvrm:
+            record["nvrm_first"] = nvrm[0][:240]
+        if is_tunnel_loss(nvrm):
+            # No es culpa del reloj: es H23. La medición queda contaminada.
+            record["status"] = FAIL_TUNNEL
+            record["detail"] = ("firma de pérdida del dispositivo Thunderbolt "
+                                "(H23): la medición queda contaminada")
+            self.abort("pérdida del dispositivo Thunderbolt durante el paso")
+            return self._finish(record)
+        if nvrm and record.get("status") == PASS:
+            # Pasó los bits pero el kernel dijo algo: no se declara "pasa" a
+            # secas. Sin saber qué era, no hay evidencia limpia.
+            record["status"] = INVALID
+            record["detail"] = (f"{len(nvrm)} líneas NVRM durante un paso sin "
+                                "errores numéricos; evidencia no limpia")
+
+        # El offset se RELEE: un reset de GPU los borra, y un paso medido sin
+        # el offset puesto no dice nada del offset.
+        read, read_err = self.hw.get()
+        record["offsets_after"] = read
+        if read is None:
+            record["status"] = INVALID
+            record["detail"] = f"no pude releer los offsets ({read_err})"
+        elif read != (gpu_off, mem_off):
+            record["status"] = INVALID
+            record["detail"] = (f"el offset cambió durante el paso: pedido "
+                                f"({gpu_off},{mem_off}) leído {read}")
+
+        # Efecto: ¿movió el reloj respecto al control?
+        record["effect"] = self._effect(record, gpu_off, mem_off)
+        return self._finish(record)
+
+    def _effect(self, record, gpu_off, mem_off):
+        """'nucleo', 'memoria', 'ambos', 'ninguno' o 'desconocido'.
+
+        Un paso que pasa SIN mover el reloj no es margen conseguido: es un
+        offset que el driver no ha aplicado al reloj real.
+        """
+        base = (self.control or {}).get("samples") or {}
+        now = record.get("samples") or {}
+        moved = []
+        for key, name, requested in (("sm_mhz", "nucleo", gpu_off),
+                                     ("mem_mhz", "memoria", mem_off)):
+            if requested <= 0:
+                continue
+            ref, cur = base.get(key), now.get(key)
+            if not ref or not cur:
+                return "desconocido"
+            # Umbral: la mitad de lo pedido, o 15 MHz, lo que sea mayor. El
+            # reloj bajo carga oscila, así que un umbral pequeño daría falsos
+            # "sí se movió".
+            threshold = max(15, requested * 0.5)
+            if (cur["max"] - ref["max"]) >= threshold:
+                moved.append(name)
+        if not moved:
+            return "ninguno"
+        return "ambos" if len(moved) == 2 else moved[0]
+
+    def _finish(self, record):
+        record["ended"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        self.records.append(record)
+        self.journal.step(record)
+        samples = record.get("samples") or {}
+        sm = (samples.get("sm_mhz") or {}).get("max")
+        power = (samples.get("power_w") or {}).get("max")
+        temp = (samples.get("temp_c") or {}).get("max")
+        extra = ""
+        if sm is not None:
+            extra = (f" | sm_max={sm:.0f}MHz pot_max={power}W temp={temp}C"
+                     f" thr={samples.get('throttle')}"
+                     f" efecto={record.get('effect', '?')}")
+        self.journal.crumb(
+            f"RESULTADO {record['label']}: {record['status']}"
+            f" errores={record.get('errors')}"
+            f" (gemm={record.get('gemm_errors')}/{record.get('gemm_iters')}it,"
+            f" vram={record.get('vram_errors')}/{record.get('vram_chunks')}ch)"
+            f"{extra}"
+            + (f" | {record['detail']}" if record.get("detail") else ""))
+        return record
+
+    def abort(self, reason):
+        if self.aborted is None:
+            self.aborted = reason
+            self.journal.crumb(f"ABORTO: {reason}")
+
+    # -- escalera, bisección, confirmación -----------------------------------
+    def _offsets_for(self, which, value):
+        return (value, 0) if which == "gpu" else (0, value)
+
+    def ladder(self, which, step, maximum, split, start=0):
+        """Escalera gruesa hasta el PRIMER fallo. (ultimo_pass, primer_fallo).
+
+        `start` arranca la escalera por encima de 0 cuando una medición
+        ANTERIOR ya dejó territorio conocido (p.ej. H25 dejó +600 limpio y
+        +675 colgando la tarjeta: repetir los ocho escalones de abajo no mide
+        nada nuevo y cuesta minutos de carga). No se contabiliza como paso
+        superado: `last_pass` sigue siendo 0 hasta que un escalón PASA en
+        ESTA ejecución, porque un pass heredado de otra sesión no es
+        evidencia de esta.
+        """
+        last_pass, first_fail = 0, None
+        value = start if start > 0 else step
+        while value <= maximum:
+            gpu_off, mem_off = self._offsets_for(which, value)
+            record = self.step(gpu_off, mem_off, self.args.ladder_seconds,
+                               split, f"escalera {which} {value:+d}")
+            if self.aborted:
+                return last_pass, first_fail
+            if record["status"] == PASS:
+                last_pass = value
+            else:
+                first_fail = value
+                return last_pass, first_fail
+            value += step
+        return last_pass, first_fail
+
+    def bisect(self, which, low, high, res, split):
+        """Afina entre un paso bueno y uno malo hasta la resolución pedida."""
+        while high - low > res:
+            mid = grid_floor((low + high) // 2, res)
+            if mid <= low or mid >= high:
+                break
+            gpu_off, mem_off = self._offsets_for(which, mid)
+            record = self.step(gpu_off, mem_off, self.args.ladder_seconds,
+                               split, f"biseccion {which} {mid:+d}")
+            if self.aborted:
+                return low, high
+            if record["status"] == PASS:
+                low = mid
+            else:
+                high = mid
+        return low, high
+
+    def confirm(self, which, candidate, res, split, repeats):
+        """n>=3 pasadas largas. Si una falla, el borde está más abajo."""
+        descents = 0
+        while candidate > 0 and descents <= self.args.max_descents:
+            ok = True
+            for attempt in range(1, repeats + 1):
+                gpu_off, mem_off = self._offsets_for(which, candidate)
+                record = self.step(
+                    gpu_off, mem_off, self.args.confirm_seconds, split,
+                    f"confirmacion {which} {candidate:+d} ({attempt}/{repeats})")
+                if self.aborted:
+                    return None
+                if record["status"] != PASS:
+                    ok = False
+                    break
+            if ok:
+                return candidate
+            candidate = grid_floor(candidate - res, res)
+            descents += 1
+        return None
+
+    def confirm_pair(self, gpu_off, mem_off, split, repeats):
+        """La COMBINACIÓN es una tercera variable: se confirma aparte."""
+        for attempt in range(1, repeats + 1):
+            record = self.step(
+                gpu_off, mem_off, self.args.confirm_seconds, split,
+                f"combinado gpu{gpu_off:+d} mem{mem_off:+d} ({attempt}/{repeats})")
+            if self.aborted:
+                return None
+            if record["status"] != PASS:
+                return False
+        return True
+
+    def coverage(self, which=None, value=None):
+        """Cobertura acumulada de los pasos que PASARON en un punto dado."""
+        iters = chunks = seconds = runs = 0
+        for record in self.records:
+            if record.get("status") != PASS:
+                continue
+            if which is not None:
+                target = self._offsets_for(which, value)
+                if (record["gpu_offset"], record["mem_offset"]) != target:
+                    continue
+            iters += record.get("gemm_iters") or 0
+            chunks += record.get("vram_chunks") or 0
+            seconds += record.get("elapsed_s") or 0
+            runs += 1
+        return {"gemm_iters": iters, "vram_chunks": chunks,
+                "seconds": round(seconds, 1), "runs": runs}
+
+
+# ---------------------------------------------------------------------------
+# preflight
+# ---------------------------------------------------------------------------
+def resolve_egpu_bus():
+    """Bus-id de la eGPU por DEVICE-ID en sysfs, con la confirmación de R4.
+
+    No se usa el índice de nvidia-smi: se reordena entre arranques y el 0 de
+    esta máquina es la GPU INTERNA. La confirmación topológica se hace con el
+    atributo `removable`, NO subiendo el árbol PCI a buscar el driver
+    thunderbolt: el controlador TB es un HERMANO, no un ancestro.
+    """
+    root = Path("/sys/bus/pci/devices")
+    found = []
+    for entry in sorted(root.iterdir()):
+        try:
+            vendor = int((entry / "vendor").read_text().strip(), 16)
+            device = int((entry / "device").read_text().strip(), 16)
+        except (OSError, ValueError):
+            continue
+        if vendor != 0x10DE:
+            continue
+        if device == INTERNAL_DEVICE_ID:
+            continue                     # la interna NUNCA es un target válido
+        if device != EGPU_DEVICE_ID:
+            continue
+        removable = ""
+        try:
+            removable = (entry / "removable").read_text().strip()
+        except OSError:
+            pass
+        found.append((entry.name, removable))
+    if not found:
+        return None, f"no hay ninguna GPU 10de:{EGPU_DEVICE_ID:04x} en el bus PCI"
+    bus, removable = found[0]
+    if removable != "removable":
+        return None, (f"{bus} existe pero `removable` dice '{removable}': "
+                      "no puedo confirmar que sea la tarjeta externa")
+    return bus, ""
+
+
+def preflight(args, hw, journal):
+    """Todo lo que tiene que ser verdad ANTES de escribir el primer offset."""
+    problems = []
+
+    if not args.dry_run and os.geteuid() != 0:
+        problems.append("escribir offsets NVML necesita root; relanza con sudo")
+
+    # Igual que app/overclock.sh: un offset positivo NO se aplica desatendido.
+    # Aquí el motivo es más fuerte todavía: esto los aplica a propósito hasta
+    # que la tarjeta falla, y nadie leería el resultado desde una unit.
+    # El heurístico es el mismo que app/overclock.sh (AORUS_OC_UNATTENDED
+    # explícito + INVOCATION_ID como red). OJO con el falso positivo: en un
+    # escritorio moderno el emulador de terminal ES una unit de systemd, así
+    # que una sesión interactiva HEREDA INVOCATION_ID. Por eso aquí -y solo
+    # aquí- hay una forma de decir "la está mirando una persona": pasar
+    # --attended en la línea de órdenes, que es algo que una unit no hace sola.
+    # El gate del PAQUETE no tiene este escape, y no debe tenerlo: allí el
+    # riesgo es un arranque aplicando offsets sin testigo.
+    if not args.attended and (os.environ.get("AORUS_OC_UNATTENDED") == "1"
+                              or os.environ.get("INVOCATION_ID")):
+        problems.append("parece ejecución DESATENDIDA (systemd/udev). Si la "
+                        "estás mirando tú, pasa --attended")
+
+    verdict, info = link_verdict(hw.bus)
+    journal.crumb(f"enlace: {verdict} ({info})")
+    if verdict != "healthy":
+        problems.append(f"GATE de enlace: {verdict} ({info}); no hay --force aquí")
+
+    window, err = hw.caps()
+    if window is None:
+        problems.append(f"la tarjeta no declara ventana de offsets ({err})")
+    else:
+        journal.crumb(f"ventana NVML: nucleo [{window[0][0]},{window[0][1]}] "
+                      f"memoria [{window[1][0]},{window[1][1]}] MHz")
+
+    read, read_err = hw.get()
+    if read is None:
+        problems.append(f"no puedo leer los offsets actuales ({read_err})")
+    elif read != (0, 0):
+        problems.append(f"la tarjeta YA tiene offsets puestos {read}: el control "
+                        "no sería un control. Resetea con 'aorus-egpu-oc reset'")
+
+    if not args.dry_run:
+        rc, out, _ = run_cmd([args.python, "-I", str(VERIFY_HELPER),
+                              "available"], 120)
+        journal.crumb(f"verificador: {out.strip() or 'sin salida'} (rc={rc})")
+        if rc != 0:
+            problems.append("no hay verificador numérico (torch+CUDA) en "
+                            f"{args.python}: sin evidencia no se mide nada")
+
+    return window, problems
+
+
+# ---------------------------------------------------------------------------
+# informe
+# ---------------------------------------------------------------------------
+def print_report(args, sweep, summary, out_dir):
+    line = "=" * 78
+    print(f"\n{line}\nRESULTADO — borde de overclock de la eGPU {summary['bus']}\n{line}")
+    control = summary.get("control") or {}
+    csam = control.get("samples") or {}
+    print(f"\nControl a offset 0: {control.get('status')} — "
+          f"{control.get('gemm_iters')} iteraciones GEMM, "
+          f"{control.get('vram_chunks')} trozos de VRAM, "
+          f"sm_max={(csam.get('sm_mhz') or {}).get('max')} MHz, "
+          f"pot_max={(csam.get('power_w') or {}).get('max')} W, "
+          f"temp_max={(csam.get('temp_c') or {}).get('max')} C")
+
+    for which in ("gpu", "mem"):
+        data = summary["domains"].get(which)
+        if not data:
+            continue
+        nombre = "NÚCLEO (gpc)" if which == "gpu" else "MEMORIA (gddr7)"
+        print(f"\n{nombre}")
+        print(f"  último paso limpio en la escalera : {data['last_pass']:+d} MHz")
+        fail = data["first_fail"]
+        print(f"  primer paso que falló             : "
+              f"{(f'{fail:+d} MHz') if fail is not None else 'ninguno dentro del rango probado'}")
+        print(f"  borde tras bisección (res {data['res']} MHz)   : {data['edge']:+d} MHz")
+        confirmed = data["confirmed"]
+        print(f"  confirmado n={args.repeats} de {args.confirm_seconds}s      : "
+              f"{(f'{confirmed:+d} MHz') if confirmed is not None else 'NO confirmado'}")
+        print(f"  efecto medido en el reloj         : {data['effect']}")
+        cov = data["coverage"]
+        print(f"  cobertura en el punto confirmado  : {cov['runs']} pasadas, "
+              f"{cov['gemm_iters']} iteraciones GEMM, {cov['vram_chunks']} "
+              f"trozos de VRAM, {cov['seconds']} s")
+        print(f"  RECOMENDADO (margen {int(args.margin * 100)}%)        : "
+              f"{data['recommended']:+d} MHz")
+
+    combined = summary.get("combined")
+    if combined is not None:
+        print(f"\nCOMBINADO núcleo {combined['gpu']:+d} + memoria "
+              f"{combined['mem']:+d}: "
+              f"{'pasa' if combined['ok'] else 'FALLA'}")
+
+    if summary.get("aborted"):
+        print(f"\n!! MEDICIÓN ABORTADA: {summary['aborted']}")
+        print("   Los bordes de arriba son parciales: lo que no se midió, no se sabe.")
+
+    if ABANDONED:
+        print(f"\n!! PROCESOS ABANDONADOS: {', '.join(str(p) for p in ABANDONED)}")
+        print("   Ni SIGKILL los cerró: seguramente con un hilo en estado-D dentro")
+        print("   del driver. No se esperaron —esperarlos es el cuelgue que este")
+        print("   tool arregló— y se los llevará el reset del dispositivo. Si siguen")
+        print("   ahí tras reconectar el Thunderbolt, son zombis sin dueño y solo")
+        print("   los limpia un reinicio; no consumen GPU.")
+        print("   Comprobar:  ps -o pid,stat,wchan,cmd -p "
+              + ",".join(str(p) for p in ABANDONED))
+
+    print(f"\nLO QUE ESTE NÚMERO NO DICE\n{'-' * 26}")
+    print("Cero errores en esta ventana no es 'seguro'. Esta tarjeta no tiene ECC,")
+    print("y hay un caso documentado en Blackwell/GDDR7 donde la corrupción apareció")
+    print("en la iteración 274.400 con un memtest de VRAM pasando 1.252 pasadas")
+    print("limpias. Lo medido aquí es el borde GRUESO —dónde falla en minutos—, no")
+    print("la cola de eventos raros. Para una carga de IA sin ECC, un resultado")
+    print("silenciosamente incorrecto se propaga a los pesos sin dejar rastro.")
+    print(f"\nEvidencia completa: {out_dir}")
+    print(f"  10-breadcrumbs.log  pasos con fsync (la última línea es el sospechoso)")
+    print(f"  20-steps.jsonl      un JSON por paso, con muestras de reloj/potencia")
+    print(f"  90-summary.json     este resumen")
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="egpu-oc-edge",
+        description="Mide el offset de reloj máximo que la eGPU sostiene sin "
+                    "corromper bits.")
+    sub = parser.add_subparsers(dest="mode")
+
+    child = sub.add_parser("step", help="modo interno: una medición (no para humanos)")
+    child.add_argument("--bus", required=True)
+    child.add_argument("--seconds", type=int, required=True)
+    child.add_argument("--split", type=float, required=True)
+
+    parser.add_argument("--bus", default=None,
+                        help="bus-id de la eGPU (por defecto se resuelve por device-id)")
+    parser.add_argument("--python", default=sys.executable,
+                        help="intérprete con torch+pynvml (por defecto el actual)")
+    parser.add_argument("--out", default=None, help="directorio de evidencia")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="imprime el plan sin tocar el hardware")
+    parser.add_argument("--attended", action="store_true",
+                        help="lo lanza una persona que va a leer el resultado "
+                             "(necesario si tu terminal hereda INVOCATION_ID)")
+    parser.add_argument("--domains", default="gpu,mem",
+                        help="qué dominios medir: gpu, mem o gpu,mem")
+    parser.add_argument("--no-combined", action="store_true",
+                        help="no medir la combinación de los dos bordes")
+    parser.add_argument("--gpu-start", type=int, default=0,
+                        help="primer escalón del núcleo (0 = empezar en --gpu-step)")
+    parser.add_argument("--gpu-step", type=int, default=75)
+    parser.add_argument("--gpu-res", type=int, default=15)
+    parser.add_argument("--gpu-max", type=int, default=1000)
+    parser.add_argument("--mem-start", type=int, default=0,
+                        help="primer escalón de la memoria (0 = empezar en --mem-step)")
+    parser.add_argument("--mem-step", type=int, default=500)
+    parser.add_argument("--mem-res", type=int, default=100)
+    parser.add_argument("--mem-max", type=int, default=6000)
+    parser.add_argument("--control-seconds", type=int, default=60)
+    parser.add_argument("--ladder-seconds", type=int, default=20)
+    parser.add_argument("--confirm-seconds", type=int, default=90)
+    parser.add_argument("--repeats", type=int, default=3,
+                        help="pasadas de confirmación (n>=3 lo pide la metodología)")
+    parser.add_argument("--max-descents", type=int, default=3,
+                        help="cuántos escalones se baja si la confirmación falla")
+    parser.add_argument("--margin", type=float, default=0.20,
+                        help="margen que se resta al borde para el valor recomendado")
+    return parser
+
+
+def estimate_minutes(args, domains):
+    """Estimación honesta del reloj de pared, para poder decir no a tiempo."""
+    per_step = CHILD_MARGIN_S * 0.15 + 10      # init de CUDA + NVML + journal
+    total = args.control_seconds + per_step
+    for which in domains:
+        if which == "gpu":
+            steps = (args.gpu_max - args.gpu_start) // args.gpu_step + 1
+        else:
+            steps = (args.mem_max - args.mem_start) // args.mem_step + 1
+        total += steps * (args.ladder_seconds + per_step)
+        total += 4 * (args.ladder_seconds + per_step)          # bisección
+        total += args.repeats * (args.confirm_seconds + per_step)
+    if not args.no_combined and len(domains) == 2:
+        total += args.repeats * (args.confirm_seconds + per_step)
+    return int(total / 60)
+
+
+def main(argv):
+    args = build_parser().parse_args(argv[1:])
+
+    if args.mode == "step":
+        return child_measure(args.bus, args.seconds, args.split)
+
+    domains = [d.strip() for d in args.domains.split(",") if d.strip()]
+    for which in domains:
+        if which not in ("gpu", "mem"):
+            print(f"dominio desconocido: {which} (gpu|mem)", file=sys.stderr)
+            return 2
+
+    bus = args.bus
+    if bus is None:
+        bus, err = resolve_egpu_bus()
+        if bus is None:
+            print(f"no encuentro la eGPU: {err}", file=sys.stderr)
+            return 1
+
+    out_dir = Path(args.out or ("/var/log/aorus-egpu/oc-edge/" +
+                                time.strftime("%Y%m%d-%H%M%S")))
+    journal = Journal(out_dir, dry_run=args.dry_run)
+    hw = Hardware(bus, args.python, dry_run=args.dry_run)
+
+    print(f"egpu-oc-edge — eGPU {bus}")
+    print(f"evidencia: {out_dir}")
+    print(f"estimación: ~{estimate_minutes(args, domains)} min de carga "
+          f"(peor caso; para antes si falla pronto)\n")
+
+    # La vuelta a 0 se registra ANTES de la primera escritura: por salida
+    # normal, por excepción y por señal. Un offset dejado puesto es el fallo
+    # que esta herramienta no puede permitirse.
+    atexit.register(hw.restore)
+
+    def on_signal(signum, _frame):
+        print(f"\n(señal {signum}) devolviendo los offsets a 0...", flush=True)
+        hw.restore()
+        raise SystemExit(130)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, on_signal)
+
+    journal.crumb(f"ARRANQUE bus={bus} dominios={','.join(domains)} "
+                  f"python={args.python}")
+    window, problems = preflight(args, hw, journal)
+    if problems:
+        print("\nPREFLIGHT FALLIDO — no se ha tocado nada:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        journal.crumb("PREFLIGHT FALLIDO: " + " | ".join(problems))
+        return 2
+
+    # La ventana del adaptador acota lo que se pide: nunca se intenta un valor
+    # que la tarjeta no ha declarado aceptar.
+    if window:
+        args.gpu_max = min(args.gpu_max, window[0][1])
+        args.mem_max = min(args.mem_max, window[1][1])
+    journal.crumb(f"techos efectivos: nucleo +{args.gpu_max} memoria +{args.mem_max}")
+
+    # El split del CONTROL y de las CONFIRMACIONES es el del gate del paquete
+    # (0.55), para que el veredicto signifique lo mismo que el de
+    # `aorus-egpu-oc verify`. En la ESCALERA se pondera hacia la fase que
+    # discrimina el dominio que se está moviendo: el GEMM para el núcleo, el
+    # patrón de VRAM para la memoria. Es más señal por segundo, y está dicho
+    # aquí para que nadie lo lea como el mismo test.
+    # MEDIDO el 2026-11-05 en esta tarjeta: una pasada COMPLETA de la fase de
+    # VRAM (42 trozos, 10,5 GiB = 70% de la VRAM libre) cuesta ~18 s — ~5,5 s
+    # llenando y ~12,5 s releyendo y comparando. De ahí los pesos:
+    #   - escalera de MEMORIA: 0.90 de 20 s = 18 s, justo una pasada entera.
+    #   - escalera de NÚCLEO : 0.10, testimonial a propósito. El discriminante
+    #     del núcleo es el GEMM (1500 it en 6 s), y gastar ahí 5 s llenando
+    #     VRAM que luego no da tiempo a releer no mide nada: el llenado se come
+    #     el presupuesto y la comprobación se queda sin trozos.
+    #   - control y CONFIRMACIONES: 0.55, el mismo valor que usa el gate del
+    #     paquete, para que el veredicto signifique lo mismo que el de
+    #     `aorus-egpu-oc verify`.
+    gate_split = 0.55
+    ladder_split = {"gpu": 0.10, "mem": 0.90}
+
+    if args.dry_run:
+        print("\nPLAN (nada de esto se ha ejecutado):")
+        print(f"  control  : offset 0, {args.control_seconds}s, split {gate_split}")
+        for which in domains:
+            step_mhz = args.gpu_step if which == "gpu" else args.mem_step
+            maximum = args.gpu_max if which == "gpu" else args.mem_max
+            res = args.gpu_res if which == "gpu" else args.mem_res
+            start = args.gpu_start if which == "gpu" else args.mem_start
+            rungs = list(range(start or step_mhz, maximum + 1, step_mhz))
+            print(f"  {which:3s}      : escalera {rungs} MHz "
+                  f"({args.ladder_seconds}s/paso, split {ladder_split[which]})")
+            print(f"             biseccion hasta {res} MHz, confirmacion "
+                  f"n={args.repeats} de {args.confirm_seconds}s (split {gate_split})")
+        if not args.no_combined and len(domains) == 2:
+            print(f"  combinado: los dos recomendados juntos, n={args.repeats}")
+        print("\nLa escalera PARA en el primer fallo, asi que lo real sera mas corto.")
+        return 0
+
+    sweep = Sweep(args, hw, journal, control=None)
+    control = sweep.step(0, 0, args.control_seconds, gate_split, "control +0")
+    sweep.control = control
+    if not args.dry_run and control["status"] != PASS:
+        print("\nEl CONTROL a offset 0 no pasó. Nada de lo que viniera después "
+              "mediría el offset:", file=sys.stderr)
+        print(f"  {control['status']}: {control.get('detail', '')}", file=sys.stderr)
+        return 1
+
+    summary = {"bus": bus, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+               "python": args.python, "window": window,
+               "control": control, "domains": {}, "combined": None,
+               "aborted": None,
+               "settings": {k: v for k, v in vars(args).items()
+                            if k not in ("mode",)}}
+
+    for which in domains:
+        if sweep.aborted:
+            break
+        step_mhz = args.gpu_step if which == "gpu" else args.mem_step
+        res = args.gpu_res if which == "gpu" else args.mem_res
+        maximum = args.gpu_max if which == "gpu" else args.mem_max
+        split = ladder_split[which]
+        journal.crumb(f"--- dominio {which}: escalera de {step_mhz} MHz hasta "
+                      f"+{maximum}, resolución {res} ---")
+        start = args.gpu_start if which == "gpu" else args.mem_start
+        last_pass, first_fail = sweep.ladder(which, step_mhz, maximum, split,
+                                             start=start)
+        edge = last_pass
+        if first_fail is not None and not sweep.aborted:
+            low, _high = sweep.bisect(which, last_pass, first_fail, res, split)
+            edge = low
+        confirmed = None
+        if edge > 0 and not sweep.aborted:
+            journal.crumb(f"--- dominio {which}: confirmación n={args.repeats} "
+                          f"en {edge:+d} ---")
+            confirmed = sweep.confirm(which, edge, res, gate_split, args.repeats)
+        point = confirmed if confirmed is not None else edge
+        recommended = grid_floor(point * (1 - args.margin), res) if point > 0 else 0
+        effects = [r.get("effect") for r in sweep.records
+                   if r.get("status") == PASS
+                   and (r["gpu_offset"] if which == "gpu" else r["mem_offset"]) == point
+                   and point > 0]
+        summary["domains"][which] = {
+            "last_pass": last_pass, "first_fail": first_fail, "edge": edge,
+            "confirmed": confirmed, "res": res, "step": step_mhz,
+            "ceiling_reached": first_fail is None,
+            "effect": effects[0] if effects else "desconocido",
+            "coverage": sweep.coverage(which, point),
+            "recommended": recommended}
+
+    gpu_data = summary["domains"].get("gpu")
+    mem_data = summary["domains"].get("mem")
+    if (not args.no_combined and not sweep.aborted and gpu_data and mem_data
+            and gpu_data["recommended"] > 0 and mem_data["recommended"] > 0):
+        journal.crumb("--- combinación de los dos valores recomendados "
+                      "(tercera variable) ---")
+        ok = sweep.confirm_pair(gpu_data["recommended"], mem_data["recommended"],
+                                gate_split, args.repeats)
+        summary["combined"] = {"gpu": gpu_data["recommended"],
+                               "mem": mem_data["recommended"], "ok": bool(ok)}
+
+    summary["aborted"] = sweep.aborted
+    summary["ended"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    summary["steps"] = len(sweep.records)
+
+    restored = hw.restore()
+    summary["offsets_restored"] = restored
+
+    if not args.dry_run:
+        path = out_dir / "90-summary.json"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    print_report(args, sweep, summary, out_dir)
+    if sweep.aborted:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

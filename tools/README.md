@@ -165,6 +165,89 @@ The next CUDA tool added here will not be so lucky.
 Check with `nvidia-smi --query-gpu=compute_cap --format=csv` before assuming
 `sm_120`.
 
+## `egpu-oc-edge`
+
+Finds the highest **positive** clock offset the eGPU sustains without returning
+a single wrong bit, for the core and the memory separately.
+It answers the question `aorus-egpu-oc` cannot:
+that command knows how to apply an offset and how to refuse one without
+evidence, but its gate is a yes/no question about a value somebody already
+picked.
+This tool searches for the value.
+
+Why bit-exactness is the criterion and not "it didn't crash":
+this card has **no ECC** (`ecc.mode.current=[N/A]`).
+An offset that is too aggressive does not fall over — it **computes wrong**.
+The CUDA kernel finishes, nobody sees an error, and the result carries
+different bits than it should.
+See the ECC risk section of [`docs/overclock.md`](../docs/overclock.md).
+
+Method (one variable per test, cheapest experiment first, n>=3 to resolve):
+
+1. Control at offset 0. Without a passing control nothing downstream measures
+   the offset, so the run aborts.
+2. Coarse ladder until the first failure — core in 75 MHz rungs, memory in
+   500 MHz rungs — then a fine bisection (15 / 100 MHz) between the last good
+   rung and the first bad one.
+3. Confirmation of the candidate with 3 passes of 90 s.
+   One failure means the edge is lower, and it steps down one notch.
+4. The combination of both edges is a **third** variable and is measured last.
+
+It reuses, deliberately, instead of reimplementing:
+
+- `src/adapters/gpu/nvml-offsets.py` to write the offset (R4 gate and
+  write-then-reread confirmation live inside it).
+- `src/adapters/verify/gemm-integrity.py` for the bit-exact phases.
+  They have to be **the same** ones the package's gate uses; an edge measured
+  with a different verifier would not authorise anything.
+
+Parent/child by design: the parent orchestrates and is the only process that
+writes to the hardware; every measurement runs in a child that imports torch
+and writes nothing, because an aggressive offset **poisons the CUDA context**
+and in a single process the next step would measure a broken one.
+
+Safety invariants: R4 gate inside the NVML helper; link gate by negotiated
+capability revalidated **before every step** (H23 drops the tunnel at idle, and
+writing right after a drop is what froze the host); no `--force`; offsets back
+to 0 on normal exit, exception, Ctrl-C or SIGTERM, **confirmed by rereading**;
+offsets reread after each step, because a GPU reset clears them and a step
+measured without the offset applied says nothing about the offset; if the child
+does not come back, abort **without retrying**.
+
+```bash
+tools/egpu-oc-edge --dry-run --attended          # the plan, touching nothing
+sudo ~/.venvs/egpu-torch-test/bin/python -I \
+  tools/egpu-oc-edge --attended                  # the full measurement
+```
+
+Needs `torch` + CUDA and `pynvml` in the same interpreter, and root (NVML
+offset writes do).
+Pass `--attended` when a person is watching:
+on a modern desktop the terminal emulator is itself a systemd unit, so an
+interactive session inherits `INVOCATION_ID` and the unattended heuristic
+would otherwise refuse to run.
+The package's own gate has no such escape hatch, and must not have one.
+
+Run it wrapped, like any freeze-risk test:
+
+```bash
+sudo src/bin/aorus-egpu-probe run -- \
+  ~/.venvs/egpu-torch-test/bin/python -I tools/egpu-oc-edge --attended
+```
+
+Evidence lands in `/var/log/aorus-egpu/oc-edge/<timestamp>/`:
+`10-breadcrumbs.log` (fsync'd, last line is the suspect step),
+`20-steps.jsonl` (one JSON per step with clock/power/temperature samples) and
+`90-summary.json`.
+
+Read the result with its coverage, never as a licence:
+"zero errors in N iterations over T seconds, n=3" is what it measures.
+There is a documented Blackwell/GDDR7 case where corruption first appeared at
+iteration **274,400** while a VRAM memtest passed 1,252 clean passes, so no
+window of minutes can rule out that tail.
+Hypothesis and resolution criteria:
+[H25](../docs/research/reliability-hypothesis-ledger.md#h25).
+
 ## Future tools
 
 This directory is the right place for:
