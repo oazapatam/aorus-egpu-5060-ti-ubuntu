@@ -153,8 +153,19 @@ sc_require_nonempty() { # $1=qué se esperaba  $2=cuántos hay
 
 ci_section "src/ — núcleo hexagonal (-S style, el nivel más exigente)"
 src_files=()
+# El filtro por shebang es necesario desde que src/bin/ tiene un entrypoint
+# en python (el TUI nvidia-oc): shellcheck solo entiende sh/bash/dash/ksh y
+# devuelve SC1071 ante cualquier otra cosa. Saltárselo aquí es seguro porque
+# ci/10-shell-syntax.sh SÍ comprueba ese fichero con su intérprete y FALLA si
+# un shebang no se reconoce: las dos etapas se complementan y nada se queda
+# sin comprobar.
 while IFS= read -r f; do src_files+=("$f"); done < <(
-  find src -type f \( -name '*.sh' -o -path 'src/bin/*' \) | sort)
+  find src -type f \( -name '*.sh' -o -path 'src/bin/*' \) | sort \
+  | while IFS= read -r f; do
+      case "$(head -1 "$f")" in
+        '#!'*bash*|'#!'*/sh|'#!'*/sh' '*|'#!'*dash*|'#!'*ksh*) printf '%s\n' "$f" ;;
+      esac
+    done)
 if sc_require_nonempty "src/" "${#src_files[@]}"; then
   sc_check fail style auto "${src_files[@]}"
 fi
