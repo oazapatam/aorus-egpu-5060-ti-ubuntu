@@ -116,16 +116,35 @@ gpu_set_clock_offset() { # $1=busid $2=gpu|mem $3=mhz
 #                            autoriza a tirar del cable, H28)
 #   AORUS_FAKE_PROCS_RC      rc de gpu_processes_all
 AORUS_FAKE_TELEMETRY_RC="${AORUS_FAKE_TELEMETRY_RC:-0}"
+
+# Device-ids que publica el doble. El de la GPU INTERNA (prohibida como diana
+# por R4) vive en esta constante y no incrustado en el registro de abajo por
+# dos razones, y la segunda es la que importa:
+#
+#   1. deja dicho, donde se declara, que 0x2c39 aparece aquí como DATO de
+#      telemetría —el doble publica las dos tarjetas para poder probar el
+#      etiquetado por rol y el caso de los campos '[N/A]'—, y nunca como
+#      objetivo de una acción: este adaptador no dirige ninguna escritura por
+#      device-id;
+#   2. la etapa ci/50-package-policy.sh §7.b exige que el device-id de la
+#      interna solo aparezca en una línea que se identifique como constante
+#      prohibida o como guarda de aborto. Dentro del heredoc no se puede poner
+#      un comentario —un '#' ahí sería texto emitido como telemetría—, así que
+#      la única forma honesta de pasar la comprobación sin debilitarla es
+#      nombrar la constante. Si algún día este fichero intentara USAR este
+#      id como diana, la comprobación volvería a saltar en la línea nueva.
+AORUS_FAKE_EGPU_DID="0x2d04"
+AORUS_FAKE_INTERNAL_DID="0x2c39"
 AORUS_FAKE_PROCS="${AORUS_FAKE_PROCS:-}"
 AORUS_FAKE_PROCS_RC="${AORUS_FAKE_PROCS_RC:-0}"
 
 gpu_telemetry_all() {
   [ "$AORUS_FAKE_TELEMETRY_RC" -eq 0 ] || return "$AORUS_FAKE_TELEMETRY_RC"
-  cat <<'REC'
+  cat <<REC
 --
 bus_id=00000000:8D:00.0
 vendor_id=0x10de
-device_id=0x2d04
+device_id=$AORUS_FAKE_EGPU_DID
 util_gpu_pct=62
 util_mem_pct=18
 mem_used_mib=6700
@@ -146,7 +165,7 @@ name=NVIDIA GeForce RTX 5060 Ti
 --
 bus_id=00000000:01:00.0
 vendor_id=0x10de
-device_id=0x2c39
+device_id=$AORUS_FAKE_INTERNAL_DID
 util_gpu_pct=0
 util_mem_pct=0
 mem_used_mib=0

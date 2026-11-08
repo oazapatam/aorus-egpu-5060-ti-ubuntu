@@ -64,10 +64,22 @@ else
     # en ningún repositorio: es un .deb local de dist/. Simularlo a secas daría
     # "dependencias NO satisfechas" por un fallo del CI, no del paquete, así
     # que el núcleo entra en la misma orden cuando el Depends lo pide.
+    #
+    # Y se coge el núcleo MÁS NUEVO, no el primero del glob. dist/ está
+    # gitignorado y nadie lo limpia, así que acumula versiones: con
+    # core_0.1.0 y core_0.2.0 a la vez, el glob ordena alfabéticamente y
+    # "${core_deb[0]}" era la 0.1.0. Entonces un paquete que pide
+    # `aorus-egpu-core (>= 0.2.0)` se simulaba contra el núcleo VIEJO y el CI
+    # lo daba por roto cuando lo roto era la elección del fichero. Pasó la
+    # primera vez que el núcleo subió de versión (0.1.0 -> 0.2.0).
+    # `sort -V` ordena por versión, que es lo que apt haría con un repo.
     sim_debs=("./$d")
     if dpkg-deb -f "$d" Depends 2>/dev/null | grep -q 'aorus-egpu-core'; then
       core_deb=(dist/aorus-egpu-core_*.deb)
-      if [ -e "${core_deb[0]}" ]; then sim_debs+=("./${core_deb[0]}"); fi
+      if [ -e "${core_deb[0]}" ]; then
+        core_newest="$(printf '%s\n' "${core_deb[@]}" | sort -V | tail -1)"
+        sim_debs+=("./$core_newest")
+      fi
     fi
     if sim="$(sudo -n apt-get install --simulate "${sim_debs[@]}" 2>&1)"; then
       ci_ok "$(basename "$d") — legible y con dependencias satisfechas"

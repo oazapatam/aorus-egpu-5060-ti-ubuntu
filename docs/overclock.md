@@ -329,6 +329,39 @@ dpkg -S /etc/aorus-egpu/profiles/*.profile   # lo que no salga, es huérfano
 sudo rm /etc/aorus-egpu/profiles/<retirado>.profile
 ```
 
+### Si quieres tu propio perfil, cópialo: no edites uno entregado
+
+La otra cara de que `/etc/aorus-egpu/profiles/` **no** sea un conffile:
+los perfiles que el paquete entrega —`stock`, `efficient` y los tres `oc-*`— son
+ficheros que el `.deb` posee, así que al actualizar **se sobreescriben sin
+preguntar** y cualquier ajuste que les hubieras hecho se pierde en silencio.
+
+No es un descuido del empaquetado, es el precio de la restricción principal de
+este repo:
+un conffile sobrevive a `apt remove`, y con ficheros en `/etc/default/grub.d/`
+y `/etc/sysctl.d/` eso significaría args de kernel y sysctl sobreviviendo a la
+desinstalación, que es exactamente el estado del que este proyecto huye.
+La etapa [`50-package-policy`](./ci-package-policy.md) lo comprueba y **falla**
+si algún paquete declara conffiles, incluido el caso de que el árbol esté
+limpio y sea el script de build el que los añada.
+
+La consecuencia práctica es simple:
+un fichero que el paquete **no** posee no lo toca nadie.
+Así que para un perfil propio, copia y renombra:
+
+```bash
+sudo cp /etc/aorus-egpu/profiles/oc-normal.profile \
+        /etc/aorus-egpu/profiles/mio.profile
+sudoedit /etc/aorus-egpu/profiles/mio.profile
+aorus-egpu-oc apply mio
+```
+
+`mio.profile` sobrevive a las actualizaciones, sale en
+`aorus-egpu-oc list` igual que los demás y pasa por los mismos gates.
+Lo que `apt remove` no se llevará es precisamente ese fichero, porque ningún
+paquete lo posee:
+bórralo a mano si dejas de quererlo.
+
 ## Lo que de verdad le falta para IA: persistencia y modo de cómputo
 
 Las dos palancas que importan para servir modelos en esta máquina no son de
