@@ -11,8 +11,34 @@
 #   3. smi  : si nvidia-smi se cuelga (rc 124), ABORTAR sin reintentar.
 #   4. link : el enlace debe poder NEGOCIAR Gen>=3. Apretar la tarjeta con el
 #             enlace Gen1 marginal congeló el host entero el 2026-06-27.
+#   5. verif: un offset de reloj POSITIVO no se da por bueno hasta que un
+#             verificador numérico ha comprobado que la GPU sigue calculando
+#             bien. Ver el bloque "GATE DE VERIFICACIÓN" más abajo.
 # Ningún gate se puede saltar con un flag: --force solo relaja el gate de enlace
 # y lo deja registrado, porque es el único cuyo riesgo es del usuario y no un bug.
+#
+# GATE DE VERIFICACIÓN (offsets positivos) — las cuatro reglas, con su motivo:
+#
+#   a. Sin verificador disponible, el gate CIERRA. Misma filosofía que el
+#      'unknown' del gate de enlace: sin evidencia no se escribe.
+#
+#   b. --force NO lo abre. Y no es una preferencia de estilo: un enlace
+#      degradado es un riesgo que el operador puede EVALUAR y asumir, mientras
+#      que un número mal calculado no lo puede ni detectar, así que no puede
+#      consentirlo. Es el mismo precedente que ya está en el código para
+#      'dead'/'unknown' en el gate de enlace.
+#
+#   c. Un offset positivo NUNCA se aplica de forma DESATENDIDA (udev o la unit
+#      systemd). Si el gate falla en un arranque nadie lo va a leer, y la
+#      máquina quedaría calculando mal sin testigo.
+#
+#   d. Secuencia OBLIGATORIA: aplicar -> verificar -> si falla, revertir a
+#      stock AHORA, NO persistir el state file (un perfil que calcula mal no
+#      debe sobrevivir a un reinicio del servicio) y dejarlo registrado en
+#      /var/log/aorus-egpu/oc-verify.log. Si el verificador devuelve 124
+#      (colgado) NO se revierte: revertir son dos escrituras más contra una
+#      tarjeta que ya no responde, y martillear un eGPU semi-roto lo deja
+#      wedged en estado-D. Es el mismo criterio que el gpu_state post-apply.
 #
 # El gate de enlace va DESPUÉS del de nvidia-smi porque su entrada
 # (`pcie.link.gen.max`) la da nvidia-smi: es la capacidad negociada del enlace,
@@ -24,16 +50,28 @@
 # shellcheck shell=bash
 
 aorus_use domain/target domain/link domain/overclock
-aorus_use ports/gpu.port ports/pci.port ports/log.port
-aorus_adapter gpu adapters/gpu/nvidia-smi
+aorus_use ports/gpu.port ports/pci.port ports/log.port ports/verify.port
+# El adaptador por defecto del puerto gpu es NVML, que es nvidia-smi MÁS los
+# offsets de reloj (ver la cabecera de adapters/gpu/nvml.sh). Degrada
+# honestamente: sin pynvml, gpu_supports_clock_offset dice "no soportado", el
+# dominio rechaza los perfiles con offsets y el resto sigue por nvidia-smi.
+aorus_adapter gpu adapters/gpu/nvml
 aorus_adapter pci adapters/pci/sysfs
 aorus_adapter log adapters/log/stderr
+aorus_adapter verify adapters/verify/torch-gemm
 
 # Nota: /etc/aorus-egpu/overclock.conf NO se lee aquí a propósito — lo consume
 # systemd con EnvironmentFile= y nos pasa el perfil como argumento. Declararlo
 # en esta capa sería una segunda fuente de verdad.
 AORUS_OC_PROFILE_DIR="${AORUS_OC_PROFILE_DIR:-/etc/aorus-egpu/profiles}"
 AORUS_OC_STATE="${AORUS_OC_STATE:-/run/aorus-egpu/overclock.state}"
+# El registro de verificaciones va a /var/log (no a /run) a propósito: es la
+# evidencia de que un offset se midió, o de que se rechazó, y tiene que
+# sobrevivir al reinicio igual que el registro de incidentes de health.
+AORUS_OC_VERIFY_LOG="${AORUS_OC_VERIFY_LOG:-/var/log/aorus-egpu/oc-verify.log}"
+# Presupuesto de tiempo de la verificación. 25 s da para llenar y releer buena
+# parte de la VRAM y varias iteraciones de GEMM sobre este túnel.
+AORUS_OC_VERIFY_SECONDS="${AORUS_OC_VERIFY_SECONDS:-25}"
 
 # --- carga de perfil ----------------------------------------------------------
 # Parser deliberadamente tonto (key=value, sin `source`): un fichero de config
@@ -133,6 +171,85 @@ oc_resolve_target() {
   printf '%s\t%s\t%s' "$bus" "$link_verdict" "$info"
 }
 
+# --- capacidad de offsets: preguntar al adaptador y pasarlo como DATO --------
+# Imprime lo que el dominio espera en su 7º argumento: "si <gmin> <gmax> <mmin>
+# <mmax>" o "no". Devuelve 124 si la herramienta se colgó, para que el caso de
+# uso aborte sin reintentar en vez de interpretar el cuelgue como un "no".
+#
+# Esto es lo que saca la creencia del dominio: antes domain_oc_validate
+# afirmaba "requiere Xorg+Coolbits", que es un hecho del ENTORNO -y además ya
+# era falso-. Ahora el entorno lo dice, y el dominio solo aplica la regla.
+_oc_offcap() { # $1=busid
+  local rc win
+  gpu_supports_clock_offset "$1"; rc=$?
+  [ "$rc" -eq 124 ] && return 124
+  if [ "$rc" -ne 0 ]; then printf 'no'; return 0; fi
+  win="$(gpu_offset_window "$1")"; rc=$?
+  [ "$rc" -eq 124 ] && return 124
+  if [ "$rc" -ne 0 ] || [ -z "$win" ]; then printf 'no'; return 0; fi
+  printf 'si %s' "$win"
+}
+
+# ¿Estamos corriendo DESATENDIDOS (udev / unit systemd)? Un offset positivo no
+# se aplica así: si el gate de verificación falla en un arranque, nadie lee el
+# error y la máquina se queda calculando mal sin testigo.
+#
+# Se detecta por dos vías a propósito: la unit declara AORUS_OC_UNATTENDED=1
+# (explícito), e INVOCATION_ID lo pone systemd en TODA unit (red de seguridad
+# para cualquier otra que se añada mañana y se olvide de declararlo).
+_oc_is_unattended() {
+  [ "${AORUS_OC_UNATTENDED:-0}" = "1" ] && return 0
+  [ -n "${INVOCATION_ID:-}" ] && return 0
+  return 1
+}
+
+# Registro de verificaciones. Nunca falla la operación por no poder escribirlo
+# (en un dry-run o como usuario normal /var/log no es escribible), pero sí se
+# intenta siempre: un rechazo del gate es tan registrable como un fallo.
+_oc_verify_log() { # $@ = texto
+  local dir
+  dir="$(dirname "$AORUS_OC_VERIFY_LOG")"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s\t%s\n' "$(date -Is 2>/dev/null || date)" "$*" \
+    >> "$AORUS_OC_VERIFY_LOG" 2>/dev/null || true
+}
+
+# Pone los offsets a 0 si la tarjeta los soporta. Es parte de la
+# REVERSIBILIDAD: gpu_reset_all devuelve relojes y potencia a fábrica, pero un
+# offset NVML no es ninguna de las dos cosas y sobreviviría al reset. Sin esto,
+# `apt remove` dejaría la tarjeta con el offset puesto.
+_oc_zero_offsets() { # $1=busid
+  local bus="$1" rc
+  gpu_supports_clock_offset "$bus"; rc=$?
+  [ "$rc" -eq 124 ] && return 124
+  [ "$rc" -ne 0 ] && return 0   # no los soporta: nada que deshacer
+  local which failed=0
+  for which in gpu mem; do
+    gpu_set_clock_offset "$bus" "$which" 0; rc=$?
+    if [ "$rc" -eq 124 ]; then
+      log_err "  nvml se colgó poniendo el offset de $which a 0; no sigo."
+      return 124
+    fi
+    [ "$rc" -eq 0 ] || { log_err "  no pude poner el offset de $which a 0"; failed=1; }
+  done
+  return "$failed"
+}
+
+# Vuelta a stock inmediata: relojes, potencia y offsets. Y se borra el state
+# file, porque el perfil ya no está aplicado.
+_oc_revert_to_stock() { # $1=busid
+  local bus="$1" rc
+  gpu_reset_all "$bus"; rc=$?
+  if [ "$rc" -eq 124 ]; then
+    log_err "  el reset de emergencia se colgó; NO insisto."
+    return 124
+  fi
+  [ "$rc" -eq 0 ] || log_err "  el reset de emergencia falló (rc=$rc)."
+  _oc_zero_offsets "$bus" || true
+  rm -f "$AORUS_OC_STATE" 2>/dev/null || true
+  return 0
+}
+
 # --- ejecutor del plan --------------------------------------------------------
 # Una escritura del plan. Devuelve 124 tal cual si nvidia-smi se colgó, para
 # que el ejecutor pueda abortar en vez de pasar a la siguiente operación.
@@ -169,7 +286,15 @@ oc_execute_plan() { # $1=busid; plan por stdin
                    _oc_write "el reset" gpu_reset_all "$bus"
                    wrc=$?; [ "$wrc" -eq 0 ] || rc=$wrc ;;
       '')          : ;;
-      clock_offset) log_err "  clock_offset no tiene adaptador en este sistema"; rc=1 ;;
+      clock_offset) log_info "  offset de reloj ${a} -> ${b} MHz"
+                   _oc_write "offset de reloj $a" gpu_set_clock_offset "$bus" "$a" "$b"
+                   wrc=$?
+                   # rc 3 = el adaptador no soporta offsets. No debería llegar
+                   # aquí (el dominio rechaza antes el perfil con la capacidad
+                   # que le pasó app/), así que si pasa es un bug de
+                   # orquestación y se dice como tal en vez de callarlo.
+                   [ "$wrc" -eq 3 ] && log_err "  el adaptador declara NO soportar offsets: el plan no debería haberlo emitido"
+                   [ "$wrc" -eq 0 ] || rc=$wrc ;;
       *)           if domain_oc_op_is_valid "$op"; then
                      log_err "  operación '$op' válida pero sin implementar en el ejecutor"
                    else
@@ -197,14 +322,44 @@ oc_apply() { # $1=perfil
   [ "$rc" -ne 0 ] && { log_err "no puedo leer las capacidades de la eGPU."; return 1; }
   read -r pmin pmax gmax mmax gmin mmin <<< "$caps"
 
+  # La capacidad de OFFSETS se consulta al adaptador y se pasa al dominio como
+  # un dato más. El dominio decide; aquí solo se informa de lo que hay.
+  local offcap
+  offcap="$(_oc_offcap "$bus")"; rc=$?
+  [ "$rc" -eq 124 ] && { log_err "la consulta de offsets se colgó; ABORTO sin reintentar."; return 124; }
+
   # Validación: los avisos se muestran, los errores abortan ANTES de escribir.
   local msgs
-  msgs="$(domain_oc_validate "$pmin" "$pmax" "$gmax" "$mmax" "$gmin" "$mmin")"; rc=$?
+  msgs="$(domain_oc_validate "$pmin" "$pmax" "$gmax" "$mmax" "$gmin" "$mmin" "$offcap")"; rc=$?
   [ -n "$msgs" ] && printf '%s\n' "$msgs" | while IFS= read -r m; do log_warn "$m"; done
   [ "$rc" -ne 0 ] && { log_err "perfil '$profile' inválido; no se ha tocado nada."; return 2; }
 
-  plan="$(domain_oc_plan "$pmin" "$pmax" "$gmax" "$mmax" "$gmin" "$mmin")"
+  plan="$(domain_oc_plan "$pmin" "$pmax" "$gmax" "$mmax" "$gmin" "$mmin" "$offcap")"
   [ -z "$plan" ] && { log_info "perfil '$profile': nada que aplicar."; return 0; }
+
+  # --- GATE DE VERIFICACIÓN, ANTES de escribir nada --------------------------
+  # Se comprueba aquí y no después de aplicar a propósito: descubrir que no hay
+  # verificador CON el offset ya puesto dejaría la tarjeta en un estado que
+  # nadie puede afirmar que sea correcto.
+  local verify_mode
+  verify_mode="$(domain_oc_verify_required)"
+  if [ "$verify_mode" = "gemm" ] && [ "${AORUS_OC_DRYRUN:-0}" != "1" ]; then
+    if _oc_is_unattended; then
+      log_err "GATE de verificación: '$profile' pide offsets POSITIVOS y esta es una ejecución DESATENDIDA (udev/servicio)."
+      log_err "Un offset positivo exige medir que la GPU sigue calculando bien, y en un arranque nadie leería el resultado."
+      log_err "Aplícalo a mano:  sudo aorus-egpu-oc apply $profile"
+      _oc_verify_log "profile=$profile bus=$bus gate=desatendido veredicto=rechazado"
+      return 2
+    fi
+    if ! verify_available; then
+      log_err "GATE de verificación: no hay verificador numérico disponible (falta torch/CUDA en \$AORUS_VERIFY_PYTHON)."
+      log_err "Sin evidencia no se escribe: un offset positivo falla CALCULANDO MAL, no cayéndose."
+      log_err "--force NO abre este gate. Un enlace degradado es un riesgo que puedes evaluar y asumir;"
+      log_err "un número mal calculado no lo puedes ni detectar, así que no lo puedes consentir."
+      _oc_verify_log "profile=$profile bus=$bus gate=verificador-ausente veredicto=rechazado"
+      return 2
+    fi
+  fi
 
   log_info "aplicando perfil '$profile' a la eGPU $bus (enlace $link_verdict: $link_info):"
   if [ "${AORUS_OC_DRYRUN:-0}" = "1" ]; then
@@ -233,12 +388,45 @@ oc_apply() { # $1=perfil
   fi
   if [ "$srefresh_rc" -ne 0 ]; then
     log_err "la eGPU no responde tras aplicar el perfil; REVIRTIENDO a fábrica."
-    gpu_reset_all "$bus" || log_err "el reset de emergencia también falló."
+    _oc_revert_to_stock "$bus" || log_err "el reset de emergencia también falló."
     return 1
   fi
 
+  # --- verificación numérica: aplicar -> VERIFICAR -> revertir si falla -------
+  # El state file se escribe DESPUÉS de esto, nunca antes: un perfil que no ha
+  # pasado la verificación no puede sobrevivir a un reinicio del servicio.
+  if [ "$verify_mode" = "gemm" ]; then
+    local vout vrc
+    log_info "verificando integridad numérica (${AORUS_OC_VERIFY_SECONDS}s de GEMM bit-exacto + patrón en VRAM)..."
+    vout="$(verify_numeric_integrity "$bus" "$AORUS_OC_VERIFY_SECONDS")"; vrc=$?
+    case "$vrc" in
+      0)
+        log_info "  verificación OK ($vout)."
+        _oc_verify_log "profile=$profile bus=$bus verify=gemm veredicto=pasa $vout" ;;
+      124)
+        # NO se revierte. Revertir son dos escrituras más contra una tarjeta
+        # que ya no responde: martillear un eGPU semi-roto lo deja wedged en
+        # estado-D. Mismo criterio que el gpu_state post-apply de arriba.
+        log_err "el verificador se COLGÓ (rc=124). NO reverto para no seguir martilleando la tarjeta."
+        log_err "El offset puede estar aplicado. Cuando la tarjeta responda: 'sudo aorus-egpu-oc reset'."
+        _oc_verify_log "profile=$profile bus=$bus verify=gemm veredicto=colgado sin-revertir"
+        return 124 ;;
+      *)
+        # rc 1 = calculó mal; rc 2 = el verificador dejó de estar disponible a
+        # mitad. En los dos casos falta la evidencia que autorizaba el offset,
+        # así que se vuelve a stock YA y no se persiste nada.
+        log_err "VERIFICACIÓN FALLIDA (rc=$vrc, $vout): revirtiendo a stock AHORA."
+        _oc_verify_log "profile=$profile bus=$bus verify=gemm veredicto=falla rc=$vrc $vout"
+        _oc_revert_to_stock "$bus"
+        log_err "el perfil '$profile' NO se ha persistido: no sobrevivirá a un reinicio del servicio."
+        log_err "Detalle en $AORUS_OC_VERIFY_LOG"
+        return 1 ;;
+    esac
+  fi
+
   mkdir -p "$(dirname "$AORUS_OC_STATE")" 2>/dev/null || true
-  printf 'profile=%s\nbus=%s\napplied=%s\n' "$profile" "$bus" "$(date -Is)" \
+  printf 'profile=%s\nbus=%s\napplied=%s\nverify=%s\n' \
+    "$profile" "$bus" "$(date -Is)" "$verify_mode" \
     > "$AORUS_OC_STATE" 2>/dev/null || true
   if [ "$rc" -eq 0 ]; then
     log_info "perfil '$profile' aplicado."
@@ -250,13 +438,58 @@ oc_apply() { # $1=perfil
 
 # --- caso de uso: reset -------------------------------------------------------
 oc_reset() {
-  local bus resolved
+  local bus resolved rc
   resolved="$(oc_resolve_target)" || return $?
   bus="${resolved%%$'\t'*}"   # primer campo: el bus-id
   log_info "reseteando la eGPU $bus a valores de fábrica"
-  gpu_reset_all "$bus" || { log_err "el reset falló."; return 1; }
+  gpu_reset_all "$bus"; rc=$?
+  [ "$rc" -eq 124 ] && { log_err "nvidia-smi se colgó durante el reset; ABORTO sin reintentar."; return 124; }
+  [ "$rc" -ne 0 ] && { log_err "el reset falló."; return 1; }
+  # Los offsets NVML no son relojes bloqueados ni power limit, así que
+  # gpu_reset_all no los toca: sin esto, un `apt remove` (que llama a este
+  # mismo reset desde el prerm) dejaría la tarjeta con el offset puesto.
+  _oc_zero_offsets "$bus"; rc=$?
+  [ "$rc" -eq 124 ] && return 124
+  [ "$rc" -ne 0 ] && { log_err "los relojes volvieron a fábrica pero los offsets NO."; return 1; }
   rm -f "$AORUS_OC_STATE" 2>/dev/null || true
   log_info "hecho."
+}
+
+# --- caso de uso: verify ------------------------------------------------------
+# Mide la integridad numérica de la eGPU TAL COMO ESTÁ ahora, sin cambiar nada.
+#
+# OJO: esto NO pasa por el gate en modo solo-lectura. Un GEMM sostenido más un
+# llenado de la VRAM es la carga más intrusiva que genera este paquete, así que
+# con el enlace degradado, muerto o ilegible el gate tiene que cerrar igual que
+# para una escritura. 'status' sí es solo lectura; esto no.
+oc_verify() { # $1=segundos (opcional)
+  local secs="${1:-$AORUS_OC_VERIFY_SECONDS}" resolved bus out rc
+  if ! domain_oc_is_uint "$secs" || [ "$secs" -le 0 ]; then
+    log_err "los segundos de verificación deben ser un entero positivo (recibí '$secs')."
+    return 2
+  fi
+  resolved="$(oc_resolve_target)" || return $?
+  bus="${resolved%%$'\t'*}"
+  if ! verify_available; then
+    log_err "no hay verificador numérico disponible."
+    log_err "Necesita un python con torch+CUDA; indícalo con AORUS_VERIFY_PYTHON si vive en un venv:"
+    log_err "  sudo AORUS_VERIFY_PYTHON=~/.venvs/egpu-torch-test/bin/python aorus-egpu-oc verify"
+    return 2
+  fi
+  log_info "verificando la eGPU $bus durante ${secs}s (GEMM bit-exacto + patrón en VRAM)..."
+  out="$(verify_numeric_integrity "$bus" "$secs")"; rc=$?
+  case "$rc" in
+    0)   log_info "VERIFICACIÓN OK ($out): la GPU calcula bien."
+         _oc_verify_log "bus=$bus verify=manual veredicto=pasa $out" ;;
+    124) log_err "el verificador se COLGÓ (rc=124). No reintento."
+         _oc_verify_log "bus=$bus verify=manual veredicto=colgado" ;;
+    2)   log_err "el verificador dejó de estar disponible a mitad; sin evidencia."
+         _oc_verify_log "bus=$bus verify=manual veredicto=no-disponible" ;;
+    *)   log_err "VERIFICACIÓN FALLIDA ($out): la GPU está calculando MAL."
+         log_err "Si tienes un perfil con offsets aplicado, quítalo: sudo aorus-egpu-oc reset"
+         _oc_verify_log "bus=$bus verify=manual veredicto=falla $out" ;;
+  esac
+  return "$rc"
 }
 
 # --- caso de uso: status ------------------------------------------------------
@@ -275,6 +508,17 @@ oc_status() {
   log_info "power limit:     ${pmin}-${pmax} W (rango soportado)"
   log_info "reloj máx:       ${gmax} MHz gráfico / ${mmax} MHz memoria"
   log_info "reloj mín:       ${gmin:-?} MHz gráfico / ${mmin:-?} MHz memoria"
+  # La capacidad de offsets se INFORMA, no se promete: lo que diga aquí el
+  # adaptador es lo mismo que decidirá si un perfil con offsets se acepta.
+  local offcap ocg ocm
+  offcap="$(_oc_offcap "$bus")"
+  if domain_oc_offcap_supported "$offcap"; then
+    ocg="$(domain_oc_offcap_window "$offcap" gpu)"
+    ocm="$(domain_oc_offcap_window "$offcap" mem)"
+    log_info "offsets:         sí (NVML) — ventana gráfico [${ocg// /,}] MHz / memoria [${ocm// /,}] MHz"
+  else
+    log_info "offsets:         no disponibles con este adaptador (perfiles con offset se rechazan)"
+  fi
   log_info "--- estado actual ---"
   gpu_state "$bus" | while IFS= read -r l; do log_info "$l"; done
   if [ -r "$AORUS_OC_STATE" ]; then

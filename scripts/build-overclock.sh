@@ -7,7 +7,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PKG="$ROOT/packaging/aorus-egpu-overclock"
 OUT="$ROOT/dist"
-BIN=aorus-egpu-oc
+# Dos entrypoints: la CLI y el TUI de ncurses. Array como en
+# build-health.sh / build-forensics.sh, que es el idioma del repo para
+# esto; `bundle_core` y `bundle_clean` ya toman una lista.
+BINS=(aorus-egpu-oc nvidia-oc)
 
 . "$ROOT/scripts/lib/bundle.sh"
 
@@ -15,7 +18,7 @@ command -v dpkg-deb >/dev/null || { echo "ERROR: falta dpkg-deb" >&2; exit 1; }
 VER="$(awk -F': ' '/^Version:/{print $2; exit}' "$PKG/DEBIAN/control")"
 
 echo "==> ensamblando el núcleo src/ en el paquete"
-bundle_core "$ROOT" "$PKG" "$BIN"
+bundle_core "$ROOT" "$PKG" "${BINS[@]}"
 
 echo "==> normalizando permisos"
 chmod 0755 "$PKG/DEBIAN/postinst" "$PKG/DEBIAN/prerm" "$PKG/DEBIAN/postrm"
@@ -31,7 +34,7 @@ mkdir -p "$OUT"
 DEB="$OUT/aorus-egpu-overclock_${VER}_all.deb"
 dpkg-deb --root-owner-group --build "$PKG" "$DEB"
 
-bundle_clean "$PKG" "$BIN"
+bundle_clean "$PKG" "${BINS[@]}"
 
 echo
 echo "Construido: $DEB"

@@ -10,7 +10,7 @@ La evidencia de por qué está en
 | `aorus-egpu-forensics` | 0.1.0 | nuevo, recomendado al depurar | capas 1-2 sí; capa 3 (ramoops) por construcción |
 | `aorus-egpu-health` | 0.1.0 | nuevo — detector de incidentes | las reglas y el `scan` sí; el servicio de vigilancia continua, no |
 | `aorus-egpu-igpu-display` | 0.1.0 | nuevo — [diseño y medidas](../igpu-display.md) | el gate y el inventario sí; el cambio de modeset requiere reiniciar |
-| `aorus-egpu-overclock` | 0.1.0 | **en desarrollo, no usar** | no |
+| `aorus-egpu-overclock` | 0.1.0 | **en desarrollo, no usar** — [palancas y perfiles medidos](../overclock.md); entrega `aorus-egpu-oc` (CLI) y `nvidia-oc` (TUI) | no |
 | `aorus-egpu-config` | 0.5.9 | **superseded** (archivo) | lo estuvo hasta el 2026-06-28; purgado |
 | `aorus-egpu-nvidia-dkms` | 595.71.05-aorus17 | **superseded + deuda de versión** | lo estuvo hasta el 2026-06-28; purgado |
 
@@ -43,8 +43,26 @@ sudo apt install ./dist/aorus-egpu-forensics_*.deb
   Necesita un rebase al tag nuevo antes de volver a usarse.
   La eGPU funciona sin ninguna de sus palancas.
 - **`aorus-egpu-overclock`.**
-  El núcleo y los tests están hechos, pero no se ha validado en hardware y la
-  capacidad está aparcada a propósito.
+  El núcleo y los tests están hechos, pero no se ha validado en hardware.
+  Entrega dos entrypoints:
+  `aorus-egpu-oc` (CLI) y `nvidia-oc` (el TUI de ncurses, pura presentación
+  sobre la CLI).
+  De sus perfiles entregados solo `efficient` tiene efecto real medido
+  (+31% de eficiencia por -13% de rendimiento):
+  el límite de potencia no se puede subir —`max_limit` == `default_limit` ==
+  180 W— y la carga más pesada medida consume 139 W de esos 180,
+  así que cualquier tope entre 140 y 180 W es decorativo.
+  Lo que sí existe, y antes esta página daba por imposible, son los **offsets**
+  de ±MHz por NVML:
+  ventana de -1000 a +1000 MHz en el núcleo y de -2000 a +6000 MHz en la
+  memoria, medida el 2026-11-02.
+  Un offset POSITIVO no se aplica sin pasar el gate de verificación numérica
+  bit-exacta, y dónde está su borde real se está midiendo con
+  `tools/egpu-oc-edge`
+  ([H25](../research/reliability-hypothesis-ledger.md#h25)).
+  Las palancas que el caso de uso de IA sí necesita —persistencia del driver y
+  modo de cómputo exclusivo— todavía no están implementadas:
+  ver [`../overclock.md`](../overclock.md).
 
 ## Un paquete por capacidad
 
@@ -55,7 +73,7 @@ cada una se pueda instalar, revertir y razonar por separado:
 - `aorus-egpu-forensics` — que un cuelgue deje evidencia.
 - `aorus-egpu-health` — que un incidente se sepa cuando pasa, con veredicto de
   dónde mirar.
-- `aorus-egpu-overclock` — que se pueda ajustar potencia y relojes.
+- `aorus-egpu-overclock` — que se pueda ajustar potencia, relojes y offsets.
 
 Todas comparten el mismo núcleo `src/`, ensamblado en el payload por
 `scripts/lib/bundle.sh`;

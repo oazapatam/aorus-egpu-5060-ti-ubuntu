@@ -6,7 +6,10 @@
 #
 # DEFENSIVO a propósito (lección de la v0.5.4 del paquete: un eGPU semi-roto
 # cuelga a nvidia-smi en estado-D y martillearlo lo dejaba wedged):
-#   - CADA invocación va acotada por `timeout`;
+#   - CADA invocación va acotada por `timeout -k`: SIGTERM al agotar el
+#     presupuesto, SIGKILL una gracia después. El `-k` es la mitad que faltaba
+#     —ver la nota sobre `AORUS_SMI_KILL_GRACE` más abajo—; sin él esta primera
+#     viñeta era una declaración falsa, no una garantía;
 #   - exit 124 (colgado) se propaga como rc 124 y el caso de uso ABORTA, no
 #     reintenta;
 #   - toda escritura se dirige con `-i <bus-id>`, nunca al índice de GPU (los
@@ -15,9 +18,20 @@
 
 # shellcheck shell=bash
 
-AORUS_SMI_TIMEOUT="${AORUS_SMI_TIMEOUT:-12}"
+aorus_use domain/proc
 
-_smi() { timeout "$AORUS_SMI_TIMEOUT" nvidia-smi "$@"; }
+AORUS_SMI_TIMEOUT="${AORUS_SMI_TIMEOUT:-12}"
+# `-k` NO es decorativo, y su ausencia fue un defecto real (2026-11-07): sin él
+# `timeout` manda el SIGTERM al agotar el presupuesto y **se queda esperando al
+# hijo**. Un proceso que no muere con TERM —y uno atascado hablando con un eGPU
+# semi-roto no muere— cuelga a `timeout` con él, así que el 124 que el caso de
+# uso espera para ABORTAR no llega nunca y con él se pierde la reversión, el
+# registro y el aviso. Con `-k` llega el SIGKILL tras una gracia, y la gracia la
+# decide domain/proc.sh. Se calcula UNA vez, al cargar el adaptador, porque esto
+# se invoca docenas de veces y no va a forkear una subshell en cada llamada.
+AORUS_SMI_KILL_GRACE="$(domain_proc_kill_grace "$AORUS_SMI_TIMEOUT")"
+
+_smi() { timeout -k "$AORUS_SMI_KILL_GRACE" "$AORUS_SMI_TIMEOUT" nvidia-smi "$@"; }
 
 gpu_available() { command -v nvidia-smi >/dev/null 2>&1; }
 

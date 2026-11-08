@@ -666,11 +666,19 @@ Están aquí en vez de documentadas como si fueran diseño.
    paquete— y el coste son unos pocos KB;
    si algún día las capas crecen, el criterio habría que revisarlo.
 
-6. **`docs/overclock.md` no existe y el OC está aparcado.**
-   Las referencias colgadas se quitaron (de `domain/overclock.sh`, del texto de
-   ayuda de `aorus-egpu-oc` y del `Documentation=` de la unit), pero el paquete
-   sigue sin documento propio porque la capacidad está sin validar.
-   Cuando se retome, el documento va antes que el `apt install`.
+6. **El OC ya tiene documento, pero le faltan las palancas que importan.**
+   [`overclock.md`](./overclock.md) existe desde el 2026-11-02 con la medición
+   de los cuatro perfiles, así que las referencias de `domain/overclock.sh` y
+   del texto de ayuda de `aorus-egpu-oc` ya resuelven.
+   Lo que queda abierto es otra cosa:
+   de las palancas medidas solo `efficient` tiene efecto —`performance` y
+   `balanced` se retiraron por inertes— y las dos que el caso de uso de IA
+   necesita de verdad, `persistence_mode` y `compute_mode`, **no existen en el
+   dominio ni en el adaptador**.
+   Sus perfiles están especificados en el documento y deliberadamente **no
+   entregados**:
+   el parser rechaza una clave desconocida, así que entregarlos hoy entregaría
+   dos perfiles que fallan al aplicarse.
 
 ### Resuelto después de la primera redacción de este documento
 

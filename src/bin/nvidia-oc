@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""nvidia-oc — interfaz de texto (ncurses) para todo el overclock de la eGPU.
+
+CAPA bin/: ENTRYPOINT FINO, y aquí eso es una restricción fuerte, no una
+etiqueta. Este fichero NO contiene ni una regla de negocio, ni una escritura al
+hardware, ni un `nvidia-smi`, ni una llamada NVML. Todo lo que hace es
+PRESENTAR y DELEGAR: el backend es `aorus-egpu-oc`, el mismo entrypoint que se
+usa a mano, y por él pasan sin excepción los gates del paquete (R4, enlace,
+verificación numérica). Ver docs/architecture.md.
+
+POR QUÉ ASÍ, Y NO HABLANDO CON LA TARJETA DIRECTAMENTE
+------------------------------------------------------
+Un TUI que escribiera offsets por su cuenta sería un segundo camino de
+escritura, y por tanto un camino SIN gates:
+  - sin gate R4 no hay nada que impida tocar la GPU interna (ya costó un
+    Xid 79),
+  - sin gate de enlace se escribe con el túnel degradado (ya congeló el host),
+  - y sobre todo: sin el gate de verificación, un offset POSITIVO se aplicaría
+    sin que nadie compruebe que la tarjeta sigue calculando bien. Esa es la
+    clase de fallo que no se ve —no se cae, calcula mal— y es justo la que un
+    menú bonito invita a provocar con dos pulsaciones.
+Así que las acciones de este TUI son literalmente `aorus-egpu-oc apply|reset|
+verify`, y la salida de esos mandatos se muestra TAL CUAL, incluidos sus
+rechazos. Si el gate dice no, aquí se lee el no completo, con su motivo.
+
+LO QUE SÍ APORTA (si no aportara nada, no debería existir)
+----------------------------------------------------------
+  1. Estado en una pantalla: enlace, rangos de potencia y reloj, ventana de
+     offsets, offsets vigentes, estado actual y perfil aplicado, refrescado
+     en segundo plano y con marca de "esto es de hace N s" cuando el refresco
+     tarda o falla. La tarjeta se vuelve ilegible cuando pide reset
+     (`[N/A]` en todo), y eso se dice en vez de pintar ceros.
+  2. El entorno resuelto por ti: los offsets y el verificador necesitan un
+     python con `pynvml` y con `torch`, que en esta máquina vive en un venv.
+     A mano eso es acordarse de
+     `sudo AORUS_NVML_PYTHON=~/.venvs/... aorus-egpu-oc status`. Aquí se
+     detecta y se reenvía solo.
+  3. Un compositor de offsets que NO inventa un camino de escritura: escribe
+     un perfil EFÍMERO en un directorio temporal y llama a
+     `aorus-egpu-oc apply` con `AORUS_OC_PROFILE_DIR` apuntando ahí. El perfil
+     pasa por el parser estricto y por todos los gates igual que uno de
+     /etc, y no ensucia la lista de perfiles del sistema.
+  4. La última medición de borde (`tools/egpu-oc-edge`) a la vista, con su
+     cobertura real, para poder cargar el valor recomendado en el compositor
+     en vez de teclear un número de memoria.
+
+Dependencias: solo la stdlib (`curses`). Nada de instalar nada.
+"""
+import curses
+import json
+import locale
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+REPO_HINT = Path(__file__).resolve().parents[2]
+EDGE_LOG_DIR = Path("/var/log/aorus-egpu/oc-edge")
+VERIFY_LOG = Path("/var/log/aorus-egpu/oc-verify.log")
+
+# El refresco de `status` encadena varias llamadas a nvidia-smi y a NVML. Con
+# la tarjeta en el estado malo -pidiendo un full-chip reset tras un Xid- se
+# midió tardando MÁS DE 60 s (2026-11-05), y luego `nvidia-smi` directamente
+# dejó de volver. Por eso el refresco va en un HILO y con timeout: la interfaz
+# nunca se bloquea esperando al hardware, y un refresco que no vuelve se
+# muestra como tal en vez de congelar la pantalla.
+STATUS_TIMEOUT = 40
+STATUS_PERIOD = 8
+PROBE_TIMEOUT = 25
+
+STEPS = (5, 15, 25, 50, 100)
+
+# Candidatos a intérprete con pynvml/torch. El del entorno manda; después, el
+# venv del laboratorio de esta máquina; por último el del sistema.
+PY_CANDIDATES = (
+    os.environ.get("AORUS_NVML_PYTHON"),
+    os.environ.get("AORUS_VERIFY_PYTHON"),
+    str(Path.home() / ".venvs/egpu-torch-test/bin/python"),
+    "/usr/bin/python3",
+    "python3",
+)
+
+
+# ---------------------------------------------------------------------------
+# backend: todo sale de aorus-egpu-oc
+# ---------------------------------------------------------------------------
+def find_cli():
+    """El entrypoint del paquete. El del repo gana si estamos en el repo.
+
+    Así el TUI se puede probar desde el checkout sin instalar el .deb, y en una
+    máquina con el paquete puesto usa el instalado.
+    """
+    local = REPO_HINT / "src" / "bin" / "aorus-egpu-oc"
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    for candidate in ("/usr/sbin/aorus-egpu-oc", "/usr/bin/aorus-egpu-oc"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("aorus-egpu-oc")
+
+
+def run(argv, timeout, env=None):
+    """(rc, salida combinada). rc 124 = agotó el tiempo, como en todo el repo."""
+    merged = dict(os.environ)
+    if env:
+        merged.update(env)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=timeout, env=merged)
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except OSError as exc:
+        return 127, f"{type(exc).__name__}: {exc}"
+
+
+def probe_python(path):
+    """Qué sabe hacer un intérprete: (pynvml, torch). Barato y acotado."""
+    if not path:
+        return False, False
+    has = []
+    for module in ("pynvml", "torch"):
+        rc, _ = run([path, "-I", "-c", f"import {module}"], PROBE_TIMEOUT)
+        has.append(rc == 0)
+    return has[0], has[1]
+
+
+class Backend:
+    """Estado compartido entre el hilo de refresco y el dibujo."""
+
+    def __init__(self, cli):
+        self.cli = cli
+        self.lock = threading.Lock()
+        self.status_text = ""
+        self.status_rc = None
+        self.status_at = 0.0
+        self.refreshing = False
+        self.profiles = []
+        self.env_python = None
+        self.env_pynvml = False
+        self.env_torch = False
+        self.env_ready = False
+        self.message = ""
+        self._want = threading.Event()
+        self._stop = threading.Event()
+
+    # -- entorno ------------------------------------------------------------
+    def detect_env(self):
+        seen = set()
+        best = (None, False, False)
+        for candidate in PY_CANDIDATES:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            resolved = shutil.which(candidate) or candidate
+            if not os.path.exists(resolved):
+                continue
+            pynvml, torch = probe_python(resolved)
+            if pynvml and torch:
+                best = (resolved, True, True)
+                break
+            if (pynvml or torch) and not best[0]:
+                best = (resolved, pynvml, torch)
+        with self.lock:
+            self.env_python, self.env_pynvml, self.env_torch = best
+            self.env_ready = True
+
+    def cli_env(self):
+        """Las variables que el backend necesita, resueltas una sola vez.
+
+        Se pasan con `env VAR=... ` explícito al elevar con sudo: `sudo -E` no
+        es fiable (en este sudoers avisa y lo IGNORA), así que confiar en él
+        dejaría al CLI buscando perfiles en /etc y sin pynvml.
+        """
+        with self.lock:
+            python = self.env_python
+        if not python:
+            return {}
+        return {"AORUS_NVML_PYTHON": python, "AORUS_VERIFY_PYTHON": python}
+
+    # -- refresco -----------------------------------------------------------
+    def request_refresh(self):
+        self._want.set()
+
+    def stop(self):
+        self._stop.set()
+        self._want.set()
+
+    def loop(self):
+        self.detect_env()
+        while not self._stop.is_set():
+            with self.lock:
+                self.refreshing = True
+            self._refresh_profiles()
+            self._refresh_status()
+            with self.lock:
+                self.refreshing = False
+            self._want.wait(STATUS_PERIOD)
+            self._want.clear()
+
+    def _refresh_status(self):
+        if not self.cli:
+            with self.lock:
+                self.status_text = "no encuentro el entrypoint aorus-egpu-oc"
+                self.status_rc = 127
+                self.status_at = time.time()
+            return
+        rc, out = run([self.cli, "status"], STATUS_TIMEOUT, self.cli_env())
+        with self.lock:
+            self.status_rc = rc
+            self.status_text = out.rstrip()
+            self.status_at = time.time()
+
+    def _refresh_profiles(self):
+        if not self.cli:
+            return
+        rc, out = run([self.cli, "list"], STATUS_TIMEOUT, self.cli_env())
+        if rc != 0:
+            return
+        found = []
+        for line in out.splitlines():
+            match = re.match(r"^\s{2,}(\S+)\s*(?:—|-)?\s*(.*)$", line)
+            if match and not line.strip().startswith("perfiles"):
+                found.append((match.group(1), match.group(2).strip()))
+        if found:
+            with self.lock:
+                self.profiles = found
+
+    # -- lo que el dibujo necesita extraído del texto -----------------------
+    def snapshot(self):
+        with self.lock:
+            return {"text": self.status_text, "rc": self.status_rc,
+                    "at": self.status_at, "refreshing": self.refreshing,
+                    "profiles": list(self.profiles),
+                    "python": self.env_python, "pynvml": self.env_pynvml,
+                    "torch": self.env_torch, "env_ready": self.env_ready}
+
+
+def parse_field(text, label):
+    match = re.search(rf"^{re.escape(label)}:\s*(.+)$", text, re.M)
+    return match.group(1).strip() if match else ""
+
+
+def parse_windows(text):
+    """Ventana de offsets tal como la informa `status`. None si no hay."""
+    match = re.search(r"ventana gráfico \[(-?\d+),(-?\d+)\] MHz / "
+                      r"memoria \[(-?\d+),(-?\d+)\]", text)
+    if not match:
+        return None
+    values = [int(v) for v in match.groups()]
+    return (values[0], values[1]), (values[2], values[3])
+
+
+def parse_current_offsets(text):
+    """Los offsets VIGENTES, si `status` los publica. (None, None) si no."""
+    match = re.search(r"gpu_offset=(-?\d+)\s+mem_offset=(-?\d+)", text)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return None, None
+
+
+def last_edge_summary():
+    """El 90-summary.json más reciente de tools/egpu-oc-edge, o None."""
+    try:
+        candidates = sorted(EDGE_LOG_DIR.glob("*/90-summary.json"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+            data["_path"] = str(path)
+            return data
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# dibujo
+# ---------------------------------------------------------------------------
+class Theme:
+    def __init__(self):
+        self.ok = self.warn = self.bad = self.dim = self.title = 0
+        self.sel = curses.A_REVERSE
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_GREEN, -1)
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)
+            curses.init_pair(3, curses.COLOR_RED, -1)
+            curses.init_pair(4, curses.COLOR_CYAN, -1)
+            self.ok = curses.color_pair(1)
+            self.warn = curses.color_pair(2)
+            self.bad = curses.color_pair(3)
+            self.title = curses.color_pair(4) | curses.A_BOLD
+            self.dim = curses.A_DIM
+            self.sel = curses.color_pair(4) | curses.A_REVERSE
+        except curses.error:
+            # Terminal sin color: todo en atributos monocromos. No es un fallo.
+            self.title = curses.A_BOLD
+
+
+def verdict_attr(theme, text):
+    low = text.lower()
+    if "healthy" in low:
+        return theme.ok
+    if "degraded" in low or "aviso" in low:
+        return theme.warn
+    if "unknown" in low or "dead" in low or "error" in low or "n/a" in low:
+        return theme.bad
+    return 0
+
+
+class App:
+    def __init__(self, stdscr, backend):
+        self.scr = stdscr
+        self.backend = backend
+        self.theme = Theme()
+        self.selected = 0
+        self.focus = "perfiles"        # perfiles | offsets
+        self.off_field = 0             # 0 = núcleo, 1 = memoria
+        self.offsets = [0, 0]
+        self.step_index = 1
+        self.notice = ""
+        self.scratch = None
+
+    # -- utilidades de dibujo ----------------------------------------------
+    def put(self, row, col, text, attr=0):
+        height, width = self.scr.getmaxyx()
+        if row < 0 or row >= height or col >= width:
+            return row + 1
+        # El recorte se hace por CARACTERES antes de llamar a curses, no con el
+        # `n` de addnstr: ese `n` cuenta BYTES, así que con texto en español
+        # -cada tilde son 2 bytes, cada '─' de los separadores son 3- la línea
+        # se cortaba mucho antes de llegar al borde de la ventana.
+        text = text[:max(0, width - col - 1)]
+        try:
+            self.scr.addstr(row, col, text, attr)
+        except curses.error:
+            pass
+        return row + 1
+
+    def section(self, row, title):
+        _h, width = self.scr.getmaxyx()
+        label = f"─ {title} "
+        self.put(row, 0, label + "─" * max(0, width - len(label) - 1),
+                 self.theme.title)
+        return row + 1
+
+    # -- pantallas ----------------------------------------------------------
+    def draw(self, snap):
+        self.scr.erase()
+        height, width = self.scr.getmaxyx()
+        if height < 18 or width < 62:
+            self.put(0, 0, "ventana demasiado pequeña (mínimo 62x18)",
+                     self.theme.bad)
+            self.scr.refresh()
+            return
+
+        text = snap["text"]
+        bus = parse_field(text, "eGPU") or "?"
+        link = parse_field(text, "enlace")
+        age = int(time.time() - snap["at"]) if snap["at"] else None
+
+        head = f" nvidia-oc  ·  eGPU {bus} "
+        state = "refrescando…" if snap["refreshing"] else (
+            f"hace {age}s" if age is not None else "sin datos")
+        if snap["rc"] == 124:
+            state = "el refresco AGOTÓ el tiempo"
+        self.put(0, 0, head.ljust(max(0, width - len(state) - 2)) + state,
+                 self.theme.title)
+
+        row = 1
+        row = self.section(row, "ESTADO")
+        if snap["rc"] not in (0, None):
+            row = self.put(row, 1, f"aorus-egpu-oc status devolvió rc={snap['rc']}"
+                           + (" (colgado: la tarjeta no responde)"
+                              if snap["rc"] == 124 else ""), self.theme.bad)
+        if link:
+            row = self.put(row, 1, f"enlace     {link}", verdict_attr(self.theme, link))
+        for label, key in (("potencia   ", "power limit"),
+                           ("reloj máx  ", "reloj máx"),
+                           ("reloj mín  ", "reloj mín"),
+                           ("offsets    ", "offsets"),
+                           ("perfil     ", "perfil aplicado")):
+            value = parse_field(text, key)
+            if value:
+                row = self.put(row, 1, f"{label}{value}",
+                               verdict_attr(self.theme, value))
+        # El estado instantáneo que publica gpu_state, tal cual.
+        live = re.findall(r"^([a-z_]+)=(\S+)$", text, re.M)
+        if live:
+            row = self.put(row, 1, "ahora      " +
+                           "  ".join(f"{k}={v}" for k, v in live[:5]))
+        if "[N/A]" in text:
+            row = self.put(row, 1, "la tarjeta devuelve [N/A]: el driver pide un "
+                           "full-chip reset (reconecta el Thunderbolt)",
+                           self.theme.bad)
+
+        row = self.section(row + 1, "ENTORNO")
+        if not snap["env_ready"]:
+            row = self.put(row, 1, "detectando intérprete con pynvml/torch…",
+                           self.theme.dim)
+        else:
+            python = snap["python"] or "ninguno"
+            row = self.put(row, 1, f"python     {python}")
+            marks = (f"pynvml {'sí' if snap['pynvml'] else 'NO'}   "
+                     f"torch {'sí' if snap['torch'] else 'NO'}")
+            attr = self.theme.ok if (snap["pynvml"] and snap["torch"]) else self.theme.warn
+            row = self.put(row, 1, f"módulos    {marks}", attr)
+            if not snap["pynvml"]:
+                row = self.put(row, 1, "sin pynvml los offsets se declaran NO "
+                               "soportados y los perfiles que los pidan se "
+                               "rechazan", self.theme.dim)
+            if not snap["torch"]:
+                row = self.put(row, 1, "sin torch no hay verificador: un offset "
+                               "POSITIVO no se puede aplicar (el gate cierra)",
+                               self.theme.dim)
+        row = self.put(row, 1, f"backend    {self.backend.cli or 'NO ENCONTRADO'}",
+                       0 if self.backend.cli else self.theme.bad)
+        row = self.put(row, 1, "privilegio " + ("root" if os.geteuid() == 0
+                       else "usuario (las escrituras elevan con sudo)"))
+
+        row = self.section(row + 1, "PERFILES")
+        profiles = snap["profiles"]
+        if not profiles:
+            row = self.put(row, 1, "ninguno legible todavía", self.theme.dim)
+        for index, (name, desc) in enumerate(profiles):
+            marker = "›" if (index == self.selected and self.focus == "perfiles") else " "
+            attr = self.theme.sel if (index == self.selected
+                                      and self.focus == "perfiles") else 0
+            row = self.put(row, 1, f"{marker} {name:<12} {desc}"[:max(0, width - 3)],
+                           attr)
+
+        windows = parse_windows(text)
+        row = self.section(row + 1, "OFFSETS (compone un perfil efímero)")
+        if windows is None:
+            row = self.put(row, 1, "no disponibles: el adaptador no declara "
+                           "ventana (falta pynvml, o la tarjeta no responde)",
+                           self.theme.dim)
+        else:
+            current = parse_current_offsets(text)
+            for index, (label, bounds) in enumerate((("núcleo ", windows[0]),
+                                                     ("memoria", windows[1]))):
+                focused = (self.focus == "offsets" and self.off_field == index)
+                value = self.offsets[index]
+                attr = self.theme.sel if focused else 0
+                if value > 0 and not focused:
+                    attr = self.theme.warn
+                vigente = ""
+                if current[index] is not None:
+                    vigente = f"   (vigente {current[index]:+d})"
+                row = self.put(row, 1,
+                               f"{'›' if focused else ' '} {label}  "
+                               f"[ {value:+5d} ] MHz   ventana "
+                               f"[{bounds[0]:+d},{bounds[1]:+d}]{vigente}", attr)
+            row = self.put(row, 1, f"  escalón {STEPS[self.step_index]} MHz "
+                           "(← → ajusta, [ ] cambia el escalón, 0 a cero)",
+                           self.theme.dim)
+            if max(self.offsets) > 0:
+                row = self.put(row, 1, "  un offset POSITIVO exige el gate de "
+                               "verificación: aplicar → medir bit a bit → "
+                               "revertir si calcula mal", self.theme.warn)
+
+        edge = last_edge_summary()
+        row = self.section(row + 1, "ÚLTIMA MEDICIÓN DE BORDE")
+        if edge is None:
+            row = self.put(row, 1, "ninguna. Mídela con tools/egpu-oc-edge "
+                           "(ver docs/overclock.md)", self.theme.dim)
+        else:
+            for which, label in (("gpu", "núcleo "), ("mem", "memoria")):
+                data = (edge.get("domains") or {}).get(which)
+                if not data:
+                    continue
+                confirmed = data.get("confirmed")
+                cov = data.get("coverage") or {}
+                row = self.put(row, 1,
+                               f"{label}  borde {data.get('edge', 0):+d}  "
+                               f"confirmado "
+                               f"{(f'{confirmed:+d}' if confirmed is not None else 'NO')}"
+                               f"  recomendado {data.get('recommended', 0):+d}"
+                               f"  (n={cov.get('runs', 0)}, "
+                               f"{cov.get('gemm_iters', 0)} it)")
+            if edge.get("aborted"):
+                row = self.put(row, 1, f"abortada: {edge['aborted']}", self.theme.warn)
+            row = self.put(row, 1, "'m' carga los recomendados en el compositor",
+                           self.theme.dim)
+
+        if self.notice:
+            row = self.put(row + 1, 1, self.notice, self.theme.warn)
+
+        keys = ("↑↓ perfil · a aplicar · d dry-run · r reset · v verificar · "
+                "tab offsets · A aplicar offsets · m recomendado · R refrescar · "
+                "? ayuda · q salir")
+        self.put(height - 1, 0, keys[:max(0, width - 1)], self.theme.title)
+        self.scr.refresh()
+
+    # -- acciones ------------------------------------------------------------
+    def shell_out(self, argv, title, env=None):
+        """Suspende curses y deja que el mandato hable por sí mismo.
+
+        A propósito NO se reformatea su salida: lo que imprime
+        `aorus-egpu-oc` cuando un gate rechaza es el motivo completo, y
+        resumirlo en una línea de estado sería esconder justo lo que hay que
+        leer. Además así `sudo` puede pedir la contraseña con el terminal
+        entero para él.
+        """
+        curses.def_prog_mode()
+        curses.endwin()
+        merged = dict(os.environ)
+        merged.update(self.backend.cli_env())
+        if env:
+            merged.update(env)
+        print("\n" + "=" * 70)
+        print(f"  {title}")
+        print(f"  $ {' '.join(argv)}")
+        print("=" * 70, flush=True)
+        try:
+            rc = subprocess.call(argv, env=merged)
+        except OSError as exc:
+            rc = 127
+            print(f"no pude ejecutarlo: {exc}")
+        print("=" * 70)
+        print(f"  rc={rc}")
+        try:
+            input("  pulsa Enter para volver a nvidia-oc… ")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        curses.reset_prog_mode()
+        self.scr.clear()
+        self.scr.refresh()
+        self.backend.request_refresh()
+        return rc
+
+    def sudo_argv(self, args, env=None):
+        """El mandato, elevado solo si hace falta y con el entorno explícito."""
+        cli_env = dict(self.backend.cli_env())
+        if env:
+            cli_env.update(env)
+        argv = [self.backend.cli, *args]
+        if os.geteuid() != 0:
+            pairs = [f"{k}={v}" for k, v in cli_env.items()]
+            argv = ["sudo", "--", "env", *pairs, *argv]
+        return argv
+
+    def confirm(self, question):
+        """Confirmación en la propia barra: sin diálogos que tapen el estado."""
+        height, width = self.scr.getmaxyx()
+        self.put(height - 2, 0, (question + "  [s/N] ").ljust(width - 1),
+                 self.theme.warn)
+        self.scr.refresh()
+        self.scr.nodelay(False)
+        try:
+            key = self.scr.getch()
+        finally:
+            self.scr.nodelay(True)
+        return key in (ord("s"), ord("S"), ord("y"), ord("Y"))
+
+    def ask_number(self, prompt, default):
+        height, width = self.scr.getmaxyx()
+        self.put(height - 2, 0, f"{prompt} [{default}]: ".ljust(width - 1),
+                 self.theme.warn)
+        self.scr.refresh()
+        curses.echo()
+        self.scr.nodelay(False)
+        try:
+            raw = self.scr.getstr(height - 2, len(prompt) + len(str(default)) + 4,
+                                  8).decode("utf-8", "replace").strip()
+        except curses.error:
+            raw = ""
+        finally:
+            curses.noecho()
+            self.scr.nodelay(True)
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+
+    def selected_profile(self, snap):
+        profiles = snap["profiles"]
+        if not profiles:
+            return None
+        return profiles[min(self.selected, len(profiles) - 1)][0]
+
+    def apply_offsets(self, snap):
+        """Perfil EFÍMERO + AORUS_OC_PROFILE_DIR: ni un camino de escritura nuevo.
+
+        El perfil se escribe en un directorio temporal y se aplica con el CLI
+        apuntado ahí, así que lo valida el mismo parser estricto, lo planifica
+        el mismo dominio y lo autorizan los mismos gates que a un perfil de
+        /etc — y la lista de perfiles del sistema no se ensucia con un
+        'scratch' que alguien aplicaría mañana sin saber qué es.
+        """
+        core, mem = self.offsets
+        if core == 0 and mem == 0:
+            self.notice = ("los dos offsets están a 0: eso es el estado de "
+                           "fábrica, aplica el perfil 'stock' si es lo que quieres")
+            return
+        if not snap["pynvml"]:
+            self.notice = "sin pynvml no hay offsets; el CLI lo rechazaría"
+            return
+        if max(core, mem) > 0 and not snap["torch"]:
+            self.notice = ("offset positivo sin torch: el gate de verificación "
+                           "cerraría. Instala torch o usa un valor negativo")
+            return
+        if not self.confirm(f"aplicar núcleo {core:+d} / memoria {mem:+d} MHz "
+                            "por un perfil efímero?"):
+            return
+        if self.scratch is None:
+            self.scratch = tempfile.mkdtemp(prefix="nvidia-oc-")
+        profile = Path(self.scratch) / "nvidia-oc.profile"
+        lines = ["# desc: perfil efímero compuesto por nvidia-oc"]
+        if core:
+            lines.append(f"gpu_clock_offset_mhz={core}")
+        if mem:
+            lines.append(f"mem_clock_offset_mhz={mem}")
+        profile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.chmod(self.scratch, 0o755)
+        os.chmod(profile, 0o644)
+        self.shell_out(self.sudo_argv(["apply", "nvidia-oc"],
+                                      {"AORUS_OC_PROFILE_DIR": self.scratch}),
+                       f"aplicando offsets núcleo {core:+d} / memoria {mem:+d}")
+
+    def load_recommended(self):
+        edge = last_edge_summary()
+        if not edge:
+            self.notice = "no hay medición previa que cargar"
+            return
+        domains = edge.get("domains") or {}
+        self.offsets = [int((domains.get("gpu") or {}).get("recommended", 0)),
+                        int((domains.get("mem") or {}).get("recommended", 0))]
+        self.focus = "offsets"
+        self.notice = ("cargados los valores RECOMENDADOS (borde menos margen). "
+                       "Lee su cobertura: no son una garantía")
+
+    def help_screen(self):
+        curses.def_prog_mode()
+        curses.endwin()
+        print(__doc__)
+        print("""
+TECLAS
+  ↑ ↓ / k j   mover la selección de perfil
+  a           aplicar el perfil seleccionado (eleva con sudo si hace falta)
+  d           dry-run del perfil: muestra el PLAN sin tocar el hardware
+  r           reset a valores de fábrica (relojes, potencia y offsets)
+  v           verificar la integridad numérica tal como está la tarjeta ahora
+  tab         alternar el foco entre la lista de perfiles y los offsets
+  ← →         ajustar el offset enfocado;  [ ]  cambiar el escalón
+  0           poner los dos offsets del compositor a 0
+  m           cargar los valores recomendados de la última medición de borde
+  A           aplicar los offsets del compositor (perfil efímero, con gates)
+  R           refrescar ya;  ? esta ayuda;  q salir
+
+LO QUE ESTE PROGRAMA NO HACE
+  No escribe en la GPU. Cada acción es una llamada a aorus-egpu-oc, así que
+  los gates R4, de enlace y de verificación numérica se aplican igual que a
+  mano, y sus rechazos se muestran completos.
+""")
+        try:
+            input("  pulsa Enter para volver… ")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        curses.reset_prog_mode()
+        self.scr.clear()
+        self.scr.refresh()
+
+    # -- bucle ---------------------------------------------------------------
+    def run(self):
+        self.scr.nodelay(True)
+        self.scr.timeout(250)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass          # terminal sin control de cursor: no es un fallo
+        while True:
+            snap = self.backend.snapshot()
+            windows = parse_windows(snap["text"])
+            self.draw(snap)
+            try:
+                key = self.scr.getch()
+            except KeyboardInterrupt:
+                return
+            if key == -1:
+                continue
+            self.notice = ""
+            if key in (ord("q"), ord("Q")):
+                return
+            if key == curses.KEY_RESIZE:
+                self.scr.clear()
+                continue
+            if key in (ord("R"),):
+                self.backend.request_refresh()
+            elif key in (ord("?"), ord("h")):
+                self.help_screen()
+            elif key == ord("\t"):
+                self.focus = "offsets" if self.focus == "perfiles" else "perfiles"
+            elif key in (curses.KEY_DOWN, ord("j")):
+                if self.focus == "offsets":
+                    self.off_field = 1 - self.off_field
+                else:
+                    self.selected = min(self.selected + 1,
+                                        max(0, len(snap["profiles"]) - 1))
+            elif key in (curses.KEY_UP, ord("k")):
+                if self.focus == "offsets":
+                    self.off_field = 1 - self.off_field
+                else:
+                    self.selected = max(0, self.selected - 1)
+            elif key in (curses.KEY_LEFT, curses.KEY_RIGHT) and windows:
+                delta = STEPS[self.step_index]
+                if key == curses.KEY_LEFT:
+                    delta = -delta
+                low, high = windows[self.off_field]
+                self.offsets[self.off_field] = max(
+                    low, min(high, self.offsets[self.off_field] + delta))
+                self.focus = "offsets"
+            elif key == ord("["):
+                self.step_index = max(0, self.step_index - 1)
+            elif key == ord("]"):
+                self.step_index = min(len(STEPS) - 1, self.step_index + 1)
+            elif key == ord("0"):
+                self.offsets = [0, 0]
+            elif key == ord("m"):
+                self.load_recommended()
+            elif key == ord("A"):
+                self.apply_offsets(snap)
+            elif key == ord("a"):
+                name = self.selected_profile(snap)
+                if not name:
+                    self.notice = "no hay perfil seleccionado"
+                elif self.confirm(f"aplicar el perfil '{name}'?"):
+                    self.shell_out(self.sudo_argv(["apply", name]),
+                                   f"aplicando el perfil '{name}'")
+            elif key == ord("d"):
+                name = self.selected_profile(snap)
+                if name:
+                    self.shell_out([self.backend.cli, "--dry-run", "apply", name],
+                                   f"dry-run del perfil '{name}' (no toca nada)")
+            elif key == ord("r"):
+                if self.confirm("resetear la eGPU a valores de fábrica?"):
+                    self.shell_out(self.sudo_argv(["reset"]),
+                                   "reset a valores de fábrica")
+            elif key == ord("v"):
+                seconds = self.ask_number("segundos de verificación", 25)
+                self.shell_out([self.backend.cli, "verify", str(seconds)],
+                               f"verificando {seconds}s (GEMM bit-exacto + VRAM)")
+
+
+def main():
+    locale.setlocale(locale.LC_ALL, "")
+    cli = find_cli()
+    backend = Backend(cli)
+    worker = threading.Thread(target=backend.loop, daemon=True)
+    worker.start()
+    app = None
+    try:
+        app = curses.wrapper(lambda scr: _boot(scr, backend))
+    finally:
+        backend.stop()
+        if isinstance(app, App) and app.scratch:
+            shutil.rmtree(app.scratch, ignore_errors=True)
+    return 0
+
+
+def _boot(scr, backend):
+    app = App(scr, backend)
+    app.run()
+    return app
+
+
+if __name__ == "__main__":
+    if not sys.stdout.isatty():
+        print("nvidia-oc necesita un terminal interactivo.\n"
+              "Para scripts y servicios usa aorus-egpu-oc, que es el backend "
+              "de este TUI y tiene la misma funcionalidad sin interfaz.",
+              file=sys.stderr)
+        raise SystemExit(2)
+    raise SystemExit(main())

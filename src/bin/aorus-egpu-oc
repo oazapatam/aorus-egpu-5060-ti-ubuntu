@@ -24,17 +24,32 @@ usage() {
 	  aorus-egpu-oc list               perfiles disponibles
 	  aorus-egpu-oc apply <perfil>     aplica un perfil
 	  aorus-egpu-oc reset              vuelve a valores de fábrica
+	  aorus-egpu-oc verify [segundos]  mide si la eGPU calcula BIEN (no cambia
+	                                   nada; carga la GPU, así que respeta el
+	                                   gate de enlace igual que una escritura)
 
 	Opciones:
-	  --dry-run     muestra el plan sin tocar el hardware
-	  --force       aplica aunque el enlace esté degradado (BAJO TU RIESGO:
-	                apretar la eGPU con el enlace Gen1 ha congelado el host)
-	  -h, --help    esta ayuda
+	  --dry-run              muestra el plan sin tocar el hardware
+	  --force                aplica aunque el enlace esté degradado (BAJO TU
+	                         RIESGO: apretar la eGPU con el enlace Gen1 ha
+	                         congelado el host). NO abre el gate de verificación.
+	  --verify-seconds <n>   presupuesto de la verificación numérica (def. 25)
+	  -h, --help             esta ayuda
 
-	Alcance: ajusta power limit y BLOQUEOS de reloj vía nvidia-smi. Los offsets
-	de +MHz sobre stock NO están disponibles en este sistema (requieren Xorg con
-	Coolbits o NVML VF offset); un perfil que los pida se rechaza en vez de
-	fingir que se aplicó.
+	Alcance: power limit y BLOQUEOS de reloj vía nvidia-smi (-pl/-lgc/-lmc), y
+	OFFSETS de reloj (+/-MHz sobre stock) vía NVML. Los offsets SÍ funcionan en
+	esta tarjeta: medido el 2026-11-02 con nvidia-ml-py, ventana de -1000 a
+	+1000 MHz en el core y de -2000 a +6000 MHz en la memoria. Necesitan un
+	python con pynvml; si vive en un venv, indícalo con AORUS_NVML_PYTHON. Sin
+	pynvml, 'status' lo dice y los perfiles con offset se RECHAZAN en vez de
+	fingir que se aplicaron. nvidia-settings no sirve aquí (necesita Xorg).
+
+	Un offset POSITIVO no se da por bueno sin medirlo: se aplica, se verifica
+	numéricamente y, si la GPU calcula mal, se revierte a stock en el acto y el
+	perfil no se persiste. --force NO abre ese gate -un enlace degradado es un
+	riesgo que puedes evaluar, un número mal calculado no lo puedes ni
+	detectar- y tampoco se aplica de forma desatendida desde udev o systemd.
+	Registro: /var/log/aorus-egpu/oc-verify.log
 
 	ESTADO: en desarrollo, sin validar en hardware todavía.
 	USAGE
@@ -45,6 +60,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) export AORUS_OC_DRYRUN=1 ;;
     --force)   export AORUS_OC_FORCE=1 ;;
+    --verify-seconds)
+               shift
+               [ $# -gt 0 ] || { printf '--verify-seconds necesita un valor\n' >&2; exit 2; }
+               export AORUS_OC_VERIFY_SECONDS="$1" ;;
     -h|--help) usage; exit 0 ;;
     -*)        printf 'opción desconocida: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     *)         if [ -z "$cmd" ]; then cmd="$1"; else args+=("$1"); fi ;;
@@ -69,5 +88,8 @@ case "$cmd" in
              oc_apply "${args[0]:-}" ;;
   reset)     need_root reset
              oc_reset ;;
+  # `verify` NO eleva: medir no escribe nada en la tarjeta, y torch no necesita
+  # root. Elevar de más obligaría a correr el runtime CUDA como root sin motivo.
+  verify)    oc_verify "${args[0]:-}" ;;
   *)         printf 'comando desconocido: %s\n' "$cmd" >&2; usage >&2; exit 2 ;;
 esac

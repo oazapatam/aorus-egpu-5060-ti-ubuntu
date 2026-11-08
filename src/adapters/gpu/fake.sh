@@ -26,6 +26,11 @@
 #   AORUS_FAKE_STATE_RC   rc de gpu_state
 #   AORUS_FAKE_WRITE_RC   rc de TODAS las escrituras (124 = colgado)
 #   AORUS_FAKE_WRITELOG   fichero donde se anota cada escritura intentada
+#   AORUS_FAKE_OFFSET_SUPPORTED  1 = la GPU soporta offsets de reloj (el
+#                         defecto, porque es lo MEDIDO en esta tarjeta);
+#                         0 = no los soporta y el dominio debe rechazarlos
+#   AORUS_FAKE_OFFSET_WINDOW  "gmin gmax mmin mmax"; vacío => sin ventana
+#                         legible, que para el dominio es "no soportado"
 # shellcheck shell=bash
 
 : "${AORUS_FAKE_BUS:=00000000:B4:00.0}"
@@ -36,6 +41,10 @@
 : "${AORUS_FAKE_STATE_RC:=0}"
 : "${AORUS_FAKE_WRITE_RC:=0}"
 : "${AORUS_FAKE_WRITELOG:=}"
+: "${AORUS_FAKE_OFFSET_SUPPORTED:=1}"
+# Las ventanas MEDIDAS el 2026-11-02 en esta tarjeta con nvidia-ml-py:
+# GPC (-1000,1000) y MEM (-2000,6000). El doble miente lo mínimo posible.
+: "${AORUS_FAKE_OFFSET_WINDOW:=-1000 1000 -2000 6000}"
 
 gpu_available() { return 0; }
 
@@ -70,3 +79,25 @@ gpu_set_power_limit() { _fake_write "power_limit $2"; }
 gpu_set_gpu_clock()   { _fake_write "gpu_clock $2 $3"; }
 gpu_set_mem_clock()   { _fake_write "mem_clock $2"; }
 gpu_reset_all()       { _fake_write "reset"; }
+
+# --- offsets de reloj ---------------------------------------------------------
+# rc 3 = no soportado, igual que el default del puerto: un adaptador que dice
+# "no" tiene que decirlo con el MISMO código que el resto, o el caso de uso
+# trataría el doble distinto que la realidad.
+gpu_supports_clock_offset() { # $1=busid
+  [ "$AORUS_FAKE_OFFSET_SUPPORTED" = "1" ] || return 3
+  return 0
+}
+
+gpu_offset_window() { # $1=busid -> "gmin gmax mmin mmax"
+  [ "$AORUS_FAKE_OFFSET_SUPPORTED" = "1" ] || return 3
+  [ -n "$AORUS_FAKE_OFFSET_WINDOW" ] || return 3
+  printf '%s' "$AORUS_FAKE_OFFSET_WINDOW"
+}
+
+# La escritura del offset se ANOTA en el writelog como cualquier otra. Es lo
+# que permite afirmar en un test que una op NO se emitió: se cuenta lo que
+# llegó a intentarse, no solo el rc final.
+gpu_set_clock_offset() { # $1=busid $2=gpu|mem $3=mhz
+  _fake_write "clock_offset $2 $3"
+}

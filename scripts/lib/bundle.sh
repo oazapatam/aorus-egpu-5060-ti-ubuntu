@@ -8,10 +8,17 @@
 #
 # Por qué copiar y no symlinks: dpkg-deb hornea el contenido, y un symlink al
 # checkout dejaría el paquete roto en cualquier otra máquina.
+#
+# VARIOS entrypoints por paquete es parte del contrato, no un accidente:
+# `bundle_core <root> <pkg> <bin>...` y `bundle_clean <pkg> <bin>...` toman
+# una lista. Lo usan build-health.sh, build-forensics.sh,
+# build-igpu-display.sh y build-overclock.sh (que entrega la CLI
+# `aorus-egpu-oc` y el TUI `nvidia-oc`). Un paquete con un solo binario
+# pasa un solo nombre y nada cambia.
 
 bundle_core() { # $1=dir raíz del repo  $2=dir del paquete  $3..=binarios de src/bin a incluir
   local root="$1" pkg="$2"; shift 2
-  local lib="$pkg/usr/lib/aorus-egpu" b
+  local lib="$pkg/usr/lib/aorus-egpu" b layer
 
   rm -rf "$lib"
   mkdir -p "$lib" "$pkg/usr/sbin"
@@ -30,6 +37,16 @@ bundle_core() { # $1=dir raíz del repo  $2=dir del paquete  $3..=binarios de sr
   # reportaría "perfil aplicado" sin haber tocado la tarjeta. Un falso éxito
   # en la ruta de escritura es peor que no tener la herramienta.
   find "$lib" -type f -name 'fake.sh' -delete
+
+  # El BYTECODE de python tampoco se entrega. `cp -a` arrastra cualquier
+  # __pycache__ que haya quedado en src/adapters/ -lo crea python al importar
+  # los helpers (el verificador se importa por ruta desde tools/egpu-oc-edge,
+  # y eso basta)-, y un .pyc es contenido GENERADO, atado a la versión de
+  # python de la máquina que construyó el paquete: en otra, el intérprete lo
+  # ignora o lo invalida. Lintian lo marca (package-installs-python-pycache-dir)
+  # y tiene razón. Mismo criterio que fake.sh: el payload solo lleva fuente.
+  find "$lib" -type d -name '__pycache__' -prune -exec rm -rf {} +
+  find "$lib" -type f -name '*.pyc' -delete
 
   find "$lib" -type d -exec chmod 0755 {} +
   find "$lib" -type f -exec chmod 0644 {} +

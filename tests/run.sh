@@ -10,7 +10,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AORUS_LIB_ROOT="$ROOT/src"; export AORUS_LIB_ROOT
 . "$ROOT/src/bootstrap.sh"
-aorus_use domain/target domain/link domain/overclock domain/display domain/health
+aorus_use domain/target domain/link domain/overclock domain/display domain/health \
+  domain/proc
 
 pass=0 fail=0
 ok()   { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
@@ -70,6 +71,41 @@ no_  "cap dead NO permite tuning"    domain_link_allows_tuning 3 0
 # El estado REAL de la máquina al 2026-11-02 (Gen3 negociado, 2.5 GT/s en
 # reposo) debe AUTORIZAR el tuning sin necesidad de --force.
 yes_ "estado real actual (cap Gen3, reposo 2.5) autorizado" domain_link_allows_tuning 3 4
+
+echo "== domain/proc: acotar un proceso que puede no volver =="
+# El 2026-11-07 un hijo IRREAPEABLE (hilo atascado en el driver tras Xid 175 +
+# 154) bloqueó al padre en wait4() para siempre: no hubo ABORTO, ni vuelta de
+# los offsets a 0, ni informe. La acotación que los adaptadores declaraban era
+# falsa porque `timeout N` manda TERM y LUEGO ESPERA. Estas son las dos
+# decisiones de la acotación real.
+is "gracia de 12s (nvidia-smi) = un cuarto"  "$(domain_proc_kill_grace 12)"  "3"
+is "gracia de 20s (nvml) = un cuarto"        "$(domain_proc_kill_grace 20)"  "5"
+is "gracia de 4s baja al minimo 2"           "$(domain_proc_kill_grace 4)"   "2"
+is "gracia de 1s baja al minimo 2"           "$(domain_proc_kill_grace 1)"   "2"
+is "gracia de 120s topa en el maximo 10"     "$(domain_proc_kill_grace 120)" "10"
+is "gracia de 600s topa en el maximo 10"     "$(domain_proc_kill_grace 600)" "10"
+# Entrada ilegible -> el MINIMO, no el maximo: sin presupuesto que escalar, la
+# respuesta conservadora es esperar poco. Esperar mucho es justo el fallo.
+is "presupuesto vacio -> minimo"             "$(domain_proc_kill_grace '')"  "2"
+is "presupuesto no numerico -> minimo"       "$(domain_proc_kill_grace 'x')" "2"
+is "presupuesto 0 -> minimo"                 "$(domain_proc_kill_grace 0)"   "2"
+# Peor caso de pared: lo que quien llama puede PROMETER hacia arriba.
+is "peor caso de 12s"                        "$(domain_proc_worst_case 12)"  "15"
+is "peor caso de 20s"                        "$(domain_proc_worst_case 20)"  "25"
+is "peor caso de 120s"                       "$(domain_proc_worst_case 120)" "130"
+is "peor caso ilegible -> 0"                 "$(domain_proc_worst_case '')"  "0"
+# 124 es el 'colgado' de todo el repo; 137 es 128+9, el desenlace de un proceso
+# que ignoro el TERM y acabo en SIGKILL. Significan lo mismo: no termino solo.
+yes_ "124 es colgado"                        domain_proc_is_hung 124
+yes_ "137 (SIGKILL) es colgado"              domain_proc_is_hung 137
+no_  "0 no es colgado"                       domain_proc_is_hung 0
+no_  "1 no es colgado"                       domain_proc_is_hung 1
+# 125/126/127 son errores de `timeout` EN SI (no pudo ejecutar la orden). Un
+# binario ausente no es una tarjeta semi-rota, y la reaccion es la opuesta.
+no_  "125 (fallo de timeout) no es colgado"  domain_proc_is_hung 125
+no_  "126 (no ejecutable) no es colgado"     domain_proc_is_hung 126
+no_  "127 (no encontrado) no es colgado"     domain_proc_is_hung 127
+no_  "rc vacio no es colgado"                domain_proc_is_hung ''
 
 echo "== domain/display: quién pinta el escritorio =="
 yes_ "i915 es integrada"        domain_display_is_integrated i915
@@ -182,7 +218,106 @@ unset OC_mem_clock_mhz
 echo "== domain/overclock: allowlist de operaciones del plan =="
 yes_ "power_limit es op válida"   domain_oc_op_is_valid power_limit
 yes_ "reset es op válida"         domain_oc_op_is_valid reset
+yes_ "clock_offset es op válida"  domain_oc_op_is_valid clock_offset
 no_  "op inventada se rechaza"    domain_oc_op_is_valid overvolt_now
+
+echo "== domain/overclock: offsets de reloj (enteros CON signo) =="
+# Sin domain_oc_is_int un offset NEGATIVO es inexpresable, y bajar el reloj al
+# mismo voltaje es justo el uso más seguro de esta palanca.
+yes_ "-200 es int válido"        domain_oc_is_int -200
+yes_ "+150 es int válido"        domain_oc_is_int +150
+yes_ "0 es int válido"           domain_oc_is_int 0
+no_  "-200 NO es uint"           domain_oc_is_uint -200
+no_  "cadena vacía no es int"    domain_oc_is_int ''
+no_  "un signo solo no es int"   domain_oc_is_int -
+no_  "texto no es int"           domain_oc_is_int abc
+is "clamp_signed dentro"          "$(domain_oc_clamp_signed -200 -1000 1000)" "-200"
+is "clamp_signed por abajo"       "$(domain_oc_clamp_signed -1500 -1000 1000)" "-1000"
+is "clamp_signed por arriba"      "$(domain_oc_clamp_signed 1500 -1000 1000)"  "1000"
+is "clamp_signed normaliza el +"  "$(domain_oc_clamp_signed +150 -1000 1000)"  "150"
+no_ "clamp_signed rechaza basura" domain_oc_clamp_signed abc -1000 1000
+
+# La capacidad entra como DATO. Las ventanas son las MEDIDAS el 2026-11-02 en
+# esta tarjeta con nvidia-ml-py: GPC (-1000,1000) y MEM (-2000,6000).
+OFFCAP='si -1000 1000 -2000 6000'
+yes_ "offcap 'si' con ventanas está soportado" domain_oc_offcap_supported "$OFFCAP"
+no_  "offcap 'no' no está soportado"           domain_oc_offcap_supported "no"
+# Un 'si' SIN ventanas legibles no autoriza nada: sin evidencia no se escribe,
+# misma filosofía que el 'unknown' del gate de enlace.
+no_  "offcap 'si' sin ventanas NO autoriza"    domain_oc_offcap_supported "si"
+no_  "offcap vacío NO autoriza"                domain_oc_offcap_supported ""
+is "ventana del core"   "$(domain_oc_offcap_window "$OFFCAP" gpu)" "-1000 1000"
+is "ventana de memoria" "$(domain_oc_offcap_window "$OFFCAP" mem)" "-2000 6000"
+no_ "dominio de reloj inventado" domain_oc_offcap_window "$OFFCAP" vram
+
+unset OC_power_limit_w OC_gpu_clock_min_mhz OC_gpu_clock_max_mhz OC_mem_clock_mhz
+# shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
+OC_profile=offsets OC_mem_clock_offset_mhz=200
+
+# SIN capacidad declarada (el defecto, y el comportamiento de antes): el perfil
+# se rechaza y el plan NO emite la operación. Que el plan no la emita es lo que
+# garantiza que un llamador que se salte validate tampoco escriba.
+no_ "offset sin capacidad declarada se rechaza" domain_oc_validate 150 180 3090 14001 180 405
+is "...y el plan no emite la op" \
+   "$(domain_oc_plan 150 180 3090 14001 180 405 2>/dev/null | grep -c clock_offset)" "0"
+
+# CON capacidad y dentro de ventana: se acepta y el plan emite la op.
+yes_ "offset dentro de ventana se acepta" domain_oc_validate 150 180 3090 14001 180 405 "$OFFCAP"
+is "el plan emite clock_offset mem 200" \
+   "$(domain_oc_plan 150 180 3090 14001 180 405 "$OFFCAP" | tr '\t' ' ' | grep clock_offset)" \
+   "clock_offset mem 200"
+
+# Fuera de ventana se RECHAZA, no se acota: acotar un +9000 a +6000 convierte
+# la petición en otra distinta, y el modo de fallo de esta palanca son números
+# mal calculados que nadie detecta a ojo.
+# shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
+OC_mem_clock_offset_mhz=9000
+no_ "offset fuera de ventana se RECHAZA" domain_oc_validate 150 180 3090 14001 180 405 "$OFFCAP"
+is "...y el plan OMITE la op (no la acota)" \
+   "$(domain_oc_plan 150 180 3090 14001 180 405 "$OFFCAP" 2>/dev/null | grep -c clock_offset)" "0"
+
+# shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
+OC_mem_clock_offset_mhz=abc
+no_ "offset no entero se rechaza" domain_oc_validate 150 180 3090 14001 180 405 "$OFFCAP"
+unset OC_mem_clock_offset_mhz
+
+# Los offsets van AL FINAL del plan: el techo de potencia se escribe antes de
+# que el reloj suba por encima de stock.
+# shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
+OC_power_limit_w=180 OC_gpu_clock_offset_mhz=-200
+off_plan="$(domain_oc_plan 150 180 3090 14001 180 405 "$OFFCAP")"
+is "el offset negativo se emite tal cual" \
+   "$(printf '%s\n' "$off_plan" | tr '\t' ' ' | grep clock_offset)" "clock_offset gpu -200"
+is "los offsets van al final del plan" \
+   "$(printf '%s\n' "$off_plan" | tail -1 | cut -f1)" "clock_offset"
+unset OC_power_limit_w
+
+echo "== domain/overclock: cuándo hay que verificar el resultado =="
+# Un offset POSITIVO no se manifiesta como un cuelgue: se manifiesta como
+# números mal calculados. Por eso exige medición, y un negativo no.
+# shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
+OC_gpu_clock_offset_mhz=200
+is "offset +200 exige gemm"            "$(domain_oc_verify_required)" "gemm"
+# shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
+OC_gpu_clock_offset_mhz=-200
+is "offset -200 no exige verificación" "$(domain_oc_verify_required)" "none"
+# shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
+OC_mem_clock_offset_mhz=+300
+is "offset de memoria +300 exige gemm" "$(domain_oc_verify_required)" "gemm"
+unset OC_gpu_clock_offset_mhz OC_mem_clock_offset_mhz
+# shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
+OC_power_limit_w=165 OC_gpu_clock_max_mhz=2400
+is "solo locks no exigen verificación"  "$(domain_oc_verify_required)" "none"
+# La meta-clave permite medir un perfil de locks a mano.
+# shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
+OC_verify=gemm
+is "verify=gemm en el perfil exige gemm" "$(domain_oc_verify_required)" "gemm"
+yes_ "verify es una clave conocida"      domain_oc_key_is_valid verify
+yes_ "verify=gemm valida"                domain_oc_validate 150 180 3090 14001 180 405 "$OFFCAP"
+# shellcheck disable=SC2034  # entrada por entorno del dominio; ver nota arriba.
+OC_verify=por_las_buenas
+no_ "un modo de verify inventado se rechaza" domain_oc_validate 150 180 3090 14001 180 405 "$OFFCAP"
+unset OC_verify OC_power_limit_w OC_gpu_clock_max_mhz
 
 echo "== domain/health: clasificar lo que dice el kernel =="
 # Las líneas son LITERALES del incidente del 2026-11-02 13:31:52-53, copiadas
