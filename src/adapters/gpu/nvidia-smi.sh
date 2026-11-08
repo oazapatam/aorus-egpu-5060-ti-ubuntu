@@ -173,3 +173,82 @@ gpu_reset_all() { # $1=busid
   esac
   return "$rc"
 }
+
+# --- telemetría para el panel vivo (solo lectura) -----------------------------
+#
+# UNA sola invocación para TODAS las GPUs. Nada de un `nvidia-smi` por tarjeta y
+# por métrica: el panel refresca cada segundo y cada invocación es un proceso
+# que habla con un driver que, en esta máquina, a veces se cuelga. Menos
+# llamadas es menos superficie para el 124.
+#
+# `name` va ÚLTIMO en la consulta a propósito. El formato es CSV y el nombre
+# comercial es el único campo que podría traer una coma; puesto al final, el
+# `read` lo absorbe entero en la última variable y una coma ahí no desplaza
+# ningún otro campo.
+_smi_vendor_of() { # $1=0xDDDDVVVV -> 0xvvvv (la mitad BAJA)
+  local v="${1// /}"; v="${v#0x}"; v="${v#0X}"
+  v="${v:4:4}"
+  printf '0x%s' "${v,,}"
+}
+
+gpu_telemetry_all() {
+  local out rc line
+  local bus did ug um mu mt tc pd pl cg cm fs ps th lg lw gx wx nm
+  out="$(_smi --query-gpu=pci.bus_id,pci.device_id,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,power.limit,clocks.gr,clocks.mem,fan.speed,pstate,clocks_throttle_reasons.active,pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,pcie.link.width.max,name \
+        --format=csv,noheader,nounits 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 124 ] && return 124
+  [ "$rc" -ne 0 ] && return 1
+  [ -n "$out" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    IFS=, read -r bus did ug um mu mt tc pd pl cg cm fs ps th lg lw gx wx nm <<< "$line"
+    # Se recortan los espacios de CADA campo porque nvidia-smi los separa con
+    # ", " y un " 62" no es un entero para el dominio. El nombre NO se recorta
+    # por dentro, solo por los bordes.
+    printf -- '--\n'
+    printf 'bus_id=%s\n'         "${bus// /}"
+    printf 'vendor_id=%s\n'      "$(_smi_vendor_of "$did")"
+    printf 'device_id=%s\n'      "$(_smi_device_of "$did")"
+    printf 'util_gpu_pct=%s\n'   "${ug// /}"
+    printf 'util_mem_pct=%s\n'   "${um// /}"
+    printf 'mem_used_mib=%s\n'   "${mu// /}"
+    printf 'mem_total_mib=%s\n'  "${mt// /}"
+    printf 'temp_c=%s\n'         "${tc// /}"
+    printf 'power_draw_w=%s\n'   "${pd// /}"
+    printf 'power_limit_w=%s\n'  "${pl// /}"
+    printf 'gpu_clock_mhz=%s\n'  "${cg// /}"
+    printf 'mem_clock_mhz=%s\n'  "${cm// /}"
+    printf 'fan_pct=%s\n'        "${fs// /}"
+    printf 'pstate=%s\n'         "${ps// /}"
+    printf 'throttle=%s\n'       "${th// /}"
+    printf 'link_gen_cur=%s\n'   "${lg// /}"
+    printf 'link_width_cur=%s\n' "${lw// /}"
+    # La CAPACIDAD, que es la que importa: en reposo `link_gen_cur` dice
+    # siempre Gen1 porque el enlace baja de velocidad solo, y enseñar esa
+    # instantánea como si fuera el techo es el error que ya costó una
+    # investigación entera en este repo (H18).
+    printf 'link_gen_max=%s\n'   "${gx// /}"
+    printf 'link_width_max=%s\n' "${wx// /}"
+    nm="${nm#"${nm%%[![:space:]]*}"}"; nm="${nm%"${nm##*[![:space:]]}"}"
+    printf 'name=%s\n'           "$nm"
+  done <<< "$out"
+  return 0
+}
+
+# Procesos con una GPU abierta. Salida VACÍA con rc 0 cuando no hay ninguno:
+# "no hay procesos" es una respuesta válida y es justo la que autoriza a tirar
+# del cable (H28), así que no puede confundirse con un error.
+gpu_processes_all() {
+  local out rc bus pid mem nm
+  out="$(_smi --query-compute-apps=gpu_bus_id,pid,used_memory,process_name \
+        --format=csv,noheader,nounits 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 124 ] && return 124
+  [ "$rc" -ne 0 ] && return 1
+  [ -n "$out" ] || return 0
+  while IFS=, read -r bus pid mem nm; do
+    [ -n "${bus// /}" ] || continue
+    nm="${nm#"${nm%%[![:space:]]*}"}"; nm="${nm%"${nm##*[![:space:]]}"}"
+    printf '%s\t%s\t%s\t%s\n' "${bus// /}" "${pid// /}" "${mem// /}" "$nm"
+  done <<< "$out"
+  return 0
+}

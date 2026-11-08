@@ -25,6 +25,19 @@ rechazos. Si el gate dice no, aquí se lee el no completo, con su motivo.
 
 LO QUE SÍ APORTA (si no aportara nada, no debería existir)
 ----------------------------------------------------------
+  0. Un PANEL VIVO de todas las GPUs, tipo htop: uso del núcleo, ocupación de
+     VRAM, consumo frente al techo, temperatura, ventilador, relojes, estado
+     de energía y throttling descodificado, con barras, historial reciente en
+     sparkline y la lista de procesos que tienen una GPU abierta. Se refresca
+     cada segundo en su propio hilo, así que un `status` lento no lo congela.
+     Salen las DOS tarjetas, la externa primero, y cuál es cuál lo decide el
+     device-id (el mismo criterio que el gate R4), no el orden en que
+     nvidia-smi las liste: los índices se reordenan entre arranques.
+     Del enlace se muestra la CAPACIDAD (Gen3), no la instantánea, porque en
+     reposo esta última siempre dice Gen1 y leerla como techo ya costó una
+     investigación entera en este repo.
+     Y responde la pregunta de H28 —¿puedo tirar del cable?— porque
+     desconectar con un proceso CUDA vivo cuelga el host.
   1. Estado en una pantalla: enlace, rangos de potencia y reloj, ventana de
      offsets, offsets vigentes, estado actual y perfil aplicado, refrescado
      en segundo plano y con marca de "esto es de hace N s" cuando el refresco
@@ -46,6 +59,7 @@ LO QUE SÍ APORTA (si no aportara nada, no debería existir)
 
 Dependencias: solo la stdlib (`curses`). Nada de instalar nada.
 """
+import collections
 import curses
 import json
 import locale
@@ -72,6 +86,32 @@ VERIFY_LOG = Path("/var/log/aorus-egpu/oc-verify.log")
 STATUS_TIMEOUT = 40
 STATUS_PERIOD = 8
 PROBE_TIMEOUT = 25
+
+# La TELEMETRÍA es otra cosa que `status`: una sola invocación de nvidia-smi,
+# sin NVML, sin gates y sin root. Por eso va en su propio hilo y con su propio
+# periodo —un segundo, como htop— en vez de colgarse del refresco de 8 s: un
+# panel vivo que se actualiza cada 8 segundos no es un panel vivo. El timeout
+# es corto a propósito: si una lectura barata no vuelve en 8 s, la tarjeta está
+# en el estado malo y lo que interesa es que el panel lo DIGA, no que espere.
+TEL_TIMEOUT = 8
+TEL_PERIOD = 1.0
+
+# Ancho de las barras. Se le pasa al CLI por entorno (AORUS_TEL_BAR_WIDTH) para
+# que el número de celdas llenas lo calcule el DOMINIO y aquí solo se pinten:
+# si este fichero hiciera la regla de tres, habría dos definiciones de "cuánto
+# ocupa un 62%" y la de aquí es la que el operador ve.
+BAR_W = 20
+BAR_FULL = "█"
+BAR_EMPTY = "░"
+
+# Caracteres de sparkline, de menos a más. El índice (0..7) lo decide el
+# dominio y llega ya resuelto en los campos *_spark; esta tabla solo traduce
+# índice -> carácter.
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
+SPARK_LEN = 24
+
+# Métricas con historial. Cada una es (clave del campo *_spark, etiqueta).
+SPARK_METRICS = ("util_gpu", "mem", "power", "temp")
 
 STEPS = (5, 15, 25, 50, 100)
 
@@ -146,6 +186,13 @@ class Backend:
         self.env_torch = False
         self.env_ready = False
         self.message = ""
+        self.tel = {"gpus": [], "procs": [], "summary": {}}
+        self.tel_rc = None
+        self.tel_at = 0.0
+        # Historial por GPU y por métrica: bus_id -> metrica -> deque de
+        # niveles 0..7 ya resueltos por el dominio. Vive aquí porque es estado
+        # de PRESENTACIÓN (como la posición del cursor), no una regla.
+        self.tel_hist = {}
         self._want = threading.Event()
         self._stop = threading.Event()
 
@@ -179,9 +226,11 @@ class Backend:
         """
         with self.lock:
             python = self.env_python
-        if not python:
-            return {}
-        return {"AORUS_NVML_PYTHON": python, "AORUS_VERIFY_PYTHON": python}
+        env = {"AORUS_TEL_BAR_WIDTH": str(BAR_W)}
+        if python:
+            env["AORUS_NVML_PYTHON"] = python
+            env["AORUS_VERIFY_PYTHON"] = python
+        return env
 
     # -- refresco -----------------------------------------------------------
     def request_refresh(self):
@@ -202,6 +251,66 @@ class Backend:
                 self.refreshing = False
             self._want.wait(STATUS_PERIOD)
             self._want.clear()
+
+    def tel_loop(self):
+        """Hilo propio: la telemetría se refresca cada segundo.
+
+        Separado de `loop()` a propósito. Si compartieran hilo, un `status`
+        lento —y con la tarjeta pidiendo un full-chip reset se midió tardando
+        más de 60 s— congelaría el panel vivo justo en el momento en que el
+        operador más necesita verlo moverse.
+        """
+        while not self._stop.is_set():
+            self._refresh_telemetry()
+            if self._stop.wait(TEL_PERIOD):
+                break
+
+    def _refresh_telemetry(self):
+        if not self.cli:
+            return
+        rc, out = run([self.cli, "telemetry"], TEL_TIMEOUT, self.cli_env())
+        parsed = parse_telemetry(out) if rc == 0 else None
+        with self.lock:
+            self.tel_rc = rc
+            self.tel_at = time.time()
+            if parsed is not None:
+                self.tel = parsed
+                self._push_history(parsed["gpus"])
+
+    def _push_history(self, gpus):
+        """Acumula los niveles de sparkline. Se llama con el lock tomado.
+
+        Los niveles llegan ya calculados en los campos `*_spark`; aquí no se
+        convierte ningún valor a nivel. Una métrica que la tarjeta no publica
+        —la interna no da `power.limit`— simplemente no tiene campo, y entonces
+        no se apunta nada: el hueco se queda hueco en vez de rellenarse con un
+        0 que dibujaría una línea plana en el suelo.
+        """
+        for gpu in gpus:
+            bus = gpu.get("bus_id", "")
+            if not bus:
+                continue
+            per_gpu = self.tel_hist.setdefault(bus, {})
+            for metric in SPARK_METRICS:
+                raw = gpu.get(f"{metric}_spark")
+                if raw is None:
+                    continue
+                try:
+                    level = int(raw)
+                except ValueError:
+                    continue
+                buf = per_gpu.setdefault(
+                    metric, collections.deque(maxlen=SPARK_LEN))
+                buf.append(max(0, min(len(SPARK_CHARS) - 1, level)))
+
+    def tel_snapshot(self):
+        with self.lock:
+            hist = {bus: {m: list(buf) for m, buf in metrics.items()}
+                    for bus, metrics in self.tel_hist.items()}
+            return {"gpus": list(self.tel["gpus"]),
+                    "procs": list(self.tel["procs"]),
+                    "summary": dict(self.tel["summary"]),
+                    "rc": self.tel_rc, "at": self.tel_at, "hist": hist}
 
     def _refresh_status(self):
         if not self.cli:
@@ -239,6 +348,35 @@ class Backend:
                     "profiles": list(self.profiles),
                     "python": self.env_python, "pynvml": self.env_pynvml,
                     "torch": self.env_torch, "env_ready": self.env_ready}
+
+
+def parse_telemetry(text):
+    """`aorus-egpu-oc telemetry` -> {gpus, procs, summary}.
+
+    El formato es por secciones (`[gpu]`, `[proc]`, `[summary]`) y dentro
+    `clave=valor`. Se eligió sobre JSON porque todo el paquete ya habla este
+    dialecto; el precio es este parser, que son quince líneas y ninguna regla.
+    """
+    gpus, procs, summary = [], [], {}
+    cur = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line == "[gpu]":
+            cur = {}
+            gpus.append(cur)
+            continue
+        if line == "[proc]":
+            cur = {}
+            procs.append(cur)
+            continue
+        if line == "[summary]":
+            cur = summary
+            continue
+        if not line or cur is None or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        cur[key] = value
+    return {"gpus": gpus, "procs": procs, "summary": summary}
 
 
 def parse_field(text, label):
@@ -347,6 +485,225 @@ class App:
             pass
         return row + 1
 
+    # -- primitivas del panel vivo ------------------------------------------
+    def bar(self, cells):
+        """Una barra de BAR_W celdas. `cells` lo calculó el dominio.
+
+        `cells` a None significa "la tarjeta no publica el dato": la barra se
+        dibuja con la marca de hueco, que NO es lo mismo que una barra a cero.
+        """
+        if cells is None:
+            return "[" + "·" * BAR_W + "]"
+        cells = max(0, min(BAR_W, cells))
+        return "[" + BAR_FULL * cells + BAR_EMPTY * (BAR_W - cells) + "]"
+
+    def spark(self, levels):
+        """Traduce índices 0..7 a caracteres. Sin historial aún: espacios."""
+        if not levels:
+            return " " * SPARK_LEN
+        text = "".join(SPARK_CHARS[i] for i in levels)
+        return text.rjust(SPARK_LEN)
+
+    def sev_attr(self, sev):
+        """Color a partir del veredicto del dominio, no de un umbral local.
+
+        Los umbrales son del dominio (domain_tel_sev_*) y llegan ya resueltos
+        como ok/warn/crit o idle/light/busy. Aquí solo se elige el color, que
+        es lo único que de verdad es presentación.
+        """
+        return {
+            "crit": self.theme.bad,
+            "warn": self.theme.warn,
+            "ok": self.theme.ok,
+            "busy": self.theme.ok,
+            "light": 0,
+            "idle": self.theme.dim,
+            "unknown": self.theme.dim,
+        }.get(sev, 0)
+
+    @staticmethod
+    def _int(gpu, key):
+        try:
+            return int(gpu[key])
+        except (KeyError, ValueError):
+            return None
+
+    def gpu_row(self, row, label, cells, right, sev=""):
+        """Una línea de métrica: etiqueta, barra y texto a la derecha."""
+        text = f" {label:<5}{self.bar(cells)} {right}"
+        return self.put(row, 1, text, self.sev_attr(sev))
+
+    # Filas que el panel NO puede ocupar: ESTADO, ENTORNO, PERFILES y la línea
+    # de ayuda siguen debajo y tienen que caber. El panel es lo primero que se
+    # mira, no lo único que hay.
+    PANEL_RESERVE = 12
+
+    def panel_budget(self):
+        height, _w = self.scr.getmaxyx()
+        return max(6, height - self.PANEL_RESERVE)
+
+    def draw_gpu_panel(self, row, tel):
+        """El panel tipo htop. Devuelve la fila siguiente."""
+        _h, width = self.scr.getmaxyx()
+        budget = self.panel_budget()
+        wide = width >= 86          # con menos ancho se cae el sparkline
+        gpus = tel["gpus"]
+
+        if tel["rc"] is None:
+            return self.put(row, 1, "leyendo la telemetría…", self.theme.dim)
+        if tel["rc"] == 124:
+            return self.put(row, 1, "la lectura de telemetría se COLGÓ: la "
+                            "tarjeta no responde (no se reintenta)",
+                            self.theme.bad)
+        if tel["rc"] != 0 or not gpus:
+            return self.put(row, 1, f"sin telemetría (rc={tel['rc']})",
+                            self.theme.bad)
+
+        # La eGPU primero, sea cual sea el orden en que nvidia-smi las liste:
+        # los índices se reordenan entre arranques y el rol lo decide el
+        # device-id (gate R4), no la posición.
+        order = {"egpu": 0, "internal": 1, "other": 2}
+        gpus = sorted(gpus, key=lambda g: order.get(g.get("role", "other"), 3))
+
+        for gpu in gpus:
+            if gpu is not gpus[0]:
+                row += 1
+            # Cada bloque ocupa 5 o 6 filas. Si no caben DENTRO DEL PRESUPUESTO
+            # se omiten las GPUs que falten y se DICE que se omitieron: una
+            # lista cortada en silencio haría creer que la máquina tiene una
+            # sola GPU, que es justo el error que este panel existe para
+            # evitar.
+            if row + 6 > budget and gpu is not gpus[0]:
+                row = self.put(row, 1, f" … {len(gpus) - gpus.index(gpu)} GPU(s) "
+                               "más: agranda la ventana", self.theme.dim)
+                break
+            bus = gpu.get("bus_id", "?")
+            role = gpu.get("role", "other")
+            tag = {"egpu": "eGPU", "internal": "int ", "other": "otra"}.get(role, "otra")
+            name = gpu.get("name", "?").replace("NVIDIA ", "")
+            gen = gpu.get("link_gen_max", "?")
+            # El ANCHO sí se toma de la instantánea, al contrario que la
+            # generación: `width.max` es lo que el chip podría negociar (x8 en
+            # esta tarjeta) y `width.current` es lo que el túnel Thunderbolt le
+            # da de verdad (x4), que no se degrada en reposo como sí hace la
+            # velocidad. Es la misma pareja que usa el gate de enlace en
+            # app/overclock.sh: gen de la CAPACIDAD, ancho del AHORA.
+            wid = gpu.get("link_width_cur", "?")
+            pstate = gpu.get("pstate", "")
+            # Se muestra la CAPACIDAD del enlace (gen.max), no la instantánea:
+            # en reposo `gen.current` siempre dice Gen1 porque el enlace baja
+            # de velocidad solo, y enseñar eso como techo es el error que ya
+            # costó una investigación entera en este repo (H18).
+            tail = f"Gen{gen} x{wid}  {pstate}  {bus} "
+            # El nombre se recorta para que el tail SIEMPRE quepa. Sin esto, a
+            # 70 columnas el nombre largo de la GPU interna empujaba al tail y
+            # salía 'Laptop GPUGen5 x16' pegado, con el bus-id cortado: justo
+            # los dos datos que identifican de qué tarjeta se habla.
+            avail = width - len(tail) - 4
+            if avail < 12:
+                # Sin sitio para los dos, manda el tail: identifica la tarjeta.
+                head = f" {tag}"
+            else:
+                head = f" {tag}  {name[:avail - len(tag) - 3]}"
+            row = self.put(row, 1,
+                           head.ljust(max(0, width - len(tail) - 3)) + tail,
+                           self.theme.title if role == "egpu" else self.theme.dim)
+
+            hist = tel["hist"].get(bus, {})
+
+            util = gpu.get("util_gpu_pct", "?")
+            clock = gpu.get("gpu_clock_mhz", "?")
+            right = f"{util:>3}%  {clock:>5} MHz"
+            if wide:
+                right = f"{util:>3}%  {self.spark(hist.get('util_gpu'))}  {clock:>5} MHz"
+            row = self.gpu_row(row, "GPU", self._int(gpu, "util_gpu_bar"),
+                               right, gpu.get("util_gpu_sev", ""))
+
+            used = gpu.get("mem_used_human", "?")
+            total = gpu.get("mem_total_human", "?")
+            pct = gpu.get("mem_pct", "?")
+            right = f"{pct:>3}%  {used} / {total}"
+            if wide:
+                right = f"{pct:>3}%  {self.spark(hist.get('mem'))}  {used} / {total}"
+            row = self.gpu_row(row, "VRAM", self._int(gpu, "mem_bar"),
+                               right, gpu.get("mem_sev", ""))
+
+            draw = gpu.get("power_draw_w", "?")
+            limit = gpu.get("power_limit_w", "")
+            if "power_bar" in gpu:
+                pct = gpu.get("power_pct", "?")
+                right = f"{pct:>3}%  {draw} / {limit} W"
+                if wide:
+                    right = f"{pct:>3}%  {self.spark(hist.get('power'))}  {draw} / {limit} W"
+                row = self.gpu_row(row, "PWR", self._int(gpu, "power_bar"), right)
+            else:
+                # La interna no publica power.limit: sin techo no hay fracción
+                # que dibujar, y poner un 0 sería inventarse la lectura.
+                row = self.gpu_row(row, "PWR", None,
+                                   f"      {draw} W  (sin techo publicado)",
+                                   "unknown")
+
+            temp = gpu.get("temp_c", "?")
+            fan = gpu.get("fan_pct", "")
+            fan_text = f"FAN {fan:>3}%" if fan and fan != "[N/A]" else "FAN  n/d"
+            bits = [f" TEMP {temp:>3} °C"]
+            if wide:
+                bits.append(self.spark(hist.get("temp")))
+            bits.append(fan_text)
+            bits.append(f"MEM {gpu.get('mem_clock_mhz', '?')} MHz")
+            row = self.put(row, 1, "  ".join(bits),
+                           self.sev_attr(gpu.get("temp_sev", "")))
+
+            throttle = gpu.get("throttle_text")
+            if throttle is None:
+                row = self.put(row, 1, " throttle  máscara ilegible",
+                               self.theme.bad)
+            elif gpu.get("throttle_active") == "si":
+                row = self.put(row, 1, f" throttle  {throttle}", self.theme.warn)
+
+        # El veredicto de H28, donde el operador ya está mirando.
+        summary = tel["summary"]
+        verdict = summary.get("unplug", "")
+        procs = summary.get("egpu_open_procs", "?")
+        if verdict == "peligroso":
+            row = self.put(row, 1,
+                           f" cable  NO desconectes: {procs} proceso(s) tienen "
+                           "la eGPU abierta (cuelga el host, H28)",
+                           self.theme.bad)
+        elif verdict == "seguro":
+            row = self.put(row, 1,
+                           " cable  seguro desconectar: ningún proceso tiene "
+                           "la eGPU abierta", self.theme.ok)
+        elif verdict:
+            row = self.put(row, 1,
+                           " cable  no he podido contar los procesos: no "
+                           "desconectes sin comprobarlo", self.theme.warn)
+        return row
+
+    def draw_procs(self, row, tel):
+        procs = tel["procs"]
+        if not procs:
+            return row
+        budget = self.panel_budget()
+        # Con el presupuesto agotado la tabla se omite por completo. No se
+        # pierde la información que importa: el veredicto del cable ya está
+        # arriba, con el recuento.
+        if row + 3 > budget:
+            return row
+        room = max(1, budget - row - 2)
+        row = self.section(row, "PROCESOS CON UNA GPU ABIERTA")
+        row = self.put(row, 1, f"  {'PID':>7}  {'VRAM':>9}  PROCESO",
+                       self.theme.dim)
+        shown = min(len(procs), room)
+        for proc in procs[:shown]:
+            mem = proc.get("mem_human", proc.get("mem_mib", "?"))
+            row = self.put(row, 1, f"  {proc.get('pid', '?'):>7}  {mem:>9}  "
+                           f"{proc.get('name', '?')}")
+        if len(procs) > shown:
+            row = self.put(row, 1, f"  … y {len(procs) - shown} más",
+                           self.theme.dim)
+        return row
+
     def section(self, row, title):
         _h, width = self.scr.getmaxyx()
         label = f"─ {title} "
@@ -378,6 +735,13 @@ class App:
                  self.theme.title)
 
         row = 1
+        # El panel vivo va PRIMERO: es lo que se mira, y lo que se mira va
+        # arriba. El estado de perfiles y gates sigue debajo, intacto.
+        tel = self.backend.tel_snapshot()
+        row = self.section(row, "GPUs EN VIVO")
+        row = self.draw_gpu_panel(row, tel)
+        row = self.draw_procs(row, tel)
+
         row = self.section(row, "ESTADO")
         if snap["rc"] not in (0, None):
             row = self.put(row, 1, f"aorus-egpu-oc status devolvió rc={snap['rc']}"
@@ -660,6 +1024,15 @@ TECLAS
   A           aplicar los offsets del compositor (perfil efímero, con gates)
   R           refrescar ya;  ? esta ayuda;  q salir
 
+EL PANEL VIVO
+  Las barras y los niveles del sparkline NO se calculan aquí: llegan ya
+  resueltos de `aorus-egpu-oc telemetry`, que los pide al dominio
+  (domain/telemetry.sh, con test). Este fichero solo elige el color y pinta.
+  Un campo que la tarjeta no publica —la GPU interna no da power.limit ni
+  fan.speed— se muestra como hueco (···· / n/d), nunca como un 0.
+  Con menos de 86 columnas se cae el sparkline; con poca altura se muestran
+  menos GPUs y se dice cuántas faltan.
+
 LO QUE ESTE PROGRAMA NO HACE
   No escribe en la GPU. Cada acción es una llamada a aorus-egpu-oc, así que
   los gates R4, de enlace y de verificación numérica se aplican igual que a
@@ -760,6 +1133,9 @@ def main():
     backend = Backend(cli)
     worker = threading.Thread(target=backend.loop, daemon=True)
     worker.start()
+    # El panel vivo tiene su propio hilo: ver tel_loop().
+    telemetry = threading.Thread(target=backend.tel_loop, daemon=True)
+    telemetry.start()
     app = None
     try:
         app = curses.wrapper(lambda scr: _boot(scr, backend))

@@ -11,7 +11,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AORUS_LIB_ROOT="$ROOT/src"; export AORUS_LIB_ROOT
 . "$ROOT/src/bootstrap.sh"
 aorus_use domain/target domain/link domain/overclock domain/display domain/health \
-  domain/proc
+  domain/proc domain/telemetry
 
 pass=0 fail=0
 ok()   { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
@@ -407,6 +407,108 @@ no_ "ningun perfil entregado alcanza el borde que cuelga (+675)" \
 unset OC_profile OC_gpu_clock_offset_mhz OC_mem_clock_offset_mhz OC_verify \
       OC_power_limit_w OC_gpu_clock_max_mhz
 
+echo "== domain/telemetry: un hueco se ve como hueco =="
+# La regla que mas importa de este modulo: un campo que la tarjeta NO publica
+# NO se convierte en 0. En esta maquina la GPU interna devuelve [N/A] en
+# power.limit y en fan.speed, y pintar "0 W" o "ventilador al 0%" donde no hay
+# dato es inventarse una lectura tranquilizadora.
+no_ "[N/A] no es un dato"          domain_tel_field '[N/A]'
+no_ "[Not Supported] no es un dato" domain_tel_field '[Not Supported]'
+no_ "vacio no es un dato"          domain_tel_field ''
+is  "un valor normal pasa"  "$(domain_tel_field '62')" "62"
+is  "recorta espacios"      "$(domain_tel_field '  62  ')" "62"
+# nvidia-smi emite "143.52" y "180 W" para campos que aqui se usan como entero.
+is  "decimales se truncan"  "$(domain_tel_int '143.52')" "143"
+is  "unidad pegada se cae"  "$(domain_tel_int '180 W')"  "180"
+no_ "texto no es entero"    domain_tel_int 'P8'
+
+echo "== domain/telemetry: porcentajes y barras =="
+is "6700 de 16311 es 41%"  "$(domain_tel_pct 6700 16311)" "41"
+is "0 de 16311 es 0%"      "$(domain_tel_pct 0 16311)"    "0"
+no_ "total 0 no da porcentaje" domain_tel_pct 100 0
+no_ "total [N/A] no da porcentaje" domain_tel_pct 100 '[N/A]'
+# Se acota, al contrario que los offsets de reloj: un 103% es artefacto de
+# muestreo del driver y mostrarlo como 100 no cambia ninguna decision.
+is "103% se acota a 100" "$(domain_tel_pct_clamp 103)" "100"
+is "62% pasa tal cual"   "$(domain_tel_pct_clamp 62)"  "62"
+# La barra REDONDEA al mas cercano: con truncamiento un 99% daria 19 celdas de
+# 20, igual que un 96%, y el final de la barra es justo donde se mira.
+is "100% llena las 20 celdas" "$(domain_tel_bar_cells 100 20)" "20"
+is "0% no llena ninguna"      "$(domain_tel_bar_cells 0 20)"   "0"
+is "50% llena 10 de 20"       "$(domain_tel_bar_cells 50 20)"  "10"
+is "99% llena 20, no 19"      "$(domain_tel_bar_cells 99 20)"  "20"
+is "96% llena 19"             "$(domain_tel_bar_cells 96 20)"  "19"
+no_ "sin dato no hay barra"   domain_tel_bar_cells '[N/A]' 20
+no_ "ancho 0 no hay barra"    domain_tel_bar_cells 50 0
+
+echo "== domain/telemetry: sparkline =="
+is "el minimo del rango es el nivel 0" "$(domain_tel_spark_level 0 0 100)"   "0"
+is "el maximo del rango es el nivel 7" "$(domain_tel_spark_level 100 0 100)" "7"
+is "la mitad cae en el nivel 3"        "$(domain_tel_spark_level 50 0 100)"  "3"
+# Una serie PLANA (min==max) se pinta al nivel mas BAJO: es la lectura correcta
+# de "no ha pasado nada". Pintarla a bloques llenos sugeriria saturacion donde
+# hay reposo.
+is "serie plana -> nivel 0"            "$(domain_tel_spark_level 40 40 40)"  "0"
+is "por debajo del rango se acota"     "$(domain_tel_spark_level 10 40 80)"  "0"
+is "por encima del rango se acota"     "$(domain_tel_spark_level 99 40 80)"  "7"
+no_ "rango invertido se rechaza"       domain_tel_spark_level 50 100 0
+
+echo "== domain/telemetry: severidad con los umbrales de ESTA tarjeta =="
+# H25 llego a 78 C en el escalon +600 con throttle 0x0: 78 es NORMAL en esta
+# caja, asi que un umbral de aviso por debajo daria una alarma permanente.
+is "78 C es normal en esta caja" "$(domain_tel_sev_temp 78)" "ok"
+is "80 C ya avisa"               "$(domain_tel_sev_temp 80)" "warn"
+is "87 C es grave"               "$(domain_tel_sev_temp 87)" "crit"
+is "sin dato de temperatura"     "$(domain_tel_sev_temp '[N/A]')" "unknown"
+is "VRAM al 41% esta bien"       "$(domain_tel_sev_fill 41)" "ok"
+is "VRAM al 90% avisa"           "$(domain_tel_sev_fill 90)" "warn"
+is "VRAM al 97% es grave"        "$(domain_tel_sev_fill 97)" "crit"
+# Un 100% de USO es el objetivo de una carga de IA, no un problema: esta
+# funcion no clasifica nada como grave.
+is "uso 100% es 'busy', no grave" "$(domain_tel_sev_util 100)" "busy"
+is "uso 0% es reposo"             "$(domain_tel_sev_util 0)"   "idle"
+is "uso 7% es carga ligera"       "$(domain_tel_sev_util 7)"   "light"
+
+echo "== domain/telemetry: descodificar la mascara de throttling =="
+is "0x0 es ninguno"  "$(domain_tel_throttle_decode 0x0)" "ninguno"
+# El bit 0x1 es GpuIdle: significa que la GPU esta en reposo, NO que algo la
+# este recortando. No se avisa de el.
+is "solo GpuIdle es ninguno" "$(domain_tel_throttle_decode 0x1)" "ninguno"
+is "0x4 es el techo de potencia por SW" \
+   "$(domain_tel_throttle_decode 0x4)" "techo de potencia por SW (SW Power Cap)"
+is "0x40 es termico por HW" \
+   "$(domain_tel_throttle_decode 0x40)" "térmico por HW (HW Thermal)"
+is "la mascara larga de nvidia-smi se lee" \
+   "$(domain_tel_throttle_decode 0x0000000000000004)" "techo de potencia por SW (SW Power Cap)"
+is "dos bits dan dos razones" \
+   "$(domain_tel_throttle_decode 0x44 | wc -l)" "2"
+# Una mascara ILEGIBLE es rc 1, no "ninguno": decir "no hay throttling" sin
+# poder leerlo es la respuesta tranquilizadora que este modulo no se permite.
+no_ "mascara ilegible se rechaza" domain_tel_throttle_decode 'vete a saber'
+no_ "mascara [N/A] se rechaza"    domain_tel_throttle_decode '[N/A]'
+no_ "0x0 no tiene throttling activo" domain_tel_throttle_active 0x0
+no_ "GpuIdle no cuenta como throttling" domain_tel_throttle_active 0x1
+yes_ "0x4 si tiene throttling activo"   domain_tel_throttle_active 0x4
+
+echo "== domain/telemetry: tamanos legibles =="
+is "512 MiB se queda en MiB" "$(domain_tel_mib_human 512)"   "512 MiB"
+is "6700 MiB son 6.5 GiB"    "$(domain_tel_mib_human 6700)"  "6.5 GiB"
+is "16311 MiB son 15.9 GiB"  "$(domain_tel_mib_human 16311)" "15.9 GiB"
+is "1024 MiB son 1.0 GiB"    "$(domain_tel_mib_human 1024)"  "1.0 GiB"
+no_ "sin dato no hay tamano" domain_tel_mib_human '[N/A]'
+
+echo "== domain/telemetry: la pregunta de H28 (se puede tirar del cable?) =="
+# Desconectar el tunel con un proceso CUDA vivo hizo que el cierre de
+# /dev/nvidia-uvm escribiera en un BAR0 ya desmapeado: Oops con el spinlock de
+# ISR tomado y host irrecuperable. El panel es el unico sitio donde el operador
+# ya esta mirando, asi que la pregunta se responde ahi.
+is "sin procesos: seguro"     "$(domain_tel_unplug_verdict 0)" "seguro"
+is "con un proceso: peligroso" "$(domain_tel_unplug_verdict 1)" "peligroso"
+is "con varios: peligroso"    "$(domain_tel_unplug_verdict 7)" "peligroso"
+# Un recuento ilegible NO autoriza: sin evidencia no se dice "seguro", misma
+# filosofia que el 'unknown' del gate de enlace.
+is "recuento ilegible NO autoriza" "$(domain_tel_unplug_verdict '[N/A]')" "desconocido"
+
 echo "== domain/health: clasificar lo que dice el kernel =="
 # Las líneas son LITERALES del incidente del 2026-11-02 13:31:52-53, copiadas
 # del journal. Si NVIDIA o el kernel cambian la redacción, estos asserts fallan
@@ -497,6 +599,12 @@ aorus_use ports/gpu.port ports/pci.port ports/log.port ports/thunderbolt.port po
 ( aorus_use adapters/gpu/nvidia-smi        && port_gpu_assert ) >/dev/null 2>&1 \
   && ok "adaptador gpu/nvidia-smi cumple el puerto" \
   || bad "adaptador gpu/nvidia-smi cumple el puerto" "falta alguna función"
+# El DOBLE tambien cumple el contrato, y no es una formalidad: si el doble se
+# queda corto respecto al puerto, los tests de los gates pasan por caminos que
+# la implementacion real no tiene, y entonces miden otra cosa.
+( aorus_use adapters/gpu/fake              && port_gpu_assert ) >/dev/null 2>&1 \
+  && ok "doble gpu/fake cumple el puerto" \
+  || bad "doble gpu/fake cumple el puerto" "falta alguna función"
 ( aorus_use adapters/pci/sysfs             && port_pci_assert ) >/dev/null 2>&1 \
   && ok "adaptador pci/sysfs cumple el puerto" \
   || bad "adaptador pci/sysfs cumple el puerto" "falta alguna función"

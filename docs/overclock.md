@@ -473,6 +473,91 @@ Lo que hace falta para entregarlos, en el orden que manda `CLAUDE.md`
 6. Solo entonces, los dos ficheros de perfil y la línea de la descripción del
    paquete.
 
+## El panel vivo: un htop para las GPUs
+
+`nvidia-oc` abre con un panel que se refresca **cada segundo** y muestra las
+**dos** tarjetas, la externa primero:
+
+```
+  eGPU  GeForce RTX 5060 Ti                         Gen3 x4  P0  00000000:8D:00.0
+  GPU  [████████████░░░░░░░░]  62%  ▁▂▂▃▄▅▆▇██▇▆▅▄▃▃▄▅▆▇██▇▆   2887 MHz
+  VRAM [████████░░░░░░░░░░░░]  41%  ▁▁▂▂▃▃▄▄▄▅▅▅▅▆▆▆▆▆▆▆▆▆▆▆  6.5 GiB / 15.9 GiB
+  PWR  [████████████████░░░░]  79%  ▂▃▃▄▅▅▆▆▇▇███▇▇▆▆▅▅▄▄▃▃▂  143.52 / 180.00 W
+  TEMP  65 °C  ▂▂▃▃▃▄▄▄▅▅▅▅▆▆▆▆▆▇▇▇▇▇▇▇  FAN  48%  MEM 14001 MHz
+  throttle  techo de potencia por SW (SW Power Cap)
+
+  int   RTX PRO 4000 Blackwell Generation Laptop GPU  Gen5 x16  P8  00000000:01:00.0
+  GPU  [░░░░░░░░░░░░░░░░░░░░]   0%  ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁    180 MHz
+  VRAM [░░░░░░░░░░░░░░░░░░░░]   0%  ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁  0 MiB / 15.9 GiB
+  PWR  [····················]       7.53 W  (sin techo publicado)
+  TEMP  53 °C  ▁▁▁▁▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂  FAN  n/d  MEM 405 MHz
+  cable  NO desconectes: 2 proceso(s) tienen la eGPU abierta (cuelga el host, H28)
+```
+
+Cuatro decisiones de este panel no son cosméticas, y vale la pena justificarlas
+porque las cuatro son trampas en las que ya se cayó antes.
+
+**Salen las dos tarjetas, y el rol lo decide el device-id.**
+No el orden en que `nvidia-smi` las liste:
+los índices se reordenan entre arranques, y apuntar por índice es exactamente
+cómo se acabaría hablando de la GPU equivocada.
+Es el mismo criterio que usa el gate R4 para las escrituras.
+Ver las dos a la vez es lo que delata que una carga aterrizó en la interna.
+
+**Del enlace se muestra la CAPACIDAD, no la instantánea.**
+El panel pone `Gen3 x4` en la eGPU porque `pcie.link.gen.max` dice 3;
+`pcie.link.gen.current` dice `1` en reposo, y leer eso como techo es el error
+que ya costó una investigación completa en este repo
+([H18](./research/reliability-hypothesis-ledger.md)).
+El **ancho**, en cambio, sí se toma del ahora (`x4`): es lo que el túnel da de
+verdad, y no se degrada en reposo como la velocidad.
+Esa pareja —generación de la capacidad, ancho del ahora— es la misma que
+alimenta el gate de enlace.
+
+**Un hueco se dibuja como hueco.**
+La GPU interna no publica `power.limit` ni `fan.speed`:
+devuelve `[N/A]`.
+El panel pone `[····]` y `n/d` en vez de una barra al 0% y un ventilador al 0%,
+porque un cero es una lectura tranquilizadora y ahí no hay lectura ninguna.
+
+**El throttling llega traducido.**
+`clocks_throttle_reasons.active` es una máscara de bits;
+el panel la descodifica a texto y solo avisa cuando hay un recorte real.
+El bit `0x1` (`GpuIdle`) se excluye a propósito:
+significa que la tarjeta está en reposo, no que algo la esté frenando.
+Una máscara que no se puede leer se muestra como ilegible, **no** como
+"ninguno".
+
+Y el panel contesta la pregunta que cuelga el host si se responde mal:
+**si se puede tirar del cable ahora mismo.**
+Desconectar el Thunderbolt con un proceso CUDA vivo hace que el cierre de
+`/dev/nvidia-uvm` escriba en un BAR0 ya desmapeado, con el spinlock de ISR
+tomado ([H28](./research/reliability-hypothesis-ledger.md)).
+Mientras haya procesos con la eGPU abierta, el panel lo dice en rojo y con el
+recuento;
+si no se pueden contar, dice que no se puede afirmar, que no es lo mismo que
+decir que es seguro.
+
+### Dónde vive cada cosa
+
+El TUI **no calcula nada de esto**.
+Las barras, los niveles del sparkline, los umbrales de temperatura, la
+traducción del throttling y el veredicto del cable llegan ya resueltos de
+`aorus-egpu-oc telemetry`, que los pide a `domain/telemetry.sh` —puro y con
+test— orquestado por `app/telemetry.sh`.
+`nvidia-oc` elige el color y coloca caracteres.
+El historial del sparkline sí vive en el TUI, porque es estado de presentación
+como la posición del cursor;
+el **mapeo** de valor a nivel no, porque es una regla, y tenerla en dos sitios
+es tenerla dos veces mal.
+
+La telemetría es **solo lectura** y va por `nvidia-smi`, no por NVML:
+mirar el estado no debería depender del binding que hace falta para *escribir*
+offsets, que en Ubuntu es incompatible por defecto.
+Por lo mismo no pide root y no pasa por el gate de enlace:
+no escribe nada, y bloquear la lectura con el enlace degradado solo cegaría al
+operador justo cuando más necesita ver el estado.
+
 ## `nvidia-oc`: la misma funcionalidad, en una pantalla
 
 El paquete entrega **dos** entrypoints, y la diferencia entre ellos es

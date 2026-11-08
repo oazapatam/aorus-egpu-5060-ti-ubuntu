@@ -101,3 +101,76 @@ gpu_offset_window() { # $1=busid -> "gmin gmax mmin mmax"
 gpu_set_clock_offset() { # $1=busid $2=gpu|mem $3=mhz
   _fake_write "clock_offset $2 $3"
 }
+
+# --- telemetría ---------------------------------------------------------------
+#
+# Dos GPUs, como la máquina real: la eGPU (2d04) y la interna (2c39). La interna
+# publica '[N/A]' en power_limit_w y fan_pct porque es EXACTAMENTE lo que hace
+# el hardware de verdad —medido el 2026-11-07—, y es el caso que obliga al
+# dominio a propagar el hueco en vez de rellenarlo con un 0.
+#
+# Mandos:
+#   AORUS_FAKE_TELEMETRY_RC  rc de gpu_telemetry_all (124 = colgado)
+#   AORUS_FAKE_PROCS         líneas de proceso ya formateadas, separadas por
+#                            ';' — vacío = ningún proceso (el caso que
+#                            autoriza a tirar del cable, H28)
+#   AORUS_FAKE_PROCS_RC      rc de gpu_processes_all
+AORUS_FAKE_TELEMETRY_RC="${AORUS_FAKE_TELEMETRY_RC:-0}"
+AORUS_FAKE_PROCS="${AORUS_FAKE_PROCS:-}"
+AORUS_FAKE_PROCS_RC="${AORUS_FAKE_PROCS_RC:-0}"
+
+gpu_telemetry_all() {
+  [ "$AORUS_FAKE_TELEMETRY_RC" -eq 0 ] || return "$AORUS_FAKE_TELEMETRY_RC"
+  cat <<'REC'
+--
+bus_id=00000000:8D:00.0
+vendor_id=0x10de
+device_id=0x2d04
+util_gpu_pct=62
+util_mem_pct=18
+mem_used_mib=6700
+mem_total_mib=16311
+temp_c=65
+power_draw_w=143.52
+power_limit_w=180.00
+gpu_clock_mhz=2887
+mem_clock_mhz=14001
+fan_pct=48
+pstate=P0
+throttle=0x0000000000000004
+link_gen_cur=3
+link_width_cur=4
+link_gen_max=3
+link_width_max=8
+name=NVIDIA GeForce RTX 5060 Ti
+--
+bus_id=00000000:01:00.0
+vendor_id=0x10de
+device_id=0x2c39
+util_gpu_pct=0
+util_mem_pct=0
+mem_used_mib=0
+mem_total_mib=16303
+temp_c=53
+power_draw_w=7.53
+power_limit_w=[N/A]
+gpu_clock_mhz=180
+mem_clock_mhz=405
+fan_pct=[N/A]
+pstate=P8
+throttle=0x0000000000000000
+link_gen_cur=1
+link_width_cur=16
+link_gen_max=5
+link_width_max=16
+name=NVIDIA RTX PRO 4000 Blackwell Generation Laptop GPU
+REC
+  return 0
+}
+
+gpu_processes_all() {
+  [ "$AORUS_FAKE_PROCS_RC" -eq 0 ] || return "$AORUS_FAKE_PROCS_RC"
+  [ -n "$AORUS_FAKE_PROCS" ] || return 0
+  printf '%s\n' "${AORUS_FAKE_PROCS//;/$'\n'}"
+  return 0
+}

@@ -1,10 +1,10 @@
 Package: aorus-egpu-overclock
-Version: 0.3.0
+Version: 0.4.0
 Architecture: all
 Maintainer: Omar Zapata <omar.zapata@arus.com.co>
 Section: admin
 Priority: optional
-Depends: aorus-egpu-core (>= 0.1.0), bash, coreutils, pciutils, systemd, udev, python3
+Depends: aorus-egpu-core (>= 0.2.0), bash, coreutils, pciutils, systemd, udev, python3
 Recommends: nvidia-utils-595 | nvidia-utils-580 | nvidia-utils, python3-pynvml (>= 13)
 Description: Perfiles de potencia y reloj para la eGPU AORUS RTX 5060 Ti
  Aplica perfiles de power limit y de bloqueo de relojes a la eGPU externa
@@ -45,10 +45,34 @@ Description: Perfiles de potencia y reloj para la eGPU AORUS RTX 5060 Ti
  (persistencia del driver y modo de cómputo exclusivo, aún sin implementar en
  el núcleo y por eso NO entregados) están en docs/overclock.md.
  .
- Dos entrypoints: aorus-egpu-oc (CLI: status, list, apply, reset, verify) y
- nvidia-oc, un TUI de ncurses que presenta lo mismo -estado, perfiles, offsets
- y verificación- sin contener ninguna regla: invoca a la CLI, así que los
- gates que se aplican son exactamente los mismos.
+ Dos entrypoints: aorus-egpu-oc (CLI: status, list, apply, reset, verify,
+ telemetry) y nvidia-oc, un TUI de ncurses que presenta lo mismo -estado,
+ perfiles, offsets y verificación- sin contener ninguna regla: invoca a la CLI,
+ así que los gates que se aplican son exactamente los mismos.
+ .
+ PANEL VIVO tipo htop en nvidia-oc: uso del núcleo, ocupación de VRAM, consumo
+ frente al techo, temperatura, ventilador, relojes, estado de energía y
+ throttling DESCODIFICADO (la máscara de bits traducida a texto), con barras,
+ historial reciente en sparkline y la lista de procesos que tienen una GPU
+ abierta. Se refresca cada segundo en un hilo propio, así que un 'status' lento
+ no lo congela. Salen las DOS tarjetas -la externa primero-, y cuál es cuál lo
+ decide el device-id, el mismo criterio que el gate R4, no el orden en que
+ nvidia-smi las liste: los índices se reordenan entre arranques. Del enlace se
+ muestra la CAPACIDAD negociada, no la instantánea, porque en reposo esta
+ última siempre informa Gen1. Un campo que la tarjeta no publica -la GPU
+ interna no da power.limit ni fan.speed- se dibuja como hueco, nunca como un 0.
+ .
+ El panel responde además la pregunta que cuelga el host si se contesta mal:
+ si se puede desconectar el Thunderbolt ahora mismo. Desconectarlo con un
+ proceso CUDA vivo hace que el cierre de /dev/nvidia-uvm escriba en un BAR0 ya
+ desmapeado, y el Oops ocurre con el spinlock de ISR tomado. Mientras haya
+ procesos con la eGPU abierta el panel lo dice en rojo, con el recuento.
+ .
+ La telemetría es SOLO LECTURA y va por nvidia-smi, no por NVML: mirar el
+ estado no debería depender del binding que hace falta para ESCRIBIR offsets,
+ que en Ubuntu es incompatible por defecto. No necesita root ni pasa por el
+ gate de enlace, porque no escribe nada; bloquear la lectura con el enlace
+ degradado solo cegaría al operador justo cuando más necesita ver el estado.
  .
  ALCANCE: ajusta límite de potencia y BLOQUEOS de reloj (nvidia-smi -pl/-lgc/
  -lmc), que funcionan headless y bajo Wayland, y también OFFSETS de +/-MHz

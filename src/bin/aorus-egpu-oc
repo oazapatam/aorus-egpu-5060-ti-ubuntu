@@ -14,6 +14,7 @@ if ! declare -F aorus_use >/dev/null; then
   printf 'aorus-egpu-oc: no encuentro bootstrap.sh\n' >&2; exit 70
 fi
 aorus_use app/overclock
+aorus_use app/telemetry
 
 usage() {
   cat <<-USAGE
@@ -27,6 +28,11 @@ usage() {
 	  aorus-egpu-oc verify [segundos]  mide si la eGPU calcula BIEN (no cambia
 	                                   nada; carga la GPU, así que respeta el
 	                                   gate de enlace igual que una escritura)
+	  aorus-egpu-oc telemetry          foto viva de TODAS las GPUs en
+	                                   clave=valor (uso, VRAM, temperatura,
+	                                   relojes, throttling y procesos). Es lo
+	                                   que consume el panel de nvidia-oc; solo
+	                                   lectura, sin root y sin gate de enlace
 
 	Opciones:
 	  --dry-run              muestra el plan sin tocar el hardware
@@ -91,5 +97,9 @@ case "$cmd" in
   # `verify` NO eleva: medir no escribe nada en la tarjeta, y torch no necesita
   # root. Elevar de más obligaría a correr el runtime CUDA como root sin motivo.
   verify)    oc_verify "${args[0]:-}" ;;
+  # `telemetry` tampoco eleva: es la lectura más barata del paquete y el panel
+  # la invoca una vez por segundo. Pedir root aquí convertiría el monitor en
+  # algo que hay que autorizar para mirar.
+  telemetry) tel_report ;;
   *)         printf 'comando desconocido: %s\n' "$cmd" >&2; usage >&2; exit 2 ;;
 esac
