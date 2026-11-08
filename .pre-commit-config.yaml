@@ -174,7 +174,7 @@ repos:
       # tienen algo que decir cuando se toca src/ o los propios tests. El
       # barrido incondicional ya lo hace ci/30-unit-tests.sh.
       - id: domain-tests
-        name: tests/run.sh (207 asserts de dominio y orquestación, sin root ni GPU)
+        name: tests/run.sh (223 asserts de dominio y orquestación, sin root ni GPU)
         entry: bash tests/run.sh
         language: system
         pass_filenames: false

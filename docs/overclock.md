@@ -163,10 +163,21 @@ pasando 1.252 pasadas limpias, y su tasa de error **dependía de la potencia**.
 
 Por lo que la recomendación operativa **no cambia**:
 para servir modelos en esta máquina, la dirección segura del tuning sigue
-siendo hacia abajo (`efficient`), y no se entrega ningún perfil con offsets
-positivos.
-Lo que el borde medido aporta no es un perfil:
-es saber dónde está el precipicio, y que está a +675 MHz y no a +50.
+siendo hacia abajo (`efficient`).
+Lo que el borde medido aporta, sobre todo, es saber dónde está el precipicio:
+a +675 MHz y no a +50.
+
+Dicho eso, desde la versión 0.3.0 el paquete **sí entrega** tres perfiles con
+offsets positivos —`oc-normal`, `oc-medio` y `oc-maximo`— y conviene ser claro
+sobre qué cambió y qué no.
+Lo que cambió es que existe una escalera medida, así que un perfil puede citar
+un número en vez de inventarlo.
+Lo que **no** cambió es nada de este apartado:
+los tres siguen pasando por el gate de verificación, ninguno se aplica de forma
+desatendida, y la recomendación para una carga de IA larga sigue siendo
+`efficient` o `oc-normal`.
+Entregarlos es reconocer que el operador va a querer el margen medido y que es
+mejor que lo tome por un camino con gates que a mano por NVML sin ninguno.
 
 ## Por qué el power limit no es una palanca aquí
 
@@ -216,6 +227,45 @@ El suelo por defecto es ahora el mínimo de la tarjeta (180 MHz), así que el
 reloj baja de verdad en reposo;
 el `gpu_clock_min_mhz=500` que este perfil llevaba antes era un parche a un
 defecto del dominio, ya corregido.
+
+### `oc-normal`, `oc-medio`, `oc-maximo` — los tres niveles de núcleo
+
+Entregados en 0.3.0.
+Los tres tocan **solo el núcleo** y fijan `mem_clock_offset_mhz=0`
+explícitamente.
+
+| Perfil | Offset de núcleo | Reloj medido | Potencia | Margen al fallo |
+|---|---|---|---|---|
+| `oc-normal` | +150 MHz | 2955 MHz | 151.7 W | 525 MHz |
+| `oc-medio` | +375 MHz | 3180 MHz | 160.5 W | 300 MHz |
+| `oc-maximo` | +600 MHz | 3405 MHz | 167.9 W | **75 MHz** |
+
+Los tres valores son puntos **reales** de la escalera del 2026-11-05, cada uno
+medido individualmente con comparación bit-exacta y `throttle 0x0`;
+no son interpolaciones.
+La referencia de reposo es 2812 MHz a offset 0.
+
+**La memoria va a 0 a propósito, y no es una omisión.**
+Su escalera no se ha medido nunca:
+el +6000 MHz que circula por las notas del proyecto viene de un bench que
+terminó en `Reset Required`, no de una comparación bit-exacta.
+En una tarjeta sin ECC, un offset de memoria sin medir no se cae:
+corrompe pesos en silencio.
+Cuando [`tools/egpu-oc-edge`](../tools/egpu-oc-edge) mida ese dominio se
+añadirá, con su número y su evidencia.
+
+**`oc-maximo` es el de evidencia más débil de todo el paquete**, y su fichero
+lo dice en la primera línea.
+Su cobertura es n=1 de 20 s, no el n≥3 de 90 s de la metodología, porque el
+barrido abortó al colgarse la tarjeta en el escalón siguiente;
+y deja 75 MHz hasta un `Xid 109` que cuesta reconectar el Thunderbolt.
+Es un perfil para medir y para tandas cortas, no para dejar puesto.
+
+Ninguno de los tres se ha aplicado todavía por el camino del paquete
+(`aorus-egpu-oc apply`):
+los números vienen de `tools/egpu-oc-edge`, que escribe por el mismo adaptador
+NVML pero con su propia orquestación.
+Esa es la validación que falta.
 
 ### `performance` — **RETIRADO**, engañaba
 

@@ -1,5 +1,5 @@
 Package: aorus-egpu-overclock
-Version: 0.2.1
+Version: 0.3.0
 Architecture: all
 Maintainer: Omar Zapata <omar.zapata@arus.com.co>
 Section: admin
@@ -13,11 +13,29 @@ Description: Perfiles de potencia y reloj para la eGPU AORUS RTX 5060 Ti
  aborta si el target resuelto no es la eGPU o no cuelga de un controlador
  Thunderbolt/USB4.
  .
- Perfiles incluidos (aorus-egpu-oc list): stock (fábrica, el default) y
+ Perfiles incluidos (aorus-egpu-oc list): stock (fábrica, el default),
  efficient (150 W con techo de reloj — el recomendado para esta caja: medido
  el 2026-11-02 da -13% de rendimiento por -34% de potencia, o sea +31% de
- eficiencia). Se editan en /etc/aorus-egpu/profiles/ y el que se aplica al
- conectar la eGPU se elige en /etc/aorus-egpu/overclock.conf.
+ eficiencia) y tres niveles de overclock del NÚCLEO: oc-normal (+150 MHz),
+ oc-medio (+375) y oc-maximo (+600). Se editan en /etc/aorus-egpu/profiles/ y
+ el que se aplica al conectar la eGPU se elige en
+ /etc/aorus-egpu/overclock.conf.
+ .
+ LOS TRES PERFILES oc-* TOCAN SOLO EL NÚCLEO, y su memoria va fijada a 0 a
+ propósito: el dominio de memoria no se ha medido nunca, y el +6000 MHz que
+ circula por las notas del proyecto viene de un bench que acabó en
+ 'Reset Required', no de una comparación bit-exacta. En una tarjeta sin ECC un
+ offset de memoria sin medir no se cae: corrompe pesos en silencio.
+ .
+ Los tres valores de núcleo son puntos REALES de la escalera medida el
+ 2026-11-05 (rejilla de 75 MHz, comparación bit-exacta): +150 da 2955 MHz,
+ +375 da 3180 y +600 da 3405, los tres con 0 errores y sin throttling. El
+ escalón siguiente, +675, produjo un fallo duro (Xid 109 CTX SWITCH TIMEOUT y
+ NV_ERR_RESET_REQUIRED) que costó reconectar el Thunderbolt. AVISO sobre
+ oc-maximo: su cobertura es n=1 de 20 s -el barrido abortó al colgarse la
+ tarjeta en el paso siguiente- y deja solo 75 MHz de margen hasta ese fallo.
+ Para servir modelos, oc-normal o efficient; oc-maximo es para medir y para
+ tandas cortas.
  .
  Los perfiles 'performance' y 'balanced' se RETIRARON el 2026-11-02 por
  medición: performance ganaba +0.04% (ruido) y su único efecto real era un

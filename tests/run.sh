@@ -319,6 +319,94 @@ OC_verify=por_las_buenas
 no_ "un modo de verify inventado se rechaza" domain_oc_validate 150 180 3090 14001 180 405 "$OFFCAP"
 unset OC_verify OC_power_limit_w OC_gpu_clock_max_mhz
 
+echo "== perfiles ENTREGADOS: el paquete no envia un perfil que el dominio rechace =="
+# Los .profile son DATOS, pero el parser es estricto A PROPOSITO: una clave
+# desconocida rechaza el perfil ENTERO al aplicarlo. Un typo en un fichero
+# entregado se descubriria con la eGPU delante, el gate de enlace ya abierto y
+# el operador esperando. Se comprueba aqui, sin GPU y sin root.
+#
+# El parser se reimplementa en seis lineas en vez de llamar a oc_load_profile
+# porque app/overclock.sh carga sus adaptadores (NVML, sysfs, torch-gemm) al
+# sourcearse, y estos tests son de DOMINIO: sin I/O. Las reglas que se
+# ejercitan si son las de produccion: domain_oc_key_is_valid, _validate y
+# _plan.
+OC_PROFILES_DIR="$ROOT/packaging/aorus-egpu-overclock/etc/aorus-egpu/profiles"
+
+oc_test_parse() { # $1=fichero -> deja OC_<clave> en el shell que llama
+  local line key
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="$(printf '%s' "$line" | tr -d '[:space:]')"
+    [ -z "$line" ] && continue
+    key="${line%%=*}"
+    domain_oc_key_is_valid "$key" || return 1
+    declare -g "OC_$key=${line#*=}"
+  done < "$1"
+}
+
+for f in "$OC_PROFILES_DIR"/*.profile; do
+  n="$(basename "$f" .profile)"
+  (
+    # Subshell: las OC_* de un perfil no contaminan al siguiente, que es
+    # justo el fallo que un bucle en el shell actual introduciria.
+    # Sin OC_profile: domain_oc_validate no lo lee.
+    oc_test_parse "$f" || exit 1
+    domain_oc_validate 150 180 3090 14001 180 405 "$OFFCAP" >/dev/null || exit 2
+  )
+  case $? in
+    0) ok "perfil entregado '$n' valida contra el dominio" ;;
+    1) bad "perfil entregado '$n' valida contra el dominio" "clave fuera de la allowlist" ;;
+    *) bad "perfil entregado '$n' valida contra el dominio" "domain_oc_validate lo rechaza" ;;
+  esac
+done
+
+# Los tres niveles de OC. El NUCLEO es el unico dominio con escalera medida
+# (H25, rejilla de 75 MHz: +150, +375 y +600 son puntos reales medidos
+# bit-exactos), asi que la MEMORIA va a 0 en los tres y eso se comprueba: un 0
+# que se convirtiera en otra cosa seria un offset de memoria ENTREGADO sin
+# medicion, en una tarjeta sin ECC, cuyo modo de fallo es corromper pesos en
+# silencio.
+for pair in oc-normal:150 oc-medio:375 oc-maximo:600; do
+  n="${pair%%:*}"; want="${pair#*:}"
+  plan="$(
+    # shellcheck disable=SC2034  # entrada por entorno del dominio; domain_oc_plan
+    # lee OC_profile para la rama 'stock'. Ver la nota de mas arriba.
+    OC_profile="$n"
+    oc_test_parse "$OC_PROFILES_DIR/$n.profile" || exit 1
+    domain_oc_plan 150 180 3090 14001 180 405 "$OFFCAP" | tr '\t' ' '
+  )"
+  is "$n: el plan pide +$want MHz en el nucleo" \
+     "$(printf '%s\n' "$plan" | awk '/clock_offset gpu/{print $3}')" "$want"
+  is "$n: el plan deja la MEMORIA en 0" \
+     "$(printf '%s\n' "$plan" | awk '/clock_offset mem/{print $3}')" "0"
+  is "$n: exige verificacion numerica" \
+     "$(
+        # Sin OC_profile: domain_oc_verify_required solo lee OC_verify y los
+        # dos offsets, asi que ponerlo aqui no afectaria al resultado.
+        oc_test_parse "$OC_PROFILES_DIR/$n.profile" >/dev/null
+        domain_oc_verify_required
+      )" "gemm"
+done
+
+# El +675 colgo la tarjeta: Xid 109 CTX SWITCH TIMEOUT -> NV_ERR_RESET_REQUIRED,
+# y hubo que reconectar el Thunderbolt. Ningun perfil entregado debe alcanzarlo.
+# Este assert es el que salta si alguien "sube un poco" el maximo mas adelante
+# sin medir antes el escalon nuevo.
+oc_max_shipped=0
+for f in "$OC_PROFILES_DIR"/*.profile; do
+  v="$(
+    oc_test_parse "$f" >/dev/null 2>&1
+    printf '%s' "${OC_gpu_clock_offset_mhz:-0}"
+  )"
+  domain_oc_is_int "$v" || continue
+  [ "$((v))" -gt "$oc_max_shipped" ] && oc_max_shipped=$((v))
+done
+is "el offset de nucleo mas alto entregado es +600" "$oc_max_shipped" "600"
+no_ "ningun perfil entregado alcanza el borde que cuelga (+675)" \
+    [ "$oc_max_shipped" -ge 675 ]
+unset OC_profile OC_gpu_clock_offset_mhz OC_mem_clock_offset_mhz OC_verify \
+      OC_power_limit_w OC_gpu_clock_max_mhz
+
 echo "== domain/health: clasificar lo que dice el kernel =="
 # Las líneas son LITERALES del incidente del 2026-11-02 13:31:52-53, copiadas
 # del journal. Si NVIDIA o el kernel cambian la redacción, estos asserts fallan
