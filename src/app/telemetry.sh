@@ -179,6 +179,10 @@ tel_report() {
   if [ -n "$procs" ]; then
     while IFS=$'\t' read -r bus pid mem name; do
       [ -n "$bus" ] || continue
+      # Una fila sin PID numérico no es un proceso: la tarjeta en
+      # `requires reset` anuncia su bus-id con el resto en hueco. Ver
+      # domain_tel_proc_is_real.
+      domain_tel_proc_is_real "$pid" || continue
       printf '[proc]\nbus_id=%s\npid=%s\nmem_mib=%s\nname=%s\n' \
              "$bus" "$pid" "$mem" "$name"
       v="$(domain_tel_mib_human "$mem")" && printf 'mem_human=%s\n' "$v"

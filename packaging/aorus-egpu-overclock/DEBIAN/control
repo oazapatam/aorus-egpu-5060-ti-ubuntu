@@ -1,5 +1,5 @@
 Package: aorus-egpu-overclock
-Version: 0.4.0
+Version: 0.4.1
 Architecture: all
 Maintainer: Omar Zapata <omar.zapata@arus.com.co>
 Section: admin
@@ -17,7 +17,7 @@ Description: Perfiles de potencia y reloj para la eGPU AORUS RTX 5060 Ti
  efficient (150 W con techo de reloj — el recomendado para esta caja: medido
  el 2026-11-02 da -13% de rendimiento por -34% de potencia, o sea +31% de
  eficiencia) y tres niveles de overclock del NÚCLEO: oc-normal (+150 MHz),
- oc-medio (+375) y oc-maximo (+600). Se editan en /etc/aorus-egpu/profiles/ y
+ oc-medio (+375) y oc-maximo (+525). Se editan en /etc/aorus-egpu/profiles/ y
  el que se aplica al conectar la eGPU se elige en
  /etc/aorus-egpu/overclock.conf.
  .
@@ -29,13 +29,21 @@ Description: Perfiles de potencia y reloj para la eGPU AORUS RTX 5060 Ti
  .
  Los tres valores de núcleo son puntos REALES de la escalera medida el
  2026-11-05 (rejilla de 75 MHz, comparación bit-exacta): +150 da 2955 MHz,
- +375 da 3180 y +600 da 3405, los tres con 0 errores y sin throttling. El
- escalón siguiente, +675, produjo un fallo duro (Xid 109 CTX SWITCH TIMEOUT y
- NV_ERR_RESET_REQUIRED) que costó reconectar el Thunderbolt. AVISO sobre
- oc-maximo: su cobertura es n=1 de 20 s -el barrido abortó al colgarse la
- tarjeta en el paso siguiente- y deja solo 75 MHz de margen hasta ese fallo.
+ +375 da 3180 y +525 da 3330, los tres con 0 errores y sin throttling.
+ .
+ oc-maximo LLEVÓ +600 Y LO PERDIÓ. Ese valor había pasado la escalera limpio,
+ pero con n=1 de 20 s, y el 2026-11-07 aplicarlo colgó la tarjeta en SEIS
+ segundos: Xid 62, PMU del GSP detenido y Xid 154 (GPU Reset Required), con el
+ verificador sin completar ni una iteración, o sea que la tarjeta murió antes
+ de calcular nada. El gate funcionó -no persistió el perfil- pero la eGPU quedó
+ pidiendo un reset. Se bajó al escalón inmediatamente inferior, +525, que es el
+ más alto con medición de duración completa y deja 150 MHz hasta el +675 que
+ cuelga el núcleo con Xid 109. No subas ese número sin medir el escalón nuevo
+ con tools/egpu-oc-edge y n>=3; el fichero del perfil lleva la cronología.
+ .
  Para servir modelos, oc-normal o efficient; oc-maximo es para medir y para
- tandas cortas.
+ tandas cortas, porque el gate de verificación detecta una tarjeta que YA
+ calcula mal y no garantiza que no empiece a calcular mal más adelante.
  .
  Los perfiles 'performance' y 'balanced' se RETIRARON el 2026-11-02 por
  medición: performance ganaba +0.04% (ruido) y su único efecto real era un

@@ -80,7 +80,7 @@ la persistencia sigue en `Disabled` en la tarjeta externa.
 | Techo de reloj gráfico | `-lgc <min>,<techo>` | Sí | **La única palanca con efecto grande medido** (es lo que hace `efficient`) |
 | Suelo de reloj gráfico | `-lgc <suelo>,...` | Sí | Contraproducente: no da rendimiento y sube consumo y temperatura **en reposo** |
 | Lock de reloj de memoria | `-lmc` | Sí, pero **NO USAR** | Defecto conocido en Blackwell: −16.43% de rendimiento (ver abajo) |
-| Offsets de +MHz sobre stock | — (NVML, no `nvidia-smi`) | **Sí** | Ventana núcleo ±1000 / memoria −2000..+6000 MHz. Medido: **+600 MHz limpio (3405 MHz), +675 cuelga con `Xid 109`**. Un offset positivo exige el gate de verificación |
+| Offsets de +MHz sobre stock | — (NVML, no `nvidia-smi`) | **Sí** | Ventana núcleo ±1000 / memoria −2000..+6000 MHz. Medido: **+525 MHz es el techo que sigue en pie**; el +600 pasó una vez y luego colgó el GSP, y el +675 cuelga con `Xid 109`. Un offset positivo exige el gate de verificación |
 | Persistencia del driver | `-pm 1` | Sí, y **sin usar** | Palanca real para vLLM; aún no implementada en el paquete |
 | Modo de cómputo exclusivo | `-c EXCLUSIVE_PROCESS` | Sí, y **sin usar** | Palanca real para vLLM; aún no implementada en el paquete |
 | ECC | `-e 1` | **No** | `ecc.mode.current=[N/A]`: la tarjeta no lo soporta (ver el riesgo abajo) |
@@ -146,12 +146,26 @@ con descriptores abiertos cuelga el host.
 
 ### Lo que este número NO autoriza
 
-La cobertura real del +600 MHz es **n=1 de 20 s**, no el n≥3 de 90 s que la
+La cobertura real del +600 MHz era **n=1 de 20 s**, no el n≥3 de 90 s que la
 metodología del repo exige:
 el barrido abortó al caerse la tarjeta, así que la confirmación no llegó a
 correr y la **memoria no se midió en absoluto**.
-El valor honesto de hoy es "el borde está entre +600 y +675 MHz, con una sola
-pasada limpia en +600".
+
+**Y el 2026-11-07 ese n=1 se cayó.**
+Aplicar `oc-maximo` con +600 MHz colgó la tarjeta en **seis segundos**:
+`Xid 62`, `_kgspRpcGspEventPmuHalted` y
+`Xid 154 → 0x1 (GPU Reset Required)`, con el verificador sin completar ni una
+iteración (`errors=0 iters=0`).
+No fue un fallo numérico: la tarjeta murió antes de calcular nada.
+Así que el valor honesto de hoy es **"el borde utilizable es +525; el +600
+pasó una vez de 20 s y cuelga"**, y el perfil `oc-maximo` bajó a +525.
+Detalle en [H25](./research/reliability-hypothesis-ledger.md).
+
+Esto es la disciplina de n≥3 cobrándose su primera factura en este repo, y
+conviene no suavizarlo:
+la debilidad del dato estaba **anotada** —en la hipótesis y en el propio
+fichero del perfil— y el valor se entregó de todas formas.
+Un aviso dentro de un fichero que alguien va a aplicar no es una salvaguarda.
 
 Y aunque estuviera confirmado, seguiría sin ser una licencia.
 Esta tarjeta no tiene ECC, y el modo de fallo que importa para una carga de IA
@@ -238,12 +252,19 @@ explícitamente.
 |---|---|---|---|---|
 | `oc-normal` | +150 MHz | 2955 MHz | 151.7 W | 525 MHz |
 | `oc-medio` | +375 MHz | 3180 MHz | 160.5 W | 300 MHz |
-| `oc-maximo` | +600 MHz | 3405 MHz | 167.9 W | **75 MHz** |
+| `oc-maximo` | +525 MHz | 3330 MHz | 165.4 W | 150 MHz |
 
 Los tres valores son puntos **reales** de la escalera del 2026-11-05, cada uno
 medido individualmente con comparación bit-exacta y `throttle 0x0`;
 no son interpolaciones.
 La referencia de reposo es 2812 MHz a offset 0.
+
+`oc-maximo` **llevó +600 MHz y lo perdió**:
+el 2026-11-07 ese valor colgó el GSP de la tarjeta seis segundos después de
+aplicarlo, y bajó al escalón inmediatamente inferior.
+No subas ese número sin medir antes el escalón con `tools/egpu-oc-edge` y
+n≥3 de 90 s;
+el fichero del perfil lleva la cronología completa.
 
 **La memoria va a 0 a propósito, y no es una omisión.**
 Su escalera no se ha medido nunca:
@@ -254,12 +275,13 @@ corrompe pesos en silencio.
 Cuando [`tools/egpu-oc-edge`](../tools/egpu-oc-edge) mida ese dominio se
 añadirá, con su número y su evidencia.
 
-**`oc-maximo` es el de evidencia más débil de todo el paquete**, y su fichero
-lo dice en la primera línea.
-Su cobertura es n=1 de 20 s, no el n≥3 de 90 s de la metodología, porque el
-barrido abortó al colgarse la tarjeta en el escalón siguiente;
-y deja 75 MHz hasta un `Xid 109` que cuesta reconectar el Thunderbolt.
-Es un perfil para medir y para tandas cortas, no para dejar puesto.
+**`oc-maximo` sigue siendo el perfil más agresivo**, y su fichero lleva en la
+primera línea el aviso y la cronología de por qué bajó.
+A +525 tiene medición de duración completa (0 errores) y deja 150 MHz hasta el
++675 que cuelga el núcleo y 75 MHz hasta el +600 que cuelga el GSP.
+Es un perfil para medir y para tandas cortas, no para dejar puesto:
+el gate de verificación detecta una tarjeta que **ya** calcula mal, no
+garantiza que no empiece a calcular mal en la hora 3 de un entrenamiento.
 
 Ninguno de los tres se ha aplicado todavía por el camino del paquete
 (`aorus-egpu-oc apply`):

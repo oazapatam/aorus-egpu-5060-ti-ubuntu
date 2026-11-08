@@ -238,6 +238,27 @@ domain_tel_mib_human() { # $1=MiB
   printf '%s.%s GiB' "$int" "$frac"
 }
 
+# ¿Esta fila de `--query-compute-apps` describe un proceso DE VERDAD?
+#
+# Medido el 2026-11-07 con la eGPU en `GPU requires reset` tras el incidente
+# del offset +600: nvidia-smi devuelve una fila con el bus-id RELLENO y el
+# resto en hueco —
+#     00000000:8D:00.0, [N/A], [N/A], [N/A]
+# — es decir, anuncia una GPU sin anunciar ningún proceso. Contarla como
+# proceso tenía dos consecuencias, y la segunda es la grave:
+#   1. el panel listaba un proceso fantasma con 'pid=[N/A]';
+#   2. el veredicto de H28 decía 'peligroso' sin que nadie tuviera la tarjeta
+#      abierta, y justo entonces la recuperación documentada consiste en
+#      desconectar el cable. Un aviso que grita cuando no hay peligro se
+#      aprende a ignorar, y el día que sí haya peligro ya no se lee.
+#
+# La regla: sin un PID numérico no hay proceso. El criterio es el pid y no el
+# bus-id porque el bus-id es justo el campo que la tarjeta rota SÍ rellena.
+domain_tel_proc_is_real() { # $1=pid tal como lo publica el adaptador
+  domain_tel_int "${1:-}" >/dev/null || return 1
+  return 0
+}
+
 # --- la pregunta de H28 -------------------------------------------------------
 #
 # "¿Puedo desconectar el cable ahora?" Desconectar el túnel con un proceso

@@ -7,11 +7,11 @@ La evidencia de por qué está en
 | Paquete | Versión | Estado | Validado en vivo |
 |---|---|---|---|
 | `egpu-tb-fix` | 1.5.1 | **principal** | **sí** — es lo que hace funcionar la eGPU hoy |
-| `aorus-egpu-core` | 0.2.0 | núcleo compartido — no se instala solo | sí — es lo que cargan los entrypoints de los demás |
+| `aorus-egpu-core` | 0.2.1 | núcleo compartido — no se instala solo | sí — es lo que cargan los entrypoints de los demás |
 | `aorus-egpu-forensics` | 0.2.0 | nuevo, recomendado al depurar | capas 1-2 sí; capa 3 (ramoops) por construcción |
 | `aorus-egpu-health` | 0.2.0 | nuevo — detector de incidentes | las reglas y el `scan` sí; el servicio de vigilancia continua, no |
 | `aorus-egpu-igpu-display` | 0.2.0 | nuevo — [diseño y medidas](../igpu-display.md) | el gate y el inventario sí; el cambio de modeset requiere reiniciar |
-| `aorus-egpu-overclock` | 0.4.0 | **en desarrollo, no usar** — [palancas y perfiles medidos](../overclock.md); entrega `aorus-egpu-oc` (CLI) y `nvidia-oc` (TUI) | el TUI y el estado sí; los tres perfiles `oc-*` llevan offsets de núcleo medidos bit-exactos pero NO se han aplicado por el camino del paquete |
+| `aorus-egpu-overclock` | 0.4.1 | **en desarrollo, no usar** — [palancas y perfiles medidos](../overclock.md); entrega `aorus-egpu-oc` (CLI) y `nvidia-oc` (TUI) | el TUI y el estado sí; los tres perfiles `oc-*` llevan offsets de núcleo medidos bit-exactos pero NO se han aplicado por el camino del paquete |
 | `aorus-egpu-config` | 0.5.9 | **superseded** (archivo) | lo estuvo hasta el 2026-06-28; purgado |
 | `aorus-egpu-nvidia-dkms` | 595.71.05-aorus17 | **superseded + deuda de versión** | lo estuvo hasta el 2026-06-28; purgado |
 

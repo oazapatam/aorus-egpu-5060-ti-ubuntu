@@ -1,29 +1,36 @@
-# desc: +600 MHz de núcleo — el escalón más alto que pasó, y el de evidencia MÁS DÉBIL
-# LEE ESTO ANTES DE DEJARLO PUESTO.
+# desc: +525 MHz de núcleo — el escalón más alto que sigue en pie
+# El +600 ESTUVO aquí y se cayó. Vale la pena leer por qué antes de subirlo.
 #
-# +600 es el último escalón de la escalera de H25 que pasó limpio, pero su
-# cobertura es **n=1 de 20 s**, no el n>=3 de 90 s que la metodología del repo
-# exige: el barrido abortó al colgarse la tarjeta en el paso siguiente, así que
-# la confirmación nunca llegó a correr. Medido en ese paso el 2026-11-05:
-# 3405 MHz bajo carga, 167.9 W, 78 °C, throttle 0x0, 0 errores.
+# El 2026-11-07 a las 22:58 este perfil llevaba +600 MHz, y aplicarlo con
+# `aorus-egpu-oc apply oc-maximo` colgó la tarjeta en SEIS segundos:
+#   NVRM: Xid (PCI:0000:8d:00): 62
+#   NVRM: _kgspRpcGspEventPmuHalted: Received signal from GSP that PMU has halted
+#   NVRM: Xid (PCI:0000:8d:00): 154, recovery action 0x0 (None) -> 0x1 (GPU Reset Required)
+# más un volcado del RISC-V del GSP. El verificador no completó NI UNA
+# iteración (`errors=0 iters=0` en oc-verify.log), así que el fallo no fue
+# numérico: la tarjeta murió antes de calcular nada. El gate funcionó —no
+# persistió el perfil— pero la eGPU quedó en `Reset Required`.
 #
-# El escalón siguiente, +675, produjo un fallo DURO: `Xid 109 CTX SWITCH
-# TIMEOUT` (x12), `NV_ERR_RESET_REQUIRED`, la tarjeta dejó de responder a NVML
-# y a nvidia-smi, y hubo que reconectar el Thunderbolt. Así que este perfil
-# deja solo **75 MHz de margen** hasta un estado que cuesta una recuperación.
+# Y el +600 venía de una medición que pasó LIMPIA: la escalera de H25 lo
+# registró a 3405 MHz con 0 errores. Con n=1 de 20 s. Esto es exactamente lo
+# que el gate de n>=3 del repo existe para atrapar, y el valor se entregó
+# igualmente con un aviso en el fichero. El aviso no bastó.
 #
-# Y el margen de reloj no es el único riesgo. Esta tarjeta no tiene ECC, y hay
-# un caso documentado en Blackwell/GDDR7 donde un GEMM de entradas fijas
-# devolvió un resultado distinto en la iteración 274.400 mientras un memtest de
-# VRAM pasaba 1.252 pasadas limpias. Las 44 327 iteraciones bit-exactas de toda
-# la escalera son dos órdenes de magnitud menos que eso: el gate de
-# verificación detecta una tarjeta que YA calcula mal, no garantiza que no
-# empiece a calcular mal en la hora 3 de un entrenamiento.
+# +525 es el escalón inmediatamente inferior y el más alto con medición de
+# duración completa: 3330 MHz, 165.4 W, throttle 0x0, 0 errores. Deja 150 MHz
+# hasta el +675 que ya se sabía que colgaba, y 75 MHz hasta el +600 que ahora
+# también se sabe que cuelga.
 #
-# Uso honesto: para medir, comparar y exprimir una tanda corta. Para servir
-# modelos en producción, `oc-normal` o directamente `efficient`.
+# NO SUBAS ESTE VALOR sin medir antes el escalón nuevo con
+# `tools/egpu-oc-edge` y n>=3 de 90 s. La lección de este incidente es que un
+# paso limpio una vez no es un paso limpio.
+#
+# Sigue siendo el perfil más agresivo del paquete y sigue sin ser para dejarlo
+# puesto: esta tarjeta no tiene ECC y el gate de verificación detecta una
+# tarjeta que YA calcula mal, no garantiza que no empiece a calcular mal en la
+# hora 3 de un entrenamiento. Para servir modelos, oc-normal o efficient.
 #
 # Memoria fijada a 0 como en el resto de los oc-*. Ver oc-normal.profile.
-gpu_clock_offset_mhz=600
+gpu_clock_offset_mhz=525
 mem_clock_offset_mhz=0
 verify=gemm

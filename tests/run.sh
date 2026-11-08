@@ -366,7 +366,7 @@ done
 # que se convirtiera en otra cosa seria un offset de memoria ENTREGADO sin
 # medicion, en una tarjeta sin ECC, cuyo modo de fallo es corromper pesos en
 # silencio.
-for pair in oc-normal:150 oc-medio:375 oc-maximo:600; do
+for pair in oc-normal:150 oc-medio:375 oc-maximo:525; do
   n="${pair%%:*}"; want="${pair#*:}"
   plan="$(
     # shellcheck disable=SC2034  # entrada por entorno del dominio; domain_oc_plan
@@ -388,10 +388,12 @@ for pair in oc-normal:150 oc-medio:375 oc-maximo:600; do
       )" "gemm"
 done
 
-# El +675 colgo la tarjeta: Xid 109 CTX SWITCH TIMEOUT -> NV_ERR_RESET_REQUIRED,
-# y hubo que reconectar el Thunderbolt. Ningun perfil entregado debe alcanzarlo.
-# Este assert es el que salta si alguien "sube un poco" el maximo mas adelante
-# sin medir antes el escalon nuevo.
+# Dos escalones se sabe que cuelgan esta tarjeta: el +675 (Xid 109 CTX SWITCH
+# TIMEOUT, 2026-11-05 en el barrido) y el +600 (Xid 62 + PMU halted + Xid 154
+# Reset Required, 2026-11-07 al aplicar el perfil, en SEIS segundos). El +600
+# habia pasado limpio con n=1 de 20 s, que es justo por lo que el repo exige
+# n>=3. Ningun perfil entregado puede alcanzar ninguno de los dos: este assert
+# es el que salta si alguien "sube un poco" el maximo sin medir el escalon.
 oc_max_shipped=0
 for f in "$OC_PROFILES_DIR"/*.profile; do
   v="$(
@@ -401,8 +403,10 @@ for f in "$OC_PROFILES_DIR"/*.profile; do
   domain_oc_is_int "$v" || continue
   [ "$((v))" -gt "$oc_max_shipped" ] && oc_max_shipped=$((v))
 done
-is "el offset de nucleo mas alto entregado es +600" "$oc_max_shipped" "600"
-no_ "ningun perfil entregado alcanza el borde que cuelga (+675)" \
+is "el offset de nucleo mas alto entregado es +525" "$oc_max_shipped" "525"
+no_ "ningun perfil entregado alcanza el +600 que colgo el GSP" \
+    [ "$oc_max_shipped" -ge 600 ]
+no_ "ningun perfil entregado alcanza el +675 que colgo el nucleo" \
     [ "$oc_max_shipped" -ge 675 ]
 unset OC_profile OC_gpu_clock_offset_mhz OC_mem_clock_offset_mhz OC_verify \
       OC_power_limit_w OC_gpu_clock_max_mhz
@@ -502,6 +506,17 @@ echo "== domain/telemetry: la pregunta de H28 (se puede tirar del cable?) =="
 # /dev/nvidia-uvm escribiera en un BAR0 ya desmapeado: Oops con el spinlock de
 # ISR tomado y host irrecuperable. El panel es el unico sitio donde el operador
 # ya esta mirando, asi que la pregunta se responde ahi.
+# MEDIDO el 2026-11-07, con la eGPU en `GPU requires reset` tras el incidente
+# del offset +600: nvidia-smi devuelve una fila de compute-apps con el bus-id
+# RELLENO y el resto en hueco ("00000000:8D:00.0, [N/A], [N/A], [N/A]"), o sea
+# que anuncia una GPU sin anunciar ningun proceso. Contarla daba un proceso
+# fantasma en la tabla y, peor, un 'peligroso' sin peligro JUSTO cuando la
+# recuperacion documentada consiste en desconectar el cable.
+no_  "fila sin pid numerico NO es un proceso"  domain_tel_proc_is_real '[N/A]'
+no_  "fila con pid vacio NO es un proceso"     domain_tel_proc_is_real ''
+no_  "un pid que es texto NO es un proceso"    domain_tel_proc_is_real 'python'
+yes_ "un pid numerico SI es un proceso"        domain_tel_proc_is_real 518732
+
 is "sin procesos: seguro"     "$(domain_tel_unplug_verdict 0)" "seguro"
 is "con un proceso: peligroso" "$(domain_tel_unplug_verdict 1)" "peligroso"
 is "con varios: peligroso"    "$(domain_tel_unplug_verdict 7)" "peligroso"
