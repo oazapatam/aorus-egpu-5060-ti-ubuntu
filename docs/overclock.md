@@ -262,6 +262,23 @@ el payload del `.deb` es la lista que el usuario ve en `aorus-egpu-oc list`, y
 un perfil presente es un perfil que alguien va a aplicar.
 El registro de lo que hacían y de por qué se fueron es este documento.
 
+**Ojo con las copias que queden en disco.**
+Quitar un perfil del paquete no borra el fichero de una máquina donde ya
+estuviera:
+`/etc/aorus-egpu/profiles/` no es un conffile de dpkg (ver
+[`ci-package-policy.md`](./ci-package-policy.md)) y dpkg solo retira lo que un
+paquete posee.
+El 2026-11-07, al instalar el paquete en esta máquina, `aorus-egpu-oc list`
+seguía ofreciendo `performance` y `balanced` desde dos ficheros del 2 de
+noviembre que **ningún paquete poseía** (`dpkg -S` no los reconocía).
+Si `list` ofrece un perfil retirado, compruébalo así y borra a mano lo que
+sobre:
+
+```bash
+dpkg -S /etc/aorus-egpu/profiles/*.profile   # lo que no salga, es huérfano
+sudo rm /etc/aorus-egpu/profiles/<retirado>.profile
+```
+
 ## Lo que de verdad le falta para IA: persistencia y modo de cómputo
 
 Las dos palancas que importan para servir modelos en esta máquina no son de

@@ -1,11 +1,11 @@
 Package: aorus-egpu-overclock
-Version: 0.2.0
+Version: 0.2.1
 Architecture: all
 Maintainer: Omar Zapata <omar.zapata@arus.com.co>
 Section: admin
 Priority: optional
 Depends: aorus-egpu-core (>= 0.1.0), bash, coreutils, pciutils, systemd, udev, python3
-Recommends: nvidia-utils-595 | nvidia-utils-580 | nvidia-utils, python3-pynvml
+Recommends: nvidia-utils-595 | nvidia-utils-580 | nvidia-utils, python3-pynvml (>= 13)
 Description: Perfiles de potencia y reloj para la eGPU AORUS RTX 5060 Ti
  Aplica perfiles de power limit y de bloqueo de relojes a la eGPU externa
  (10de:2d04) y SOLO a ella, vía nvidia-smi dirigido por PCI bus-id. La GPU
@@ -40,9 +40,23 @@ Description: Perfiles de potencia y reloj para la eGPU AORUS RTX 5060 Ti
  2026-11-05 se comprobó en vivo que un +75 MHz mueve el reloj real de 2827 a
  2887 MHz. Lo que NO sirve aquí es nvidia-settings, que necesita NV-CONTROL
  sobre un servidor X y la sesión es Wayland. El adaptador NVML decora al de
- nvidia-smi y degrada honestamente: sin python3-pynvml los offsets se declaran
- NO soportados, un perfil que los pida se RECHAZA en vez de fingir que se
- aplicó, y el resto (potencia, locks, estado, reset) sigue funcionando igual.
+ nvidia-smi y degrada honestamente: sin un pynvml utilizable los offsets se
+ declaran NO soportados, un perfil que los pida se RECHAZA en vez de fingir que
+ se aplicó, y el resto (potencia, locks, estado, reset) sigue funcionando igual.
+ .
+ LA VERSIÓN DEL BINDING IMPORTA, y por eso el Recommends pide
+ python3-pynvml (>= 13). El paquete que trae Ubuntu resolute es 12.550.89, y
+ ahí la firma de nvmlDeviceGetGpcClkMinMaxVfOffset es la antigua: recibe los
+ límites como parámetros de salida en vez de devolverlos, así que la llamada
+ falla con TypeError y el adaptador concluye -correctamente- "offsets no
+ soportados". Medido el 2026-11-07 en esta máquina con el driver 595.99.02. Con
+ nvidia-ml-py 13.615.71 la misma llamada devuelve la ventana real
+ (-1000..1000 MHz en el núcleo, -2000..6000 en la memoria).
+ .
+ Si ese binding vive en un venv y no en el python del sistema, el intérprete se
+ elige con AORUS_NVML_PYTHON (y AORUS_VERIFY_PYTHON para el verificador):
+ nvidia-oc los resuelve solo -prueba cada candidato y se queda con el que
+ importa pynvml y torch-, y la CLI los acepta del entorno.
  .
  GATE DE VERIFICACIÓN (solo para offsets POSITIVOS): esta tarjeta no tiene
  ECC, así que un offset demasiado agresivo no se cae, CALCULA MAL -el kernel
