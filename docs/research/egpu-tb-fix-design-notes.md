@@ -86,6 +86,20 @@ Ubicación: `pkg/egpu-tb-fix/`. Para construirlo: `./build.sh` (genera `dist/*.d
   transitorio (`egpu-tb-fix ungate`) la abre y enlaza lo que quedó sin driver detrás de
   Thunderbolt. No se cierra durante el arranque (`systemctl is-system-running` ≠ running/degraded)
   ni sin el módulo nvidia cargado. `egpu-tb-fix open-gate` la abre a mano.
+- Replug a media preparación (desde 1.5.1, [H26](./reliability-hypothesis-ledger.md#h26)):
+  si el túnel se cae durante la espera de estabilidad,
+  `pciehp` libera el bus y el device PCI de la eGPU **sale de sysfs**.
+  Antes eso se leía como "no hay ninguna eGPU conectada":
+  la ejecución terminaba sin hacer nada y, al abrir la compuerta al salir,
+  borraba la que el evento del replug acababa de cerrar,
+  así que la tarjeta reaparecía con el autoprobe encendido y sin BAR0
+  (2026-11-07 00:59:13; recuperada a mano con `sudo egpu-tb-fix`).
+  Ahora `wait_stable` distingue "nunca hubo eGPU" de "había y desapareció"
+  —en el segundo caso espera `REPLUG_SECS=30` a que vuelva—,
+  `gate` sella la compuerta con `date +%s%N` y `open_gate` no abre una compuerta
+  posterior al arranque de su instancia (salvo con `force`:
+  el subcomando `open-gate` y el `ExecStopPost` del servicio),
+  y `ungate` atiende una eGPU sin BAR0 exista o no la compuerta.
 - Regla udev + `egpu-tb-fix.service`: lo lanzan solos al conectar la eGPU. Cooldown de 30 s.
   Otra regla deja `power/control=on` en las funciones de la eGPU.
 - `72-egpu-tb-fix-seat.rules`: pone `ID_SEAT=seat-egpu` a los nodos DRM de la eGPU para que

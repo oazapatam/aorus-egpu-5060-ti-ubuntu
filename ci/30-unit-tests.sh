@@ -34,6 +34,24 @@ else
   fi
 fi
 
+# --- 1b) regresión de egpu-tb-fix (script legacy, fuera de src/) --------------
+# `egpu-tb-fix` es anterior a la arquitectura hexagonal: su lógica vive en
+# packaging/, así que tests/run.sh no la alcanza. Este test carga el script con
+# el `main` neutralizado y dobles para sysfs y el reloj. Fija H26: un replug del
+# túnel a media preparación dejaba la eGPU sin BAR0 y sin driver.
+ci_section "regresión de egpu-tb-fix (H26: replug del túnel)"
+if [ ! -f tests/egpu-tb-fix-replug.sh ]; then
+  ci_fail "no existe tests/egpu-tb-fix-replug.sh"
+else
+  out="$(bash tests/egpu-tb-fix-replug.sh 2>&1)"; rc=$?
+  resumen="$(printf '%s' "$out" | tail -1)"
+  if [ "$rc" -eq 0 ]; then
+    ci_ok "tests/egpu-tb-fix-replug.sh — $resumen"
+  else
+    ci_fail "tests/egpu-tb-fix-replug.sh falló ($resumen)" "$(printf '%s' "$out" | grep -E 'FAIL' || printf '%s' "$out")"
+  fi
+fi
+
 # --- 2) smoke de los entrypoints ----------------------------------------------
 # Convención de códigos de salida que se comprueba aquí:
 #   0  = ok            2  = error de uso (opción/comando/argumento)

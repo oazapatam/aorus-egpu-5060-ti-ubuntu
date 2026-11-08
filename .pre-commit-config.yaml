@@ -181,6 +181,18 @@ repos:
         files: '^(src/|tests/)'
         stages: [pre-commit]
 
+      # Regresión del script legacy `egpu-tb-fix`, cuya lógica vive en
+      # packaging/ y no en src/, así que tests/run.sh no la ve. Fija H26: un
+      # replug del túnel Thunderbolt a media preparación dejaba la eGPU sin
+      # BAR0 y además borraba la compuerta del evento nuevo.
+      - id: egpu-tb-fix-replug-tests
+        name: tests/egpu-tb-fix-replug.sh (26 asserts, sin root ni GPU)
+        entry: bash tests/egpu-tb-fix-replug.sh
+        language: system
+        pass_filenames: false
+        files: '^(packaging/egpu-tb-fix/|tests/)'
+        stages: [pre-commit]
+
       # ----- Etapa de CI de documentación -----
       # ci/70-docs.sh comprueba enlaces relativos colgados, fences sin cerrar,
       # sembr (aviso) y que las versiones de docs/packages/README.md cuadren

@@ -30,6 +30,13 @@
 # congeló al hacerlo). Si en GATE_SECS no aparece ninguna eGPU, "ungate" vuelve a encender
 # el autoprobe y enlaza lo que quedó sin driver.
 #
+# Replug del túnel a media preparación: el túnel PCIe se cae y vuelve en el segundo
+# siguiente, así que el device PCI de la eGPU desaparece de sysfs y reaparece. Dos reglas
+# salen de ahí (2026-11-07, H26): que la eGPU no esté en sysfs NO es "no hay nada que
+# esperar" mientras el replug esté en curso (ver wait_stable), y una compuerta que cerró un
+# evento posterior al arranque de esta instancia NO se abre al terminar, porque pertenece a
+# la eGPU que está llegando (ver open_gate).
+#
 # Todo se hace en caliente vía sysfs: un reinicio deja el PCI como estaba.
 
 set -euo pipefail
@@ -46,9 +53,11 @@ HOLD_DRIVER=none	# driver_override que no coincide con ningún driver
 COOLDOWN_SECS=30
 STABLE_SECS=15	# la caja debe llevar este tiempo enumerada antes de tocarla
 WAIT_SECS=120	# máximo que se espera a que se estabilice
+REPLUG_SECS=30	# si la eGPU desaparece de sysfs, cuánto se espera a que vuelva
 LINK_GEN=3	# generación PCIe máxima del enlace interno de la caja (caja ↔ GPU)
 DRY_RUN=0
 PM_FILE="" PM_SAVED=""
+RUN_STARTED=0	# date +%s%N al arrancar main(); distingue nuestra compuerta de una posterior
 
 log() { echo "egpu-tb-fix: $*"; }
 
@@ -211,11 +220,27 @@ removable_devices() {
 
 # Abre la compuerta: enciende el autoprobe del bus PCI y enlaza lo que quedó sin driver
 # detrás de Thunderbolt, salvo las eGPUs retenidas.
+#
+# No se abre una compuerta que cerró un evento POSTERIOR al arranque de esta instancia: si
+# el túnel se cayó y volvió mientras esperábamos, gate() ya instaló una compuerta nueva —con
+# su propio temporizador de reapertura— para la eGPU que está llegando. Borrarla dejaba el
+# autoprobe encendido justo cuando el device PCI reaparecía, y nvidia tomaba la tarjeta sin
+# BAR0 (2026-11-07, H26). Con "force" se abre igualmente: es la red de seguridad del
+# subcomando "open-gate" y del ExecStopPost del servicio.
 open_gate() {
-	local name
+	local force=${1:-} name closed_at
 	if (( DRY_RUN )); then
 		log "[dry-run] echo 1 > $AUTOPROBE y enlazar lo que quedó sin driver detrás de Thunderbolt"
 		return 0
+	fi
+	if [[ $force != force ]] && (( RUN_STARTED )) && [[ -s $GATE_FILE ]]; then
+		# set -e: si el fichero se borra entre el test y la lectura, no abortamos.
+		closed_at=$(<"$GATE_FILE") || closed_at=0
+		if [[ $closed_at =~ ^[0-9]+$ ]] && (( closed_at > RUN_STARTED )); then
+			log "la compuerta la cerró un evento posterior a esta ejecución;" \
+				"la dejo cerrada para la eGPU que llega (su 'ungate' la abrirá en ${GATE_SECS}s)."
+			return 0
+		fi
 	fi
 	{ echo 1 > "$AUTOPROBE"; } 2>/dev/null || true
 	rm -f "$GATE_FILE"
@@ -252,17 +277,48 @@ cooldown_ok() {
 
 # Espera a que la caja de cada eGPU lleve STABLE_SECS enumerada. Si el enlace se cae y
 # vuelve, la caja se re-enumera y la cuenta empieza de nuevo.
+#
+# El conjunto de eGPUs se vuelve a leer en cada vuelta y puede quedarse VACÍO: al caerse el
+# túnel, pciehp libera el bus y el device PCI sale de sysfs. Eso no es "estable", es un
+# replug en curso, y la tarjeta vuelve un segundo después sin BAR0. Darlo por "no hay nada
+# que esperar" dejaba el resto de main() sin trabajo que hacer y la eGPU sin arreglar
+# (2026-11-07 00:59:13, H26). Se espera a que vuelva, hasta REPLUG_SECS desde que se fue;
+# pasado eso se da por desconectada de verdad y no se bloquea la compuerta más tiempo.
 wait_stable() {
-	local deadline g box waiting
+	local deadline g box waiting seen=0 gone_at=0 now list
 	deadline=$(( $(date +%s) + WAIT_SECS ))
 	while :; do
+		now=$(date +%s)
 		waiting=""
-		for g in $(egpus); do
+		# Una sola lectura del conjunto por vuelta. Con dos llamadas a egpus() el device puede
+		# irse entre la primera y la segunda, el "for" no itera, "waiting" queda vacío y la
+		# función volvería a decir "estable": es la misma carrera, en una ventana más corta.
+		list=$(egpus)
+		if [[ -z $list ]]; then
+			# Nunca hubo ninguna: no hay replug que esperar.
+			(( seen )) || return 0
+			if (( ! gone_at )); then
+				gone_at=$now
+				log "la eGPU salió de sysfs (replug del túnel); espero hasta ${REPLUG_SECS}s a que vuelva."
+			fi
+			if (( now - gone_at >= REPLUG_SECS )); then
+				log "la eGPU no volvió tras ${REPLUG_SECS}s; la doy por desconectada."
+				return 0
+			fi
+			sleep 1
+			continue
+		fi
+		if (( gone_at )); then
+			log "la eGPU volvió tras $(( now - gone_at ))s; sigo esperando a que su caja esté estable."
+			gone_at=0
+		fi
+		seen=1
+		for g in $list; do
 			read -r _ _ box < <(locate_box "$g") || continue
 			if (( $(age_of "$box") < STABLE_SECS )); then waiting=$box; fi
 		done
 		[[ -n $waiting ]] || return 0
-		if (( $(date +%s) >= deadline )); then
+		if (( now >= deadline )); then
 			log "la caja $waiting no lleva ${STABLE_SECS}s estable tras ${WAIT_SECS}s; no la toco."
 			return 1
 		fi
@@ -523,7 +579,9 @@ gate() {
 		return 0
 	fi
 	mkdir -p "$STATE_DIR"
-	date +%s > "$GATE_FILE"
+	# Nanosegundos: open_gate compara esta marca con el arranque de cada instancia, y con
+	# precisión de segundos un cierre y un arranque en el mismo segundo son indistinguibles.
+	date +%s%N > "$GATE_FILE"
 	log "$dev: autoprobe PCI apagado hasta preparar la eGPU (${GATE_SECS}s si no aparece ninguna)."
 	echo 0 > "$AUTOPROBE"
 	if ! systemd-run --quiet --no-block --collect --on-active="$GATE_SECS" \
@@ -537,8 +595,16 @@ gate() {
 # abre la compuerta al terminar; si no (otro tipo de dispositivo, o el túnel PCIe no se
 # creó), se abre aquí.
 ungate() {
+	# Una eGPU sin BAR0 se atiende aunque la compuerta ya no esté: una ejecución anterior pudo
+	# abrirla justo antes de que el device PCI volviera de un replug, y entonces no queda nadie
+	# que vaya a arreglar la tarjeta (2026-11-07, H26). Es la última red.
+	if [[ -n $(broken_egpus) ]]; then
+		log "hay una eGPU sin BAR0 que nadie preparó; lanzo el servicio."
+		systemctl start --no-block egpu-tb-fix.service
+		return 0
+	fi
 	[[ -e $GATE_FILE ]] || return 0
-	if [[ -n $(pending_egpus)$(broken_egpus) ]]; then
+	if [[ -n $(pending_egpus) ]]; then
 		systemctl start --no-block egpu-tb-fix.service
 		return 0
 	fi
@@ -635,6 +701,7 @@ status() {
 
 main() {
 	local cmd=${1:-}
+	RUN_STARTED=$(date +%s%N)
 	case $cmd in
 		""|hold|release|debug|tb-pm|tb-event|ungate|open-gate) ;;
 		--dry-run) DRY_RUN=1 ;;
@@ -653,7 +720,7 @@ main() {
 			if [[ ${2:-} == add ]]; then gate "${3:-}"; fi
 			return
 			;;
-		open-gate) open_gate; return ;;
+		open-gate) open_gate force; return ;;
 		debug) tb_debug "${2:-}"; return ;;
 	esac
 
