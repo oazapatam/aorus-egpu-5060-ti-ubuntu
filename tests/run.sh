@@ -704,6 +704,50 @@ is "solo lectura pasa con enlace muerto" \
 is "nvidia-smi colgado -> 124" "$(AORUS_FAKE_FIND_RC=124 oc_rc)" "124"
 is "colgado leyendo el enlace -> 124" "$(AORUS_FAKE_GENMAX_RC=124 oc_rc)" "124"
 
+echo "== app/overclock: el registro de verificaciones no miente ni hace ruido =="
+# El registro es la evidencia de que algo se midio. Dos defectos reales,
+# medidos el 2026-11-07 con un `aorus-egpu-oc verify` de usuario normal contra
+# el log de root:
+#
+#   1. RUIDO. La forma era `printf ... >> "$LOG" 2>/dev/null || true`, y el
+#      `2>/dev/null` no silenciaba nada: bash aplica las redirecciones de
+#      izquierda a derecha, asi que el `>>` fallaba cuando stderr era todavia
+#      el terminal. Salia "Permission denied" justo debajo de
+#      "VERIFICACION OK". El `2>/dev/null` tiene que ir PRIMERO.
+#   2. CODIGO MUERTO. Con la redireccion en un comando COMPUESTO
+#      (`{ printf; } 2>/dev/null >> "$LOG"`) bash se come el fallo y devuelve
+#      0, asi que una rama `if !` nunca se tomaria y la perdida del registro
+#      seria silenciosa. Tiene que ser un comando SIMPLE.
+#
+# Estos asserts fijan las dos propiedades: nada en stderr, y el fallo SE
+# detecta (se avisa por stdout de que la medicion no queda en el historico).
+vlog_dir="$TD/vlog"; mkdir -p "$vlog_dir"
+
+# AORUS_OC_VERIFY_LOG parece sin usar a shellcheck (SC2034) porque
+# _oc_verify_log la lee del ENTORNO, no por parametro, y shellcheck no sigue a
+# traves de `aorus_use`. Ponerla ES el test: es la entrada de la funcion.
+# shellcheck disable=SC2034
+# a) destino escribible: escribe, y no dice nada por stderr.
+AORUS_OC_VERIFY_LOG="$vlog_dir/ok.log"
+verr="$(_oc_verify_log 'caso=escribible' 2>&1 >/dev/null)"
+is "log escribible: nada por stderr" "$verr" ""
+is "log escribible: la linea se escribe" \
+   "$(grep -c 'caso=escribible' "$vlog_dir/ok.log" 2>/dev/null)" "1"
+
+# b) destino NO escribible (directorio sin permiso de escritura): ni una
+#    palabra por stderr, pero SI un aviso por stdout.
+mkdir -p "$vlog_dir/ro" && : > "$vlog_dir/ro/no.log" && chmod 0444 "$vlog_dir/ro/no.log"
+# shellcheck disable=SC2034  # entrada por entorno de _oc_verify_log; ver arriba.
+AORUS_OC_VERIFY_LOG="$vlog_dir/ro/no.log"
+verr="$(_oc_verify_log 'caso=solo-lectura' 2>&1 >/dev/null)"
+vout="$(_oc_verify_log 'caso=solo-lectura' 2>/dev/null)"
+is "log no escribible: nada por stderr (sin 'Permission denied')" "$verr" ""
+yes_ "log no escribible: AVISA de que no queda registro" \
+     grep -q 'sin registrar' <<< "$vout"
+is "log no escribible: no se escribio nada" \
+   "$(grep -c 'caso=solo-lectura' "$vlog_dir/ro/no.log" 2>/dev/null)" "0"
+chmod 0644 "$vlog_dir/ro/no.log"
+
 echo "== app/overclock: rc=124 en una escritura ABORTA el plan =="
 # El hueco era este: un 124 se trataba como fallo generico y el ejecutor
 # SEGUIA con las dos escrituras siguientes. Tres escrituras de 12 s contra una

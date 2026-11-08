@@ -7,7 +7,7 @@ La evidencia de por qué está en
 | Paquete | Versión | Estado | Validado en vivo |
 |---|---|---|---|
 | `egpu-tb-fix` | 1.5.1 | **principal** | **sí** — es lo que hace funcionar la eGPU hoy |
-| `aorus-egpu-core` | 0.2.1 | núcleo compartido — no se instala solo | sí — es lo que cargan los entrypoints de los demás |
+| `aorus-egpu-core` | 0.2.2 | núcleo compartido — no se instala solo | sí — es lo que cargan los entrypoints de los demás |
 | `aorus-egpu-forensics` | 0.2.0 | nuevo, recomendado al depurar | capas 1-2 sí; capa 3 (ramoops) por construcción |
 | `aorus-egpu-health` | 0.2.0 | nuevo — detector de incidentes | las reglas y el `scan` sí; el servicio de vigilancia continua, no |
 | `aorus-egpu-igpu-display` | 0.2.0 | nuevo — [diseño y medidas](../igpu-display.md) | el gate y el inventario sí; el cambio de modeset requiere reiniciar |

@@ -206,12 +206,36 @@ _oc_is_unattended() {
 # Registro de verificaciones. Nunca falla la operación por no poder escribirlo
 # (en un dry-run o como usuario normal /var/log no es escribible), pero sí se
 # intenta siempre: un rechazo del gate es tan registrable como un fallo.
+#
+# EL ORDEN DE LAS REDIRECCIONES NO ES COSMÉTICO. Antes esto era
+#   printf ... >> "$AORUS_OC_VERIFY_LOG" 2>/dev/null || true
+# y el `2>/dev/null` NO silenciaba nada, porque bash procesa las redirecciones
+# de izquierda a derecha: cuando el `>>` falla al abrir el fichero, el error lo
+# imprime el propio shell en el stderr que hubiera EN ESE MOMENTO, que todavía
+# era el terminal. Medido el 2026-11-07: un `aorus-egpu-oc verify` como usuario
+# normal terminaba con rc 0 y la verificación correcta, pero escupiendo
+#   app/overclock.sh: line 213: /var/log/aorus-egpu/oc-verify.log: Permission denied
+# justo debajo del "VERIFICACIÓN OK". Con el `2>/dev/null` PRIMERO, el stderr ya
+# está redirigido cuando se intenta abrir el fichero y el fallo es silencioso.
+#
+# Y si no se pudo registrar, se DICE. El registro existe para ser la evidencia
+# de que algo se midió; perderla en silencio deja al operador creyendo que hay
+# una traza que no existe, y en este repo la traza es media herramienta.
 _oc_verify_log() { # $@ = texto
   local dir
   dir="$(dirname "$AORUS_OC_VERIFY_LOG")"
   mkdir -p "$dir" 2>/dev/null || true
-  printf '%s\t%s\n' "$(date -Is 2>/dev/null || date)" "$*" \
-    >> "$AORUS_OC_VERIFY_LOG" 2>/dev/null || true
+  # Comando SIMPLE, no un `{ ...; }`: con un compuesto bash se come el fallo de
+  # la redirección y devuelve 0, así que la rama de aviso sería código muerto.
+  # Comprobado el 2026-11-07 en esta máquina con el log de root y un usuario
+  # normal: la forma `{ printf; } 2>/dev/null >> fichero` dice rc 0 y no
+  # escribe nada; `printf 2>/dev/null >> fichero` devuelve rc != 0.
+  local stamp
+  stamp="$(date -Is 2>/dev/null || date)"
+  if ! printf '%s\t%s\n' "$stamp" "$*" 2>/dev/null >> "$AORUS_OC_VERIFY_LOG"; then
+    log_info "sin registrar en $AORUS_OC_VERIFY_LOG (hace falta root): esta medición no queda en el histórico."
+    return 0
+  fi
 }
 
 # Pone los offsets a 0 si la tarjeta los soporta. Es parte de la
