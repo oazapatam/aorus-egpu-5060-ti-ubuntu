@@ -377,8 +377,14 @@ for pair in oc-normal:150 oc-medio:375 oc-maximo:525; do
   )"
   is "$n: el plan pide +$want MHz en el nucleo" \
      "$(printf '%s\n' "$plan" | awk '/clock_offset gpu/{print $3}')" "$want"
-  is "$n: el plan deja la MEMORIA en 0" \
-     "$(printf '%s\n' "$plan" | awk '/clock_offset mem/{print $3}')" "0"
+  # NO escribe la memoria EN ABSOLUTO, que es mas fuerte que escribirle un 0.
+  # El 0 explicito estuvo ahi y es la sospechosa principal de los dos cuelgues
+  # del 2026-11-07: `egpu-oc-edge`, que midio esta escalera limpia, omite la
+  # escritura cuando el valor no cambia, asi que durante la escalera del nucleo
+  # nunca escribe el offset de memoria. El perfil si lo escribia, y lo que se
+  # cuelga es el PMU, que gestiona la curva V/F.
+  is "$n: el plan NO escribe la memoria" \
+     "$(printf '%s\n' "$plan" | grep -c 'clock_offset mem')" "0"
   is "$n: exige verificacion numerica" \
      "$(
         # Sin OC_profile: domain_oc_verify_required solo lee OC_verify y los

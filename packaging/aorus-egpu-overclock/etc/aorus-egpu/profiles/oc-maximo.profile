@@ -30,7 +30,20 @@
 # tarjeta que YA calcula mal, no garantiza que no empiece a calcular mal en la
 # hora 3 de un entrenamiento. Para servir modelos, oc-normal o efficient.
 #
-# Memoria fijada a 0 como en el resto de los oc-*. Ver oc-normal.profile.
+#
+# NO lleva `mem_clock_offset_mhz=0`, y la ausencia es deliberada. La llevaba, y
+# es la sospechosa principal de los dos cuelgues del 2026-11-07 (+600 y +525,
+# los dos con `Xid 62` + `_kgspRpcGspEventPmuHalted` + `Xid 154` en 4-6 s).
+# Motivo: `tools/egpu-oc-edge`, que SÍ midió esta escalera limpia, omite la
+# escritura cuando el valor no cambia (`Hardware.apply`: `if self.applied[which]
+# == mhz: continue`), así que durante la escalera del núcleo **nunca escribe el
+# offset de memoria**. El perfil sí lo escribía, y lo que se cuelga es el PMU,
+# que es precisamente quien gestiona la curva V/F. Era una escritura añadida
+# "por higiene" —para limpiar un offset de memoria previo— y esa higiene no
+# justifica una escritura extra al hardware en la palanca más delicada del
+# paquete. Para limpiar offsets está `aorus-egpu-oc reset`.
+#
+# Sigue siendo cierto que estos perfiles NO tocan la memoria: lo que cambia es
+# que ahora no la tocan de verdad, en vez de escribirle un 0.
 gpu_clock_offset_mhz=525
-mem_clock_offset_mhz=0
 verify=gemm
