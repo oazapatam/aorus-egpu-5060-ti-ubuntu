@@ -26,6 +26,8 @@
 
 ## Hypotheses
 
+<a id="h1"></a>
+
 ### H1 — Q-watchdog kthread MMIO probe converts Mode A → Mode B
 
 | Field | Value |
@@ -37,6 +39,8 @@
 | Resolution test | A/B run, n=3 each side, FLR off so failures don't pollute next iter |
 | If supported | Default `NVreg_AorusWatchdogEnable=0` in modprobe.d; investigate why periodic MMIO reads suppress AER signaling |
 | If rejected | Q-watchdog is innocent; restore default Enable=1 |
+
+<a id="h2"></a>
 
 ### H2 — Wrapper `remove+rescan+FLR` sequence wedges host with held fds
 
@@ -50,6 +54,8 @@
 | If supported | Wrapper must release fds before FLR (risky) OR skip remove+rescan entirely OR rely on M-recover (in-kernel) instead |
 | If rejected | FLR is innocent; freeze locus is somewhere else in the recovery path |
 
+<a id="h3"></a>
+
 ### H3 — Cold-boot first-CUDA failure rate is ~60% Mode B / ~40% Mode A regardless of levers
 
 | Field | Value |
@@ -62,6 +68,8 @@
 | If supported | Bug is intrinsic to cold-boot first-CUDA; preventing or warming up is the fix (Phase C3 #87) |
 | If rejected | Some other variable explains the distribution |
 
+<a id="h4"></a>
+
 ### H4 — NMI watchdog cannot catch this class of freeze (deadlock, not CPU loop)
 
 | Field | Value |
@@ -72,6 +80,8 @@
 | Evidence AGAINST | None |
 | Implication | Hardware watchdog (Phase C4 #88, iTCO_wdt) is the only reliable last-resort recovery |
 
+<a id="h5"></a>
+
 ### H5 — Phase 1b reliability stack (Q-active + Q-passive + N + O) works correctly when fired
 
 | Field | Value |
@@ -81,6 +91,8 @@
 | Evidence FOR | Test 2 fired all 4 markers; AER captured 50 events; Xid 154 logged; host stayed alive 90+ s post-failure; wrapper completed full post-state telemetry |
 | Evidence AGAINST | None |
 | Implication | When the bug fires Mode A, our infrastructure handles it cleanly. Remaining work is on Mode B detection (Q-watchdog or alternatives) and recovery (M-recover) |
+
+<a id="h6"></a>
 
 ### H6 — Bare FLR (`echo 1 > /sys/.../reset` only, no remove+rescan) avoids wedge
 
@@ -94,6 +106,8 @@
 | If supported | Wrapper recovery becomes minimal — single sysfs write |
 | If rejected | All FLR variants wedge; need M-recover (in-driver) path |
 
+<a id="h7"></a>
+
 ### H7 — Stopping persistenced + uvm-keepalive before FLR avoids wedge
 
 | Field | Value |
@@ -102,6 +116,8 @@
 | Stated | 2026-05-05 |
 | Notes | Persistenced is load-bearing per `architecture.md` (Problem 2 mitigation); stopping it during a recovery flow risks re-exposing the close-path freeze. Test only after exhausting H6 and H11. |
 
+<a id="h8"></a>
+
 ### H8 — DPC (Downstream Port Containment) enable + tune would catch Mode B
 
 | Field | Value |
@@ -109,6 +125,8 @@
 | Status | **REJECTED 2026-05-05** (audit, n=0 tests required) |
 | Resolution | Hardware audit on 2026-05-05 found NO device on the eGPU path implements PCIe DPC capability: 0000:00:07.0, 0000:01:00.0, 0000:02:00.0, 0000:03:00.0, 0000:04:00.0 all lack DPC bits in `lspci -vv`; no `/sys/bus/pci/devices/.../dpc/` sysfs anywhere. Kernel `_OSC` granted DPC control but there's nothing to control on this stack. |
 | Implication | DPC is unusable on TB-attached devices regardless of OS-side configuration. Pursue other L1 levers (H9 PCIe tuning, H10 IOMMU policy). |
+
+<a id="h9"></a>
 
 ### H9 — PCIe per-device tuning reduces error rate / converts Mode B → Mode A
 
@@ -153,6 +171,8 @@ H9 splits into three sub-hypotheses, each independently testable.
 | Evidence AGAINST | MaxPayload bottleneck at 128B means any read response gets split into 128B chunks anyway; benefit minimal even for perf, near-zero for reliability |
 | Resolution test | `setpci` to raise MaxReadReq on 04:00.0; n=3 iters |
 
+<a id="h10"></a>
+
 ### H10 — IOMMU policy / Thunderbolt-untrusted-device handling causes DMA failures during GSP boot
 
 | Field | Value |
@@ -175,6 +195,8 @@ H9 splits into three sub-hypotheses, each independently testable.
 | Cross-references | [H14](#h14) (root cause being investigated); `archive/commit3-recovery-loop-2026-05-06-161429/`; Lever G WSL2 evidence (closed driver doesn't show this); Task #93 |
 | Priority | **HIGH** — could resolve H14 root cause and eliminate the entire WPR2-stuck cycle for cold-cold-boot |
 
+<a id="h11"></a>
+
 ### H11 — Phase 4 M-recover (in-kernel slot_reset/resume) avoids wrapper-FLR wedge
 
 | Field | Value |
@@ -189,6 +211,8 @@ H9 splits into three sub-hypotheses, each independently testable.
 | Status note | This is the "right answer" destination per the project vision; everything else in recovery space is interim |
 
 ---
+
+<a id="h16"></a>
 
 ### H16 — PCIe link transient during GSP boot triggers GSP_LOCKDOWN independently of IOMMU
 
@@ -207,6 +231,8 @@ H9 splits into three sub-hypotheses, each independently testable.
 | Cross-references | [`docs/iommu-gsp-lockdown-analysis.md`](./iommu-gsp-lockdown-analysis.md), `archive/iommu-off-test-2026-05-07-145453/`, [H10](#h10), [H14](#h14), Lever Q-stack, Lever H8/H9, `H9a Port A root cause memory` (project_port_a_h9a_root_cause_2026_05_08), `archive/phase5-evidence/` |
 | Priority | **CLOSING.** ~~High — second known cause of cold-boot failure; investigation should follow IOMMU work.~~ Empirical falsification by H9a retirement is strong; investigation deprioritized. If the ledger ever sees a cold-boot failure with 0 GSP_LOCKDOWN events from H9a-controlled paths, reopen. |
 
+<a id="h15"></a>
+
 ### H15 — Commit 3 recovery action requires hardening (MaxAttempts gate + rate-limit + kill-switch persistence) before production-quality
 
 | Field | Value |
@@ -222,6 +248,8 @@ H9 splits into three sub-hypotheses, each independently testable.
 | Resolution path | ~~Patch 0020 hardens Commit 3 with all four fixes.~~ **Superseded:** the resolution shipped as patches 0024 + 0026 + 0027 + 0028 (see Resolution patches above). |
 | Cross-references | `archive/commit3-recovery-loop-2026-05-06-161429/` (the storm forensic); patch 0019 (disabled — kept as falsified-but-documented historical record); patches 0024/0026/0027/0028 (resolution); `archive/phase5-evidence/` (ongoing PROVEN gate evidence); `docs/lever-m-recover-commit3-hardening-design.md`; `docs/lever-m-recover-commit3-handover.md`; task #62 |
 | Priority | **CLOSED** — production posture is `Enable=1` (modprobe.d), kill-switch escape (`aorus-egpu-lever-m disable`) available, L4 helper remains as belt-and-braces backup until n≥10 PROVEN. |
+
+<a id="h14"></a>
 
 ### H14 — First rm_init_adapter on cold-cold-boot fails due to a transient bus state during initial GSP boot (root cause of H13's WPR2-stuck cycle)
 
@@ -247,6 +275,8 @@ H9 splits into three sub-hypotheses, each independently testable.
 | Layer | L1 (NVIDIA fork — RM-side rm_init_adapter call graph) |
 | Cross-references | [H13](#h13) — H14 is the *root cause* of H13's symptom; [`docs/lever-M-recover-design.md`](./lever-M-recover-design.md) Open Question #6; `archive/diag-telemetry-2026-05-06-154732/` |
 
+<a id="h13"></a>
+
 ### H13 — WPR2 register stuck blocks nvidia.ko init on cold-cold-boot
 
 | Field | Value |
@@ -262,6 +292,8 @@ H9 splits into three sub-hypotheses, each independently testable.
 | Recovery — REJECTED mechanisms | Tier 1 v1: `pcie_reset_flr` alone ("PCI FLR might have failed" + WPR2 stays up). Tier 1 v2: `pci_reset_function` ("Inappropriate ioctl for device" / -ENOTTY). |
 | Resolution path | **Lever R Tier 1 v3 (L4 userspace helper)** — pivoted from L1 to L4 after v1/v2 empirical failures. Helper runs after `aorus-egpu-compute-load-nvidia.service`, detects driver-bind-failed state via nvidia-smi failure + dmesg WPR2 pattern, executes the validated remove+rescan+reset sequence, re-runs compute-load-nvidia. Layer: L4 (helper) + L5 (systemd unit). See [`lever-R-design.md`](./lever-R-design.md). |
 | Validation | Forensic dossier: `archive/boot-init-mode-b-2026-05-06-074608/`; sysfs experiment 09:14 demonstrating the working recovery sequence. **2026-05-06 11:08: Tier 1 v3 (L4 helper) SUPPORTED at n=1 under real cold-cold-boot WPR2-stuck conditions** — helper detected the failure, executed the 8-step recovery sequence, GPU restored to working state. End-to-end automatic recovery validated. Detection bug found+fixed during this run: `nvidia-smi -L` returns exit 0 even on "No devices found", so detection now parses stdout for `^GPU N:` pattern. **2026-05-06 12:33 — n=2 cold-cold-boot reproduction:** boot-time helper invocation FAILED first pass (post-recovery state showed conf-compute / gpuSanityCheck flags=0x1 — different failure mode than WPR2-stuck); manual second invocation 4 minutes later SUCCEEDED with identical sequence. Tier 2 PARTIAL retry-budget implemented (12:48): helper now retries up to MAX_ATTEMPTS=3 times with RETRY_DELAY_S=5 between, recording per-attempt history. **2026-05-06 12:56:48 — n=3 cold-cold-boot, ALL 3 attempts FAILED**: retry-budget triggered cleanly (Tier 2 plumbing validated structurally) but every attempt's verify reported no working GPU. Post-helper diagnostics in `archive/boot-recovery-fail-2026-05-06-125648/` showed the kernel was looping in conf-compute mode every ~10s, source identified as `nvidia-persistenced` racing the helper's bind step. **2026-05-06 13:25 — manual rerun with persistenced STOPPED first SUCCEEDED on attempt 1 (13.7s)** — same code, same recovery sequence, only difference was no concurrent userspace authority touching `/dev/nvidia0`. **Race-condition hypothesis CONFIRMED.** Cumulative auto-recovery success: 1/4 (25%) — H13 status downgraded from STRONGLY-SUPPORTED to RACE-PROVEN: recovery sequence works in clean conditions, fails under userspace contention. **Resolution path PIVOTED to Lever M-recover** (in-driver state machine via `pci_error_handlers` + upstream bridge bus reset) — single arbiter, no race surface. See [`lever-M-recover-design.md`](./lever-M-recover-design.md). L4 helper remains as fallback during M-recover stabilization; retires upon M-recover PROVEN at n≥10. |
+
+<a id="h12"></a>
 
 ### H12 — CUDA process exit on declared-disconnected GPU spins worker threads in nvidia.ko close-path
 
@@ -352,6 +384,8 @@ TB-attached stack. Resolved at zero test cost via pure investigation.
   Recuperación por reconexión del Thunderbolt; sin `remove`/`rescan`/FLR, por
   [H2](#h2).
 
+<a id="h17"></a>
+
 ### H17 — PCIe link speed instability during GSP boot is the H16 mechanism; capping bridge at Gen1 before nvidia bind eliminates the transient
 
 | Field | Value |
@@ -385,6 +419,8 @@ TB-attached stack. Resolved at zero test cost via pure investigation.
 | **2026-05-08 11:46 — B4-portA matched-pair forensics + ROOT CAUSE IDENTIFIED** | Captured Port A failure-side dossier (B4) with same instrumentation, identical to B1 outcome (36 GSP_LOCKDOWN, 18 rmInit FAIL, 0 OK). Then ran structured A-vs-B diff: state, events, timeline, T1.5 PCIe Eq decoded, T1.6 NVIDIA procfs / TB counters / RAPL / thermal. **THE DISCRIMINATOR FOUND:** `/proc/driver/nvidia/gpus/.../information` shows Port A `Bus Type: PCI` + `Video BIOS: ??.??.??.??.??` + `GPU UUID: (missing)` + `GPU Firmware: N/A` — the open NVIDIA driver could NOT successfully read the GPU's PCI Express Capability at probe time. Port B (success) had all fields populated correctly. **The cause:** `lspci -vv` showed Port A GPU + root port DevCtl2 = `Completion Timeout: 1ms to 10ms` (Range B); Port B GPU + root port had `50us to 50ms` (Range A default). **Per-port asymmetric programming** comes from `aorus-egpu-pcie-tune.service` (Lever H9a) hardcoding Port A's BDFs (`0000:00:07.0` and `0000:04:00.0` at lines 50-51 of the script). Service runs at every boot and tightens DevCtl2 to Range B, which is too tight for TB-tunneled config space reads → reads time out, return 0xffffffff → driver classifies GPU as legacy PCI → rm_init fails → GSP_LOCKDOWN cascade. Falsifies all prior hypotheses (H17/H17.G3, H19/H20/H21, "hardware-broken Port A"). Memory: `project_port_a_h9a_root_cause_2026_05_08.md`. |
 | **2026-05-08 11:55 — B5-portA-h9a-DISABLED CONFIRMS ROOT CAUSE** | Single-variable test: `systemctl disable aorus-egpu-pcie-tune.service`, cold-boot to Port A. **Result: 100% success.** All counters flipped: `gsp_lockdown_count` 36→0, `rminit_fail_count` 18→0, `rminit_ok_count` 0→1, `rminit_failed_msg_count` 9→0. `tb_wait_for_port_calls` unchanged (7→7 — confirms TB driver path identical, asymmetry was purely H9a). GPU info: `Bus Type: PCIe` (was PCI), `Video BIOS: 98.02.2e.80.5d` (was ??), `UUID: GPU-90b9424e-7236-fd4d-d903-44e565e1bd42` (matches Port B's UUID exactly — same physical GPU), `GPU Firmware: 595.71.05` (was N/A). Completion Timeout on root port + GPU = 50us-50ms (Range A default, untouched). Dossier: `archive/event-captures/B5-portA-h9a-DISABLED-SUCCESS-2026-05-08T015759Z`. **Lever H9a is the root cause of Port A failure. Fix path: redesign or retire H9a.** Outstanding: regression-test Port B with H9a disabled (Port B never used H9a's setting due to BDF mismatch, so should be unchanged); design replacement that preserves H9a's intent (faster Mode B silent-freeze detection) without breaking TB-tunneled reads. |
 
+<a id="h19"></a>
+
 ### H19 — `tb_wait_for_port()` 1-second cap is too short on cold-cold-boot with TB5/Barlow Ridge retimers (Thread A finding)
 
 | Field | Value |
@@ -396,6 +432,8 @@ TB-attached stack. Resolved at zero test cost via pure investigation.
 | Resolution test | Original test obsolete (timeout doesn't fire). If H19 is to be re-tested in the future, would need to find a boot where TB *does* exhibit init timeout — none observed yet. |
 | Layer | L1 (kernel thunderbolt driver patch) |
 | Cross-references | `docs/tb-driver-source-analysis.md` § 3 H2/H5; Lever W status now needs re-evaluation given falsification |
+
+<a id="h20"></a>
 
 ### H20 — `usb4_switch_configuration_valid()` 50ms wait is too short for TB5 80G negotiation (Thread A finding)
 
@@ -409,6 +447,8 @@ TB-attached stack. Resolved at zero test cost via pure investigation.
 | Layer | L1 (kernel thunderbolt driver patch) |
 | Cross-references | `docs/tb-driver-source-analysis.md` § 3 H6 |
 
+<a id="h21"></a>
+
 ### H21 — Linux TB driver missing `tb_native_add_links()` causes asymmetric device-link guarding (Thread A finding)
 
 | Field | Value |
@@ -420,6 +460,8 @@ TB-attached stack. Resolved at zero test cost via pure investigation.
 | Resolution test | Original test executed and returned negative — H21 ruled out for this hardware/firmware combination. |
 | Layer | L1 (kernel thunderbolt driver patch) |
 | Cross-references | `docs/tb-driver-source-analysis.md` § 3 H1 |
+
+<a id="h18"></a>
 
 ### H18 — Host-side TB tunnel runs at PCIe Gen1 ×4 instead of TB4-spec Gen3 ×4
 
@@ -437,6 +479,8 @@ TB-attached stack. Resolved at zero test cost via pure investigation.
 
 | **2026-05-07 21:?? — H18 FALSIFIED** | nvbandwidth empirical measurement (NVIDIA's official tool, replaces deprecated bandwidthTest): **H2D = 2.80 GB/s = 22.4 Gbps useful payload**, D2H = 3.29 GB/s, bidirectional H2D = 2.47 GB/s. This is at TB4 saturation (70-82% of 32 Gbps spec ceiling, typical for real hardware). The lspci `LnkCap = Gen1` reading was virtual-bridge spoofing, NOT a real bandwidth limit. **There is no Gen1 ceiling to raise.** Lever V retired. Cold-load TTFT decomposition: pure PCIe portion ~3.4s (9.4 GB ÷ 2.8 GB/s); remaining ~4.6s of 8s observed is filesystem read + ollama deserialization + parse — task #74 (async pipelining) is the real cold-load lever. Methodology + diagram + measurement archived in `docs/cuda-bandwidth-methodology.md`, `docs/tb4-pcie-topology.md`, `docs/tb4-tunnel-gen1-investigation.md` (Resolution section). Memory entry `feedback_lspci_lnkcap_tb_virtual` saved for future sessions. **Lesson**: the OS-reported PCIe link state on TB-tunneled bridges is virtualized — measure with nvbandwidth before investigating software fixes. |
 
+<a id="h22"></a>
+
 ### H22 — Close-path bug class (architecture.md Problem 2) is empirically mitigated by the cumulative driver stack 2026-05-08
 
 | Field | Value |
@@ -449,6 +493,8 @@ TB-attached stack. Resolved at zero test cost via pure investigation.
 | UVM-side parallel | `aorus-egpu-uvm-keepalive.service` reclassification status PENDING — Patch 0029 instruments /dev/nvidia0's close path (in nvidia.ko) only. UVM lives in nvidia-uvm.ko with its own char device + handlers. UVM-side close-path bug class has not been re-tested with analogous instrumentation; presumptively load-bearing until probed. |
 | Cross-references | `docs/architecture.md` Problem 2 (RECLASSIFIED 2026-05-08); `docs/lever-catalog.md` § Lever M-recover; `docs/service-retirement-roadmap.md` § persistenced (RECLASSIFIED) + uvm-keepalive (PENDING); `archive/close-path-probes/2026-05-08T18-57-32+10-00/`, `2026-05-08T19-01-17+10-00/`, `2026-05-08T19-02-01+10-00/`; patches 0024 + 0026 + 0027 + 0028 + 0029. |
 | Priority | **CLOSED.** Production posture: persistenced + uvm-keepalive remain active as performance optimizations / pending UVM probe respectively. M-recover stands as insurance for any future regression. |
+
+<a id="h23"></a>
 
 ### H23 — Tunnel-path power management (ASPM L1 + runtime PM on the intermediate bridges `egpu-tb-fix` does not cover) drops the whole Thunderbolt device at idle
 
@@ -475,6 +521,8 @@ TB-attached stack. Resolved at zero test cost via pure investigation.
 | Layer | L4 (userspace — `egpu-tb-fix` `prep_power()` coverage); possibly L5 (cmdline / `pcie_aspm=off`) as a blunter variant for a single-variable test |
 | Cross-references | [`docs/what-actually-works.md`](../what-actually-works.md) (BAR0 reassignment on hotplug, measured bandwidth); [`docs/research/egpu-tb-fix-design-notes.md`](./egpu-tb-fix-design-notes.md); [`docs/freeze-forensics.md`](../freeze-forensics.md); `src/domain/health.sh` (`tb_device_loss` / `gpu_fault` verdicts) |
 | Priority | **HIGH** — 2 incidents in ~13 h on the only package verified live, and incident 1 cost 29 min of downtime because it needed a manual reconnect. The mitigation is cheap and its test is passive observation. |
+
+<a id="h24"></a>
 
 ### H24 — Una llamada NVML desde `nvidia-ctk` se bloquea en el kernel de forma inmatable, y los procesos en estado D que deja son lo que impide a `systemd-shutdown` completar el reinicio
 
@@ -510,6 +558,8 @@ TB-attached stack. Resolved at zero test cost via pure investigation.
 | Cross-references | [`docs/freeze-forensics.md`](../freeze-forensics.md) (el journal vive en RAM; envolver con `aorus-egpu-probe`); [`docs/research/open-driver-defects.md`](./open-driver-defects.md); [H23](#h23) (modo de fallo distinto e independiente: allí la eGPU estaba conectada y lo que cae es el túnel) |
 | Priority | **MEDIA** — n=1 y no determinista (el arranque siguiente fue limpio), pero el coste cuando ocurre es un apagado con el botón físico y la pérdida del journal. Lo primero es reproducirlo y medir dónde bloquea, que es barato y pasivo. |
 
+<a id="h25"></a>
+
 ### H25 — La eGPU tiene margen de reloj por encima de stock, y el borde donde empieza a corromper bits se puede medir
 
 | Field | Value |
@@ -542,6 +592,8 @@ TB-attached stack. Resolved at zero test cost via pure investigation.
 | Cross-references | [`docs/overclock.md`](../overclock.md) (capacidades medidas de la tarjeta, perfiles y el riesgo de no tener ECC); [`docs/research/lever-catalog.md`](./lever-catalog.md); [H23](#h23) (pérdida del dispositivo TB: el confusor que hay que separar); [`docs/freeze-forensics.md`](../freeze-forensics.md) (por qué la medición va envuelta en `aorus-egpu-probe`) |
 | Priority | **MEDIA** — no es un problema de fiabilidad abierto, es una capacidad sin medir. Pero es barata de medir, el instrumento ya existe, y mientras no esté medida cualquier discusión sobre overclock en esta máquina es una opinión. |
 
+<a id="h26"></a>
+
 ### H26 — Un replug del túnel Thunderbolt a media preparación convierte la ejecución de `egpu-tb-fix` en un no-op y además destruye la compuerta del evento nuevo
 
 | Field | Value |
@@ -554,7 +606,7 @@ TB-attached stack. Resolved at zero test cost via pure investigation.
 | Evidencia — cronología del 2026-11-07 (journal al milisegundo) | `00:59:06.296` el router TB `1-1` aparece y `gate()` apaga el autoprobe (compuerta A, con su `ungate` a 15 s). `00:59:06.911` boltd autoriza. `00:59:07.204` el device PCI `8d:00.0` enumera por primera vez. `00:59:07.228` arranca `egpu-tb-fix.service` (lo pide la regla udev del **device PCI**) y entra en `wait_stable()`: la caja `8b:00.0` tiene 0 s, así que espera. **`00:59:13.379` `pciehp Slot(1): Link Down` + `Card not present`; `pci_bus 0000:8d: busn_res: [bus 8d] is released`** → el device sale de sysfs. `00:59:13.759` tb-event `add` otra vez → `gate()` cierra la **compuerta B** y programa su propio `ungate`. `00:59:13.863` la instancia en vuelo (pid 901872) dice **`no hay ninguna eGPU NVIDIA conectada`** y termina con éxito. `00:59:14.499` el device vuelve, el BAR0 falla y `nvidia` lo intenta igualmente y falla −1. `00:59:23` y `00:59:30` los dos `ungate` se ejecutan y **no hacen nada**. |
 | Mecanismo — rama 1: "vacío" se confundía con "estable" | `wait_stable()` recorría `$(egpus)` y marcaba `waiting` solo si alguna caja era joven. Con el conjunto **vacío**, el bucle `for` no ejecuta el cuerpo, `waiting` queda vacío y la función **retorna 0 = estable**. El resto de `main()` opera sobre conjuntos que también están vacíos (`broken_egpus`, `pending_egpus`), así que no hay nada que arreglar y el script sale con éxito. El `return 0` era correcto para "no hay eGPU conectada" e incorrecto para "la eGPU se acaba de ir y vuelve ya". |
 | Mecanismo — rama 2: `open_gate` destruía una compuerta ajena | Al terminar, `main()` llama a `open_gate`, que hace `echo 1 > drivers_autoprobe` y `rm -f $GATE_FILE` **sin mirar de quién es la compuerta**. A las `00:59:14.0` borró la compuerta B, cerrada 200 ms antes por el evento del replug. Resultado: cuando el device reapareció a las `00:59:14.499`, el autoprobe estaba encendido y `nvidia` tomó una tarjeta sin BAR0 — exactamente lo que la compuerta existe para impedir. |
-| Mecanismo — rama 3: el `ungate` se desarmó a sí mismo | `ungate()` empezaba por `[[ -e $GATE_FILE ]] || return 0`. Como la rama 2 había borrado el fichero, los dos temporizadores de las `00:59:23` y `00:59:30` salieron inmediatamente **sin llegar a evaluar `broken_egpus`**, que en ese momento sí tenía a `8d:00.0`. La última red estaba condicionada al mismo estado que el bug anterior había destruido. |
+| Mecanismo — rama 3: el `ungate` se desarmó a sí mismo | `ungate()` empezaba por `[[ -e $GATE_FILE ]] \|\| return 0`. Como la rama 2 había borrado el fichero, los dos temporizadores de las `00:59:23` y `00:59:30` salieron inmediatamente **sin llegar a evaluar `broken_egpus`**, que en ese momento sí tenía a `8d:00.0`. La última red estaba condicionada al mismo estado que el bug anterior había destruido. |
 | Lo que NO es la causa (hipótesis descartadas por la propia cronología) | **(a) No es "el servicio corrió antes de que existiera el device PCI"**: el device enumeró a las `07.204` y el servicio arrancó a las `07.228`, 24 ms después. **(b) No es `STABLE_SECS` demasiado corto**: la espera funcionó, y de hecho estaba esperando cuando se cayó el túnel. **(c) No es un driver nuevo**: 595.99.02 instalado, cargado y correspondiente al kernel en uso, sin actualizaciones pendientes; el fallo es de asignación de recursos PCI y ocurre antes de que el driver intervenga. El `probe failed −1` es el driver **negándose correctamente** a una GPU sin BAR0. |
 | Relación con H23 | El `Link Down` de las `00:59:13.379` es la firma de [H23](#h23) (el túnel se cae en reposo). H23 explica **por qué** se cae; H26 explica **qué hace mal el software cuando se cae en el peor instante posible**. Son independientes: arreglar H26 no reduce las caídas, hace que una caída deje de costar la eGPU. |
 | Fix aplicado (`egpu-tb-fix` 1.5.1) | **(1)** `wait_stable()` distingue "nunca hubo eGPU" (retorna 0, no hay nada que esperar) de "había y desapareció" (espera hasta `REPLUG_SECS=30` a que vuelva, y al volver reanuda la espera de estabilidad). **(2)** `gate()` sella la compuerta con `date +%s%N` y `open_gate` **no abre** una compuerta cuya marca sea posterior al arranque de la instancia (`RUN_STARTED`); el subcomando `open-gate` y el `ExecStopPost` del servicio pasan `force` y siguen abriendo sin condiciones, que es su papel de última red. **(3)** `ungate()` evalúa `broken_egpus` **antes** de mirar el fichero de la compuerta: una eGPU sin BAR0 se atiende exista o no la compuerta. |
@@ -565,6 +617,8 @@ TB-attached stack. Resolved at zero test cost via pure investigation.
 | Layer | L4 (userspace: `egpu-tb-fix`, sysfs y temporizadores de systemd). Ninguna palanca de kernel ni de driver interviene. |
 | Cross-references | [H23](#h23) (la caída del túnel que dispara el escenario); [`docs/what-actually-works.md`](../what-actually-works.md) (la cadena causal del hotplug que sí funciona); [`docs/research/egpu-tb-fix-design-notes.md`](./egpu-tb-fix-design-notes.md); `packaging/egpu-tb-fix/usr/sbin/egpu-tb-fix` (`wait_stable`, `open_gate`, `gate`, `ungate`) |
 | Priority | **ALTA** — es el paquete principal y el único verificado en vivo, y el fallo deja la eGPU inutilizable de forma silenciosa: todo indica que está conectada menos `nvidia-smi`. Coste del fix: tres funciones de un script que ya existía. |
+
+<a id="h27"></a>
 
 ### H27 — Con la eGPU en `GPU Reset Required`, desconectarla cuelga el hotplug PCI porque `nvidia-modeset` intenta restaurar la consola en la GPU muerta; con `nvidia_drm.modeset=0` la retirada termina y la eGPU se recupera sin reiniciar
 
@@ -588,6 +642,8 @@ TB-attached stack. Resolved at zero test cost via pure investigation.
 | Layer | L3/L4 (configuración de módulo del driver + userspace). Ningún parche de kernel. |
 | Cross-references | [H2](#h2) (retirar con descriptores abiertos cuelga); [H25](#h25) (el borde del reloj, que da el disparador reproducible); [`docs/igpu-display.md`](../igpu-display.md); [`docs/research/egpu-tb-fix-design-notes.md`](./egpu-tb-fix-design-notes.md) (`nvEvoMakeRoom` en las caídas de 2026-10-02) |
 | Priority | **ALTA** — cada `Reset Required` cuesta hoy un reinicio, y el intento natural de recuperarlo (reconectar) degrada el escritorio entero. |
+
+<a id="h28"></a>
 
 ### H28 — Desconectar el túnel con un proceso CUDA vivo hace que el cierre de `/dev/nvidia-uvm` escriba en un BAR0 ya desmapeado, y el Oops ocurre con el spinlock de ISR tomado, así que el host queda irrecuperable aunque siga respondiendo
 

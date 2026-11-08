@@ -21,6 +21,15 @@ MD024: false
 # MD033 — inline HTML.
 # Some docs use `<details>`/`<summary>` for collapsible sections
 # and `<br>` for explicit line breaks.
+#
+# `<a>` esta permitido SOLO para anclas estables (`<a id="h28"></a>` delante de
+# un encabezado). El ledger de hipotesis se referencia a si mismo cientos de
+# veces como `[H28](#h28)`, y el ancla que genera GitHub a partir del
+# encabezado incluye el titulo entero: `#h28-desconectar-el-tunel-con-un...`.
+# Depender de ese ancla significa que cualquier reescritura del titulo rompe
+# todos los enlaces que apuntan a el, en silencio. El ancla explicita es
+# estable y MD051 la reconoce. La alternativa `{#h28}` calla al linter pero
+# GitHub no la soporta: la renderiza como texto dentro del encabezado.
 MD033:
   allowed_elements:
     - details
@@ -28,6 +37,7 @@ MD033:
     - br
     - sub
     - sup
+    - a
 
 # MD041 — first line must be top-level heading.
 # Some service docs start with frontmatter or a status block.
