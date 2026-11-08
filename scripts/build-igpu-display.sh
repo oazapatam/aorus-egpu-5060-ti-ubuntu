@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Construye dist/aorus-egpu-igpu-display_<ver>_all.deb.
-# El payload se ensambla desde src/ (ver scripts/lib/bundle.sh).
+# Los entrypoints se copian de src/bin (ver scripts/lib/bundle.sh); el núcleo
+# compartido /usr/lib/aorus-egpu lo entrega aorus-egpu-core, NO este paquete.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,8 +14,8 @@ BINS=(aorus-egpu-display)
 command -v dpkg-deb >/dev/null || { echo "ERROR: falta dpkg-deb" >&2; exit 1; }
 VER="$(awk -F': ' '/^Version:/{print $2; exit}' "$PKG/DEBIAN/control")"
 
-echo "==> ensamblando el núcleo src/ en el paquete"
-bundle_core "$ROOT" "$PKG" "${BINS[@]}"
+echo "==> instalando los entrypoints (el núcleo lo entrega aorus-egpu-core)"
+bundle_bins "$ROOT" "$PKG" "${BINS[@]}"
 
 # La plantilla de modprobe se instala AQUÍ, no se envía en el árbol del paquete:
 # bundle_clean borra usr/share/aorus-egpu tras cada build (ahí genera forensics

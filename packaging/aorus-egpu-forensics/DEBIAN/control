@@ -1,10 +1,10 @@
 Package: aorus-egpu-forensics
-Version: 0.1.0
+Version: 0.2.0
 Architecture: all
 Maintainer: Omar Zapata <omar.zapata@arus.com.co>
 Section: admin
 Priority: optional
-Depends: bash, coreutils, findutils, systemd, kmod
+Depends: aorus-egpu-core (>= 0.1.0), bash, coreutils, findutils, systemd, kmod
 Recommends: pciutils
 Description: Forense de cuelgues al probar la eGPU AORUS por Thunderbolt
  Probar una eGPU por Thunderbolt congela el host de vez en cuando, y sin Xid,

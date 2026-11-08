@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Construye dist/aorus-egpu-overclock_<ver>_all.deb.
-# El payload se ENSAMBLA desde src/ (ver scripts/lib/bundle.sh); nada de lógica
-# duplicada en packaging/.
+# Los entrypoints se copian de src/bin (ver scripts/lib/bundle.sh); el núcleo
+# compartido /usr/lib/aorus-egpu lo entrega aorus-egpu-core, NO este paquete, y
+# en packaging/ no hay lógica duplicada.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -9,7 +10,7 @@ PKG="$ROOT/packaging/aorus-egpu-overclock"
 OUT="$ROOT/dist"
 # Dos entrypoints: la CLI y el TUI de ncurses. Array como en
 # build-health.sh / build-forensics.sh, que es el idioma del repo para
-# esto; `bundle_core` y `bundle_clean` ya toman una lista.
+# esto; `bundle_bins` y `bundle_clean` ya toman una lista.
 BINS=(aorus-egpu-oc nvidia-oc)
 
 . "$ROOT/scripts/lib/bundle.sh"
@@ -17,8 +18,8 @@ BINS=(aorus-egpu-oc nvidia-oc)
 command -v dpkg-deb >/dev/null || { echo "ERROR: falta dpkg-deb" >&2; exit 1; }
 VER="$(awk -F': ' '/^Version:/{print $2; exit}' "$PKG/DEBIAN/control")"
 
-echo "==> ensamblando el núcleo src/ en el paquete"
-bundle_core "$ROOT" "$PKG" "${BINS[@]}"
+echo "==> instalando los entrypoints (el núcleo lo entrega aorus-egpu-core)"
+bundle_bins "$ROOT" "$PKG" "${BINS[@]}"
 
 echo "==> normalizando permisos"
 chmod 0755 "$PKG/DEBIAN/postinst" "$PKG/DEBIAN/prerm" "$PKG/DEBIAN/postrm"

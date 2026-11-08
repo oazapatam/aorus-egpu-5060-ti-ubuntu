@@ -372,8 +372,11 @@ Los ejemplos entre paréntesis son "controlar los ventiladores de la caja" y
 7. **Entrega en `packaging/<pkg>/` y un `scripts/build-<pkg>.sh`.**
    Cero lógica en el árbol del paquete:
    unidades systemd, reglas udev, ficheros de `/etc` y maintainer scripts.
-   El build llama a `bundle_core "$ROOT" "$PKG" "$BIN"` y, al terminar,
+   El build llama a `bundle_bins "$ROOT" "$PKG" "$BIN"` y, al terminar,
    a `bundle_clean`.
+   El núcleo **no** lo entrega tu paquete:
+   lo entrega `aorus-egpu-core`, y tu `DEBIAN/control` lo declara en
+   `Depends: aorus-egpu-core (>= 0.1.0)`.
    Añade el target al `Makefile` **con `lint` y `test` como prerrequisitos**,
    como hace `overclock: lint test`.
 
@@ -565,12 +568,35 @@ Mapeo:  src/{bootstrap.sh,domain,ports,adapters,app}  ->  usr/lib/aorus-egpu/
         src/bin/<x>                                   ->  usr/sbin/<x>
 ```
 
-`bundle_core` hace `rm -rf` del árbol destino, instala `bootstrap.sh` a 0644,
-copia las cuatro capas, normaliza permisos (0755 directorios, 0644 ficheros) e
-instala los binarios pedidos a 0755 en `usr/sbin/`.
+`bundle_payload` hace `rm -rf` del árbol destino, instala `bootstrap.sh` a
+0644, copia las cuatro capas y normaliza permisos (0755 directorios, 0644
+ficheros).
+Lo llama **solo** `scripts/build-core.sh`:
+el núcleo compartido se entrega una vez, en `aorus-egpu-core`.
+`bundle_bins` instala los entrypoints pedidos a 0755 en `usr/sbin/`, y es lo
+único que ejecutan los builds de las capacidades.
 `bundle_clean` lo borra todo al terminar el build, para que lo generado no se
 cuele en git ni en el build siguiente —
 `scripts/build-overclock.sh` lo llama justo después de `dpkg-deb --build`.
+
+**Por qué el núcleo tiene paquete propio.**
+Hasta el 2026-11-07 cada paquete de capacidad entregaba su propia copia del
+núcleo en `/usr/lib/aorus-egpu/`, y dpkg no permite que dos paquetes se pisen un
+fichero:
+instalar `aorus-egpu-overclock` con `aorus-egpu-igpu-display` ya puesto fallaba
+en seco con
+`trying to overwrite '/usr/lib/aorus-egpu/adapters/drm/sysfs.sh', which is also
+in package aorus-egpu-igpu-display`.
+El solape era de 45 de 46 ficheros:
+el payload entero.
+No se había notado porque nunca hubo dos instalados a la vez.
+Los atajos no servían:
+un `Conflicts` prohibiría la combinación útil (el forense y el detector de
+incidentes a la vez), y un `Replaces` sin paquete común rompería la
+reversibilidad, porque `apt remove` del último instalado se llevaría el núcleo
+del que los otros dependen.
+Lo impide ahora la sección 12 de `ci/50-package-policy.sh`, que falla si dos
+`.deb` comparten un fichero.
 
 **Copia en vez de symlinks** a propósito:
 `dpkg-deb` hornea el contenido, y un symlink al checkout dejaría el paquete roto
@@ -658,13 +684,15 @@ Están aquí en vez de documentadas como si fueran diseño.
    Es intencionado como marcador explícito del contrato, pero conviene saber que
    hoy el gate de enlace discrimina **por generación**, no por anchura.
 
-5. **El bundler copia todas las capas a todos los paquetes.**
-   `bundle_core` lleva `domain/`, `ports/`, `adapters/` y `app/` completos al
-   payload, así que `aorus-egpu-forensics` incluye también
-   `app/overclock.sh` y `domain/overclock.sh`, que no usa.
-   Es deliberado —una sola fuente de verdad y cero lógica de selección por
-   paquete— y el coste son unos pocos KB;
-   si algún día las capas crecen, el criterio habría que revisarlo.
+5. **El bundler copia todas las capas, pero ya solo a un paquete.**
+   `bundle_payload` lleva `domain/`, `ports/`, `adapters/` y `app/` completos a
+   `aorus-egpu-core`, así que ahí va también `app/overclock.sh` para una máquina
+   que solo quiera el forense.
+   Sigue siendo deliberado —una sola fuente de verdad y cero lógica de selección
+   por paquete— y ahora el coste se paga una vez, no por paquete.
+   Lo que costó de verdad la copia por paquete no fueron los KB:
+   fue que dpkg se negara a instalar el segundo paquete, con el núcleo entero
+   solapado (ver la sección del bundler más arriba).
 
 6. **El OC ya tiene documento, pero le faltan las palancas que importan.**
    [`overclock.md`](./overclock.md) existe desde el 2026-11-02 con la medición

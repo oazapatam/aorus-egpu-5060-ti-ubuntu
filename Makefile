@@ -3,7 +3,13 @@
 # Los .deb salen en dist/ y NO se versionan. La lógica de empaquetado vive en
 # scripts/build-*.sh (fuente única); este Makefile solo es comodidad.
 #
-#   make              -> paquetes soportados (tb-fix + forensics)
+#   make              -> CI LOCAL COMPLETO. El target `ci` está declarado antes
+#                        que `all`, así que es el default goal de make. Se deja
+#                        así a propósito: `make` a secas no construye nada que
+#                        no haya pasado el CI antes.
+#   make all          -> paquetes soportados (core + tb-fix + forensics)
+#   make core         -> aorus-egpu-core        (NÚCLEO compartido; lo piden
+#                                                todos los aorus-egpu-* >= 0.2.0)
 #   make tb-fix       -> egpu-tb-fix            (PRINCIPAL, verificado en vivo)
 #   make forensics    -> aorus-egpu-forensics   (depurar cuelgues del host)
 #   make health       -> aorus-egpu-health      (detector de incidentes eGPU)
@@ -27,7 +33,7 @@
 SHELL := /bin/bash
 DIST  := dist
 
-.PHONY: all tb-fix forensics health igpu-display overclock config dkms ci ci-list lint test inspect clean
+.PHONY: all core tb-fix forensics health igpu-display overclock config dkms ci ci-list lint test inspect clean
 
 # El CI local vive en ci/ (una etapa por fichero, ci/NN-*.sh) y lo orquesta
 # ci/run.sh, que ordena por número, no se para en el primer fallo y distingue
@@ -39,7 +45,12 @@ ci:
 ci-list:
 	@bash ci/run.sh --list
 
-all: tb-fix forensics
+# `core` entra en `all` porque sin él NINGÚN paquete de capacidad se puede
+# instalar: entregan solo sus entrypoints y lo declaran en Depends.
+all: core tb-fix forensics
+
+core: lint test
+	@bash scripts/build-core.sh
 
 forensics: lint
 	@bash scripts/build-forensics.sh
@@ -81,10 +92,13 @@ inspect:
 
 clean:
 	@rm -rf $(DIST) build
+	@rm -rf packaging/aorus-egpu-core/usr
 	@rm -rf packaging/aorus-egpu-igpu-display/usr/lib/aorus-egpu
+	@rm -rf packaging/aorus-egpu-igpu-display/usr/share
 	@rm -f  packaging/aorus-egpu-igpu-display/usr/sbin/aorus-egpu-display
 	@rm -rf packaging/aorus-egpu-overclock/usr/lib/aorus-egpu
 	@rm -f  packaging/aorus-egpu-overclock/usr/sbin/aorus-egpu-oc
+	@rm -f  packaging/aorus-egpu-overclock/usr/sbin/nvidia-oc
 	@rm -rf packaging/aorus-egpu-health/usr/lib/aorus-egpu
 	@rm -f  packaging/aorus-egpu-health/usr/sbin/aorus-egpu-health
 	@rm -rf packaging/aorus-egpu-forensics/usr/lib/aorus-egpu

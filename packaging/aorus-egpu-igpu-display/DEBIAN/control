@@ -1,10 +1,10 @@
 Package: aorus-egpu-igpu-display
-Version: 0.1.0
+Version: 0.2.0
 Architecture: all
 Maintainer: Omar Zapata <omar.zapata@arus.com.co>
 Section: admin
 Priority: optional
-Depends: bash, coreutils, kmod, initramfs-tools | dracut
+Depends: aorus-egpu-core (>= 0.1.0), bash, coreutils, kmod, initramfs-tools | dracut
 Recommends: pciutils
 Description: Escritorio en la iGPU Intel, las dos GPUs NVIDIA libres para cómputo
  En este portátil hay tres GPUs: la iGPU Intel (Arrow Lake), la dGPU NVIDIA

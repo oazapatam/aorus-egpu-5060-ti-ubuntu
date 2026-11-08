@@ -1,0 +1,45 @@
+Package: aorus-egpu-core
+Version: 0.1.0
+Architecture: all
+Maintainer: Omar Zapata <omar.zapata@arus.com.co>
+Section: admin
+Priority: optional
+Depends: bash, coreutils
+Breaks: aorus-egpu-forensics (<< 0.2.0), aorus-egpu-health (<< 0.2.0), aorus-egpu-igpu-display (<< 0.2.0), aorus-egpu-overclock (<< 0.2.0)
+Replaces: aorus-egpu-forensics (<< 0.2.0), aorus-egpu-health (<< 0.2.0), aorus-egpu-igpu-display (<< 0.2.0), aorus-egpu-overclock (<< 0.2.0)
+Description: Núcleo compartido (dominio, puertos y adaptadores) de los paquetes aorus-egpu-*
+ Lógica común de las capacidades de la eGPU: las reglas puras de dominio, los
+ contratos de los puertos, los adaptadores que hacen la I/O y los casos de uso.
+ No trae ningún ejecutable y no hace nada por sí solo: lo instalan los paquetes
+ de capacidad (aorus-egpu-forensics, aorus-egpu-health, aorus-egpu-igpu-display,
+ aorus-egpu-overclock) como dependencia, y sus entrypoints de /usr/sbin lo
+ cargan desde /usr/lib/aorus-egpu/bootstrap.sh.
+ .
+ POR QUÉ EXISTE ESTE PAQUETE. Hasta la 0.1.0 cada paquete de capacidad
+ entregaba su propia copia del núcleo en /usr/lib/aorus-egpu/. dpkg no permite
+ que dos paquetes se pisen un fichero, así que instalar un segundo paquete
+ fallaba en seco ("trying to overwrite ... which is also in package ..."), y no
+ se había notado porque nunca hubo dos instalados a la vez. El solape medido
+ era de 45 de 46 ficheros: el payload entero.
+ .
+ Los atajos habituales no servían. Un Conflicts impediría tener a la vez, por
+ ejemplo, el forense y el detector de incidentes, que es justo la combinación
+ útil. Y un Replaces sin paquete común rompería la REVERSIBILIDAD, que es el
+ invariante nº1 del proyecto: `apt remove` del último paquete instalado se
+ llevaría el núcleo del que los otros siguen dependiendo. Un paquete común es
+ lo que deja ambas cosas en pie.
+ .
+ Convivencia con las versiones viejas: este paquete declara Breaks y Replaces
+ sobre los cuatro paquetes de capacidad anteriores a la 0.2.0, que son los que
+ entregaban el núcleo por su cuenta. apt los actualiza en la misma operación;
+ instalar este paquete a secas sobre uno de ellos se niega en vez de pisarle
+ ficheros.
+ .
+ Acoplamiento de versión: las capacidades piden aorus-egpu-core (>= 0.1.0), no
+ una versión exacta, porque el cargador ya falla de forma explícita y ruidosa
+ (rc=70, "no encuentro el módulo") si un entrypoint pide un módulo que un
+ núcleo viejo no tiene. Un número de versión más estricto cambiaría ese error
+ claro por un apt que se niega a instalar, sin ganar ninguna seguridad real.
+ .
+ Reversible: apt remove borra el árbol entero. Si queda algún paquete de
+ capacidad instalado, apt avisa de la dependencia antes de hacerlo.

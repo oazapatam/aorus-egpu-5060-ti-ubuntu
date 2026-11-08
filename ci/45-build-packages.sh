@@ -16,10 +16,16 @@ CI_STAGE=45-build-packages
 # seguir siendo construibles como archivo documentado— pero su fallo no tumba el
 # CI, porque arrastran deuda conocida (ver docs/what-actually-works.md).
 # El DKMS se EXCLUYE: clona ~1 GB de open-gpu-kernel-modules de la red.
+#
+# aorus-egpu-core va PRIMERO en el orden alfabético por casualidad, pero su
+# presencia aquí no es casual: es la dependencia de los otros cuatro, y la
+# comprobación de dependencias de más abajo lo necesita construido.
 declare -A BUILD=(
+  [aorus-egpu-core]="scripts/build-core.sh:critico"
   [egpu-tb-fix]="scripts/build-tb-fix.sh:critico"
   [aorus-egpu-forensics]="scripts/build-forensics.sh:critico"
   [aorus-egpu-health]="scripts/build-health.sh:critico"
+  [aorus-egpu-igpu-display]="scripts/build-igpu-display.sh:critico"
   [aorus-egpu-overclock]="scripts/build-overclock.sh:critico"
   [aorus-egpu-config]="scripts/build-config.sh:archivo"
 )
@@ -53,7 +59,17 @@ else
     fi
     # --simulate NO instala; solo resuelve. Necesita root para leer el estado
     # de apt, así que si no hay sudo sin contraseña se omite en vez de fallar.
-    if sim="$(sudo -n apt-get install --simulate "./$d" 2>&1)"; then
+    #
+    # Un paquete de capacidad >= 0.2.0 depende de aorus-egpu-core, que NO está
+    # en ningún repositorio: es un .deb local de dist/. Simularlo a secas daría
+    # "dependencias NO satisfechas" por un fallo del CI, no del paquete, así
+    # que el núcleo entra en la misma orden cuando el Depends lo pide.
+    sim_debs=("./$d")
+    if dpkg-deb -f "$d" Depends 2>/dev/null | grep -q 'aorus-egpu-core'; then
+      core_deb=(dist/aorus-egpu-core_*.deb)
+      if [ -e "${core_deb[0]}" ]; then sim_debs+=("./${core_deb[0]}"); fi
+    fi
+    if sim="$(sudo -n apt-get install --simulate "${sim_debs[@]}" 2>&1)"; then
       ci_ok "$(basename "$d") — legible y con dependencias satisfechas"
     else
       case "$sim" in
@@ -70,11 +86,13 @@ fi
 # podrían colarse en git.
 ci_section "limpieza de los árboles generados"
 sucio=0
-for p in packaging/aorus-egpu-overclock packaging/aorus-egpu-forensics; do
+for p in packaging/aorus-egpu-core packaging/aorus-egpu-overclock \
+         packaging/aorus-egpu-health packaging/aorus-egpu-forensics \
+         packaging/aorus-egpu-igpu-display; do
   if [ -d "$p/usr/lib/aorus-egpu" ]; then
     ci_fail "$p/usr/lib/aorus-egpu no se limpió tras el build"; sucio=1
   fi
 done
-[ "$sucio" -eq 0 ] && ci_ok "sin restos de bundle_core"
+[ "$sucio" -eq 0 ] && ci_ok "sin restos de los árboles ensamblados"
 
 ci_summary

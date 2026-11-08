@@ -38,11 +38,12 @@ SUPERSEDED_PKGS="aorus-egpu-config aorus-egpu-nvidia-dkms"
 # Árboles de payload que genera scripts/lib/bundle.sh en tiempo de build.
 # Están gitignorados (o deberían estarlo) y jamás deben aparecer versionados.
 GENERATED_PATHS="
-packaging/aorus-egpu-overclock/usr/lib/aorus-egpu
+packaging/aorus-egpu-core/usr/lib/aorus-egpu
 packaging/aorus-egpu-overclock/usr/sbin/aorus-egpu-oc
-packaging/aorus-egpu-health/usr/lib/aorus-egpu
+packaging/aorus-egpu-overclock/usr/sbin/nvidia-oc
 packaging/aorus-egpu-health/usr/sbin/aorus-egpu-health
-packaging/aorus-egpu-forensics/usr/lib/aorus-egpu
+packaging/aorus-egpu-igpu-display/usr/sbin/aorus-egpu-display
+packaging/aorus-egpu-igpu-display/usr/share
 packaging/aorus-egpu-forensics/usr/sbin/aorus-egpu-probe
 packaging/aorus-egpu-forensics/usr/sbin/aorus-egpu-postmortem
 packaging/aorus-egpu-nvidia-dkms/usr
@@ -722,6 +723,85 @@ else
       ci_ok "sin dobles: $(basename "$deb")"
     fi
   done
+fi
+
+ci_section "12. Dos paquetes nunca se pisan un fichero"
+# =============================================================================
+# POR QUÉ: dpkg se niega a desempaquetar un fichero que ya pertenece a otro
+# paquete, y lo hace en mitad de la instalación:
+#
+#   trying to overwrite '/usr/lib/aorus-egpu/adapters/drm/sysfs.sh',
+#   which is also in package aorus-egpu-igpu-display
+#
+# Eso es exactamente lo que pasó el 2026-11-07 al instalar aorus-egpu-overclock
+# con aorus-egpu-igpu-display ya puesto. Los cuatro paquetes hexagonales
+# entregaban el núcleo ENTERO en /usr/lib/aorus-egpu/ —45 de 46 ficheros
+# solapados— y no se había notado porque nunca hubo dos instalados a la vez.
+# El arreglo fue sacar el núcleo a aorus-egpu-core; esta comprobación impide
+# que vuelva a colarse, porque el síntoma solo aparece al instalar el SEGUNDO
+# paquete y eso puede tardar meses en pasar.
+#
+# Se compara solo la versión MÁS ALTA de cada paquete: dist/ acumula builds
+# viejos (dos egpu-tb-fix, dos overclock) y dos versiones del mismo paquete se
+# pisan por definición, lo que sería un falso positivo.
+
+if ! command -v dpkg-deb >/dev/null 2>&1; then
+  ci_skip "sin dpkg-deb — no puedo inspeccionar los .deb"
+elif ! ls dist/*.deb >/dev/null 2>&1; then
+  ci_skip "no hay .deb en dist/ — ejecuta los build-*.sh antes"
+else
+  ov_tmp="$(mktemp -d)"
+  # Versión más alta por paquete.
+  declare -A OV_DEB=()
+  for deb in dist/*.deb; do
+    nombre="$(dpkg-deb -f "$deb" Package 2>/dev/null)" || continue
+    version="$(dpkg-deb -f "$deb" Version 2>/dev/null)"
+    [ -n "$nombre" ] || continue
+    if [ -n "${OV_DEB[$nombre]:-}" ]; then
+      previa="$(dpkg-deb -f "${OV_DEB[$nombre]}" Version 2>/dev/null)"
+      dpkg --compare-versions "$version" gt "$previa" || continue
+    fi
+    OV_DEB[$nombre]="$deb"
+  done
+
+  # Lista de ficheros (NO directorios: que dos paquetes compartan /usr/sbin es
+  # normal y dpkg lo gestiona; compartir un FICHERO es el fallo).
+  for nombre in "${!OV_DEB[@]}"; do
+    # LC_ALL=C en el sort Y en el comm de abajo: con una colación UTF-8, `sort`
+    # ignora la puntuación al ordenar y `comm` protesta con "file 2 is not in
+    # sorted order" sobre una lista que sort acaba de producir. Son rutas, así
+    # que el orden de bytes es además el correcto.
+    dpkg-deb -c "${OV_DEB[$nombre]}" 2>/dev/null \
+      | awk '$1 !~ /^d/ { print $6 }' | LC_ALL=C sort -u > "$ov_tmp/$nombre.files"
+  done
+
+  ov_nombres=()
+  while IFS= read -r n; do ov_nombres+=("$n"); done \
+    < <(printf '%s\n' "${!OV_DEB[@]}" | sort)
+  ov_choques=0
+  for ((i = 0; i < ${#ov_nombres[@]}; i++)); do
+    for ((j = i + 1; j < ${#ov_nombres[@]}; j++)); do
+      a="${ov_nombres[i]}"; b="${ov_nombres[j]}"
+      comunes="$(LC_ALL=C comm -12 "$ov_tmp/$a.files" "$ov_tmp/$b.files")"
+      [ -n "$comunes" ] || continue
+      # Un Replaces declarado es una convivencia DELIBERADA (p. ej. el núcleo
+      # reclamando los ficheros de las capacidades < 0.2.0), no un error.
+      rep_a="$(dpkg-deb -f "${OV_DEB[$a]}" Replaces 2>/dev/null)"
+      rep_b="$(dpkg-deb -f "${OV_DEB[$b]}" Replaces 2>/dev/null)"
+      case "$rep_a" in *"$b"*) continue ;; esac
+      case "$rep_b" in *"$a"*) continue ;; esac
+      ov_choques=1
+      ci_fail "$a y $b se pisan $(printf '%s\n' "$comunes" | wc -l) fichero(s)" \
+        "$(printf '%s\n' "$comunes" | head -10)" \
+        "dpkg abortará la instalación del segundo paquete." \
+        "El núcleo compartido va en aorus-egpu-core; un paquete de capacidad" \
+        "solo entrega sus entrypoints (ver scripts/lib/bundle.sh)."
+    done
+  done
+  if [ "$ov_choques" -eq 0 ]; then
+    ci_ok "sin ficheros pisados entre los ${#ov_nombres[@]} paquetes de dist/"
+  fi
+  rm -rf "$ov_tmp"
 fi
 
 ci_summary

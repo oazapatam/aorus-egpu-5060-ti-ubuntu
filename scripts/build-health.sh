@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Construye dist/aorus-egpu-health_<ver>_all.deb.
-# El payload se ENSAMBLA desde src/ (ver scripts/lib/bundle.sh); nada de lógica
-# duplicada en packaging/.
+# Los entrypoints se copian de src/bin (ver scripts/lib/bundle.sh); el núcleo
+# compartido /usr/lib/aorus-egpu lo entrega aorus-egpu-core, NO este paquete, y
+# en packaging/ no hay lógica duplicada.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,8 +15,8 @@ BINS=(aorus-egpu-health)
 command -v dpkg-deb >/dev/null || { echo "ERROR: falta dpkg-deb" >&2; exit 1; }
 VER="$(awk -F': ' '/^Version:/{print $2; exit}' "$PKG/DEBIAN/control")"
 
-echo "==> ensamblando el núcleo src/ en el paquete"
-bundle_core "$ROOT" "$PKG" "${BINS[@]}"
+echo "==> instalando los entrypoints (el núcleo lo entrega aorus-egpu-core)"
+bundle_bins "$ROOT" "$PKG" "${BINS[@]}"
 
 echo "==> normalizando permisos"
 chmod 0755 "$PKG/DEBIAN/postinst" "$PKG/DEBIAN/postrm"

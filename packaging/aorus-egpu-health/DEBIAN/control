@@ -1,10 +1,10 @@
 Package: aorus-egpu-health
-Version: 0.1.0
+Version: 0.2.0
 Architecture: all
 Maintainer: Omar Zapata <omar.zapata@arus.com.co>
 Section: admin
 Priority: optional
-Depends: bash, coreutils, sed, grep, mawk | gawk | original-awk, systemd
+Depends: aorus-egpu-core (>= 0.1.0), bash, coreutils, sed, grep, mawk | gawk | original-awk, systemd
 Suggests: aorus-egpu-forensics
 Description: Detector de incidentes de la eGPU AORUS, con veredicto de causa
  El 2026-11-02 a las 13:31:53 la eGPU sufrió un Xid 79 ("GPU has fallen off the

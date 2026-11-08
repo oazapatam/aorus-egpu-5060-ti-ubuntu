@@ -1,27 +1,53 @@
 #!/usr/bin/env bash
-# scripts/lib/bundle.sh — ensambla el núcleo src/ dentro del payload de un
-# paquete. Fuente ÚNICA: src/. Lo que queda bajo packaging/<pkg>/usr/lib/ es
-# GENERADO y está gitignorado, igual que el árbol usr/src del paquete DKMS.
+# scripts/lib/bundle.sh — ensambla el núcleo src/ y los entrypoints dentro del
+# payload de un paquete. Fuente ÚNICA: src/. Lo que queda bajo
+# packaging/<pkg>/usr/ es GENERADO y está gitignorado, igual que el árbol
+# usr/src del paquete DKMS.
 #
 # Mapeo:  src/{bootstrap.sh,domain,ports,adapters,app}  ->  usr/lib/aorus-egpu/
+#           ... y eso lo entrega UN SOLO paquete: aorus-egpu-core.
 #         src/bin/<x>                                   ->  usr/sbin/<x>
+#           ... y eso lo entrega el paquete de la capacidad.
+#
+# POR QUÉ EL NÚCLEO VIVE EN SU PROPIO PAQUETE (y no una copia por paquete, que
+# es lo que se hacía hasta el 2026-11-07):
+#
+#   Los cuatro paquetes hexagonales entregaban el núcleo ENTERO en la misma
+#   ruta, /usr/lib/aorus-egpu/. dpkg no permite que dos paquetes se pisen un
+#   fichero, así que instalar un segundo paquete fallaba en seco:
+#
+#     trying to overwrite '/usr/lib/aorus-egpu/adapters/drm/sysfs.sh',
+#     which is also in package aorus-egpu-igpu-display
+#
+#   No se había notado porque nunca había habido dos instalados a la vez. El
+#   solape medido era de 45 de 46 ficheros: no era un roce, era el payload
+#   completo. Y los arreglos de atajo (Replaces sin Breaks, o un Conflicts)
+#   rompían la REVERSIBILIDAD, que es el invariante nº1 del repo: con Replaces,
+#   `apt remove` del último instalado se habría llevado el núcleo que el otro
+#   paquete necesitaba para seguir funcionando.
+#
+#   Así que el núcleo compartido se entrega una vez, en aorus-egpu-core, y cada
+#   paquete de capacidad lo DECLARA como dependencia. Es la misma idea que ya
+#   gobierna src/: una sola fuente de lógica.
 #
 # Por qué copiar y no symlinks: dpkg-deb hornea el contenido, y un symlink al
 # checkout dejaría el paquete roto en cualquier otra máquina.
 #
 # VARIOS entrypoints por paquete es parte del contrato, no un accidente:
-# `bundle_core <root> <pkg> <bin>...` y `bundle_clean <pkg> <bin>...` toman
-# una lista. Lo usan build-health.sh, build-forensics.sh,
-# build-igpu-display.sh y build-overclock.sh (que entrega la CLI
-# `aorus-egpu-oc` y el TUI `nvidia-oc`). Un paquete con un solo binario
-# pasa un solo nombre y nada cambia.
+# `bundle_bins <root> <pkg> <bin>...` y `bundle_clean <pkg> <bin>...` toman una
+# lista. Lo usan build-health.sh, build-forensics.sh, build-igpu-display.sh y
+# build-overclock.sh (que entrega la CLI `aorus-egpu-oc` y el TUI `nvidia-oc`).
+# Un paquete con un solo binario pasa un solo nombre y nada cambia.
 
-bundle_core() { # $1=dir raíz del repo  $2=dir del paquete  $3..=binarios de src/bin a incluir
-  local root="$1" pkg="$2"; shift 2
-  local lib="$pkg/usr/lib/aorus-egpu" b layer
+# Ensambla el NÚCLEO compartido. Lo llama SOLO scripts/build-core.sh: si lo
+# llamara un paquete de capacidad, volvería el solape que este fichero
+# documenta más arriba.
+bundle_payload() { # $1=dir raíz del repo  $2=dir del paquete (aorus-egpu-core)
+  local root="$1" pkg="$2"
+  local lib="$pkg/usr/lib/aorus-egpu" layer
 
   rm -rf "$lib"
-  mkdir -p "$lib" "$pkg/usr/sbin"
+  mkdir -p "$lib"
   install -m 0644 "$root/src/bootstrap.sh" "$lib/bootstrap.sh"
   for layer in domain ports adapters app; do
     cp -a "$root/src/$layer" "$lib/$layer"
@@ -50,7 +76,15 @@ bundle_core() { # $1=dir raíz del repo  $2=dir del paquete  $3..=binarios de sr
 
   find "$lib" -type d -exec chmod 0755 {} +
   find "$lib" -type f -exec chmod 0644 {} +
+}
 
+# Instala los ENTRYPOINTS de un paquete de capacidad. No toca usr/lib: el
+# núcleo lo pone aorus-egpu-core y el paquete lo declara en Depends.
+bundle_bins() { # $1=dir raíz del repo  $2=dir del paquete  $3..=binarios de src/bin
+  local root="$1" pkg="$2"; shift 2
+  local b
+
+  mkdir -p "$pkg/usr/sbin"
   for b in "$@"; do
     install -m 0755 "$root/src/bin/$b" "$pkg/usr/sbin/$b"
   done

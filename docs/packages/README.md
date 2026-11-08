@@ -7,10 +7,11 @@ La evidencia de por qué está en
 | Paquete | Versión | Estado | Validado en vivo |
 |---|---|---|---|
 | `egpu-tb-fix` | 1.5.1 | **principal** | **sí** — es lo que hace funcionar la eGPU hoy |
-| `aorus-egpu-forensics` | 0.1.0 | nuevo, recomendado al depurar | capas 1-2 sí; capa 3 (ramoops) por construcción |
-| `aorus-egpu-health` | 0.1.0 | nuevo — detector de incidentes | las reglas y el `scan` sí; el servicio de vigilancia continua, no |
-| `aorus-egpu-igpu-display` | 0.1.0 | nuevo — [diseño y medidas](../igpu-display.md) | el gate y el inventario sí; el cambio de modeset requiere reiniciar |
-| `aorus-egpu-overclock` | 0.1.0 | **en desarrollo, no usar** — [palancas y perfiles medidos](../overclock.md); entrega `aorus-egpu-oc` (CLI) y `nvidia-oc` (TUI) | no |
+| `aorus-egpu-core` | 0.1.0 | núcleo compartido — no se instala solo | sí — es lo que cargan los entrypoints de los demás |
+| `aorus-egpu-forensics` | 0.2.0 | nuevo, recomendado al depurar | capas 1-2 sí; capa 3 (ramoops) por construcción |
+| `aorus-egpu-health` | 0.2.0 | nuevo — detector de incidentes | las reglas y el `scan` sí; el servicio de vigilancia continua, no |
+| `aorus-egpu-igpu-display` | 0.2.0 | nuevo — [diseño y medidas](../igpu-display.md) | el gate y el inventario sí; el cambio de modeset requiere reiniciar |
+| `aorus-egpu-overclock` | 0.2.0 | **en desarrollo, no usar** — [palancas y perfiles medidos](../overclock.md); entrega `aorus-egpu-oc` (CLI) y `nvidia-oc` (TUI) | el TUI y el estado sí; ningún perfil ni offset validado |
 | `aorus-egpu-config` | 0.5.9 | **superseded** (archivo) | lo estuvo hasta el 2026-06-28; purgado |
 | `aorus-egpu-nvidia-dkms` | 595.71.05-aorus17 | **superseded + deuda de versión** | lo estuvo hasta el 2026-06-28; purgado |
 
@@ -63,6 +64,47 @@ sudo apt install ./dist/aorus-egpu-forensics_*.deb
   Las palancas que el caso de uso de IA sí necesita —persistencia del driver y
   modo de cómputo exclusivo— todavía no están implementadas:
   ver [`../overclock.md`](../overclock.md).
+
+## El núcleo va en su propio paquete (desde el 2026-11-07)
+
+`aorus-egpu-core` entrega `/usr/lib/aorus-egpu/` —dominio, puertos, adaptadores
+y casos de uso— y nada más:
+ni un ejecutable, ni una unidad, ni un fichero de `/etc`.
+Los paquetes de capacidad entregan solo sus entrypoints de `/usr/sbin/` y lo
+declaran en `Depends: aorus-egpu-core (>= 0.1.0)`.
+
+Por qué, medido en vez de supuesto:
+hasta ese día cada paquete llevaba su propia copia del núcleo en la misma ruta,
+y dpkg no permite que dos paquetes se pisen un fichero.
+Instalar `aorus-egpu-overclock` con `aorus-egpu-igpu-display` ya puesto fallaba
+a mitad de la instalación:
+
+```text
+trying to overwrite '/usr/lib/aorus-egpu/adapters/drm/sysfs.sh',
+which is also in package aorus-egpu-igpu-display (0.1.0)
+```
+
+El solape era de **45 de 46 ficheros**, el payload completo, y no se había
+notado porque nunca había habido dos paquetes instalados a la vez.
+
+Un `Conflicts` habría prohibido justo las combinaciones útiles (el forense y el
+detector de incidentes al mismo tiempo), y un `Replaces` sin paquete común
+habría roto la reversibilidad, que es el invariante nº1 del repo:
+`apt remove` del último paquete instalado se habría llevado el núcleo del que
+los otros siguen dependiendo.
+
+Consecuencias prácticas:
+
+- Las versiones de los cuatro paquetes de capacidad subieron a **0.2.0**;
+  `aorus-egpu-core` declara `Breaks` y `Replaces` sobre todo lo anterior a esa
+  versión, así que apt actualiza en una sola operación y nunca pisa ficheros a
+  escondidas.
+- Instalar un paquete de capacidad desde `dist/` requiere pasarle también el
+  `.deb` del núcleo, porque no está en ningún repositorio:
+  `sudo apt install ./dist/aorus-egpu-core_*.deb ./dist/aorus-egpu-overclock_*.deb`.
+- La regresión la impide la sección 12 de `ci/50-package-policy.sh`, que falla
+  si dos `.deb` de `dist/` comparten un fichero.
+  Se comprobó en rojo con un paquete de pega antes de darla por buena.
 
 ## Un paquete por capacidad
 
